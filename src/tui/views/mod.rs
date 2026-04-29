@@ -292,30 +292,32 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
+    // inner width = area minus the two border columns
     let sep = "─".repeat(area.width.saturating_sub(2) as usize);
 
     let body: Vec<Line> = state
         .log_lines
         .iter()
         .flat_map(|l| {
-            if let Some(title) = l.strip_prefix("##[section]") {
+            // ##[group] is GitHub Actions' step-level section header.
+            // ##[section] serves the same role in some runners.
+            if let Some(title) = l.strip_prefix("##[group]").or_else(|| l.strip_prefix("##[section]")) {
                 vec![
                     Line::from(Span::styled(sep.clone(), Style::default().fg(Color::DarkGray))),
                     Line::from(vec![
                         Span::styled("▸ ", Style::default().fg(Color::Cyan).bold()),
                         Span::styled(title.to_string(), Style::default().fg(Color::Cyan).bold()),
                     ]),
+                    Line::default(),
                 ]
-            } else if let Some(cmd) = l.strip_prefix("##[group]") {
-                vec![Line::from(vec![
-                    Span::styled("  ┌ ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(cmd.to_string(), Style::default().fg(Color::White).bold()),
-                ])]
             } else if l.starts_with("##[endgroup]") {
-                vec![Line::from(Span::styled(
-                    "  └─",
-                    Style::default().fg(Color::DarkGray),
-                ))]
+                // blank line after each section body
+                vec![Line::default()]
+            } else if let Some(cmd) = l.strip_prefix("##[command]") {
+                vec![Line::from(vec![
+                    Span::styled("  $ ", Style::default().fg(Color::Green).bold()),
+                    Span::styled(cmd.to_string(), Style::default().fg(Color::White)),
+                ])]
             } else if let Some(msg) = l.strip_prefix("##[error]") {
                 vec![Line::from(Span::styled(
                     format!("✗ {msg}"),
@@ -333,7 +335,7 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
                 } else if lower.contains("warn") {
                     Style::default().fg(Color::Yellow)
                 } else {
-                    Style::default()
+                    Style::default().fg(Color::Rgb(200, 200, 200))
                 };
                 vec![Line::from(Span::styled(l.clone(), style))]
             }
@@ -342,6 +344,7 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
 
     let p = Paragraph::new(body)
         .block(styled_block("Logs"))
+        .wrap(Wrap { trim: false })
         .scroll((state.log_scroll, 0));
     f.render_widget(p, area);
 }
