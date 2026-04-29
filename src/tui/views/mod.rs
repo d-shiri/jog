@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 
 use super::status_glyph;
 use crate::app::state::{AppState, View};
-use crate::provider::Status;
+use crate::provider::{Run, Status};
 
 pub fn render(f: &mut Frame, state: &AppState) {
     let area = f.area();
@@ -26,6 +26,7 @@ pub fn render(f: &mut Frame, state: &AppState) {
         View::RunDetail => render_run_detail(f, chunks[1], state),
         View::Logs => render_logs(f, chunks[1], state),
         View::Watch => render_watch(f, chunks[1], state),
+        View::TriggerPrompt => render_trigger_prompt(f, chunks[1], state),
     }
     render_footer(f, chunks[2], state);
 }
@@ -40,12 +41,19 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
+    let editing = state
+        .trigger_prompt
+        .as_ref()
+        .map(|p| p.editing)
+        .unwrap_or(false);
     let hint = match state.view {
         View::Workflows => "↵ runs  t trigger  w watch  o open  q quit",
         View::Runs => "↵ detail  t trigger  r rerun  R rerun-failed  x cancel  w watch  Esc back",
         View::RunDetail => "↵/l logs  Esc back  q quit",
         View::Logs => "j/k scroll  d/u page  g top  Esc back  q quit",
         View::Watch => "Esc back  q quit",
+        View::TriggerPrompt if editing => "type to edit  Bksp delete  Enter/Esc done",
+        View::TriggerPrompt => "j/k move  Space cycle  ↵/i edit  t submit  Esc cancel",
     };
     let txt = match &state.status_msg {
         Some(m) => format!(" {}   |   {}", hint, m),
@@ -209,9 +217,7 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
         .split(area);
 
     let summary_lines = if let Some(detail) = &state.run_detail {
-        let elapsed = (Utc::now() - detail.run.created_at).num_seconds().max(0);
-        let mins = elapsed / 60;
-        let secs = elapsed % 60;
+        let elapsed = format_elapsed(elapsed_seconds(&detail.run));
         let step = detail.current_step().unwrap_or("—");
         vec![
             Line::from(vec![
@@ -227,7 +233,7 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
             ]),
             Line::from(vec![
                 Span::styled("Elapsed:", Style::default().bold()),
-                Span::raw(format!(" {}:{:02}", mins, secs)),
+                Span::raw(format!(" {}", elapsed)),
             ]),
             Line::from(vec![
                 Span::styled("Run:    ", Style::default().bold()),
@@ -281,6 +287,103 @@ fn style_for_status(s: Status) -> Style {
     }
 }
 
+fn render_trigger_prompt(f: &mut Frame, area: Rect, state: &AppState) {
+    let Some(prompt) = state.trigger_prompt.as_ref() else {
+        let p = Paragraph::new("(no prompt)")
+            .block(Block::default().borders(Borders::ALL).title(" Trigger "));
+        f.render_widget(p, area);
+        return;
+    };
+    let title = format!(
+        " Trigger: {}  ({})  on {} ",
+        prompt.workflow_name, prompt.workflow_file, state.current_branch
+    );
+    let mut lines = Vec::new();
+    let name_width = prompt
+        .fields
+        .iter()
+        .map(|f| f.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(8);
+    for (i, field) in prompt.fields.iter().enumerate() {
+        let selected = i == prompt.cursor;
+        let prefix = if selected { "▶ " } else { "  " };
+        let label_style = if selected {
+            Style::default().bold().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        let value_display = if field.value.is_empty() {
+            "(empty)".to_string()
+        } else {
+            field.value.clone()
+        };
+        let editing_marker = if selected && prompt.editing { "_" } else { "" };
+        let value_style = if selected && prompt.editing {
+            Style::default().fg(Color::Yellow).bold()
+        } else if selected {
+            Style::default().fg(Color::White).bold()
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let mut spans = vec![
+            Span::raw(prefix),
+            Span::styled(format!("{:<width$}", field.name, width = name_width), label_style),
+            Span::raw("  "),
+            Span::styled(value_display, value_style),
+            Span::styled(editing_marker, Style::default().fg(Color::Yellow)),
+        ];
+        if field.required {
+            spans.push(Span::styled(
+                "  (required)",
+                Style::default().fg(Color::Red),
+            ));
+        }
+        if let Some(opts) = &field.options {
+            spans.push(Span::styled(
+                format!("  [{}]", opts.join("/")),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    if prompt.fields.is_empty() {
+        lines.push(Line::from("(no inputs)"));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press `t` to trigger, `Esc` to cancel.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+fn elapsed_seconds(run: &Run) -> i64 {
+    // For terminal runs, freeze the clock at completion. Otherwise it would
+    // keep ticking forever on a Skipped/Failed/Success run.
+    let end = if run.status.is_terminal() {
+        run.updated_at
+    } else {
+        Utc::now()
+    };
+    (end - run.created_at).num_seconds().max(0)
+}
+
+fn format_elapsed(secs: i64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{}:{:02}", m, s)
+    }
+}
+
 fn relative(t: chrono::DateTime<Utc>) -> String {
     let secs = (Utc::now() - t).num_seconds().max(0);
     if secs < 60 {
@@ -301,5 +404,42 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn format_elapsed_under_hour() {
+        assert_eq!(format_elapsed(0), "0:00");
+        assert_eq!(format_elapsed(42), "0:42");
+        assert_eq!(format_elapsed(125), "2:05");
+        assert_eq!(format_elapsed(3599), "59:59");
+    }
+
+    #[test]
+    fn format_elapsed_over_hour() {
+        assert_eq!(format_elapsed(3600), "1:00:00");
+        assert_eq!(format_elapsed(6942), "1:55:42");
+    }
+
+    #[test]
+    fn elapsed_freezes_for_terminal_runs() {
+        let created = Utc.with_ymd_and_hms(2026, 4, 29, 8, 0, 0).unwrap();
+        let updated = Utc.with_ymd_and_hms(2026, 4, 29, 8, 0, 5).unwrap();
+        let run = Run {
+            id: 1,
+            display_title: "x".into(),
+            head_branch: "main".into(),
+            status: Status::Skipped,
+            created_at: created,
+            updated_at: updated,
+            url: String::new(),
+        };
+        // Skipped 5s after creation; should stay 5s no matter when we look.
+        assert_eq!(elapsed_seconds(&run), 5);
     }
 }

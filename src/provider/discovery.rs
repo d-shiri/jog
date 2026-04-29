@@ -98,7 +98,7 @@ fn parse_inputs(on: Option<&Value>) -> Vec<WorkflowInput> {
     let mut out = Vec::new();
     for (k, v) in inputs {
         let Some(name) = k.as_str() else { continue };
-        let (required, default) = match v {
+        let (required, default, options) = match v {
             Value::Mapping(m) => {
                 let req = m
                     .iter()
@@ -109,14 +109,29 @@ fn parse_inputs(on: Option<&Value>) -> Vec<WorkflowInput> {
                     .iter()
                     .find(|(k, _)| k.as_str() == Some("default"))
                     .map(|(_, v)| value_to_string(v));
-                (req, def)
+                let opts = m
+                    .iter()
+                    .find(|(k, _)| k.as_str() == Some("options"))
+                    .and_then(|(_, v)| match v {
+                        Value::Sequence(items) => Some(
+                            items
+                                .iter()
+                                .map(value_to_string)
+                                .filter(|s| !s.is_empty())
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
+                    })
+                    .filter(|v: &Vec<String>| !v.is_empty());
+                (req, def, opts)
             }
-            _ => (false, None),
+            _ => (false, None, None),
         };
         out.push(WorkflowInput {
             name: name.to_string(),
             required,
             default,
+            options,
         });
     }
     out

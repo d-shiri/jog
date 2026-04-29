@@ -18,6 +18,15 @@ pub enum Status {
     Unknown,
 }
 
+impl Status {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Status::Success | Status::Failure | Status::Cancelled | Status::Skipped
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Workflow {
     pub name: String,
@@ -34,6 +43,8 @@ pub struct WorkflowInput {
     pub name: String,
     pub required: bool,
     pub default: Option<String>,
+    /// Allowed values for `type: choice` inputs. None for free-form text.
+    pub options: Option<Vec<String>>,
 }
 
 impl Workflow {

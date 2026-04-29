@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::app::state::{AppState, View};
+use crate::app::state::{AppState, TriggerPrompt, View};
 use crate::config::Config;
 use crate::provider::github::{GitHubProvider, current_branch};
 use crate::provider::{Provider, Run, RunDetail, Status, Workflow};
@@ -167,6 +167,12 @@ async fn event_loop(
             }
             _ = tick.tick() => {
                 if state.view == View::Watch {
+                    // Refresh the runs list so a freshly triggered run replaces
+                    // the previous one as `runs.first()`. Without this, the
+                    // tick below keeps polling the OLD run id forever.
+                    if let Some(file) = state.workflow_for_runs.clone() {
+                        spawn_fetch_runs(provider.clone(), file, tx.clone(), state);
+                    }
                     if let Some(run) = state.runs.first().cloned() {
                         spawn_fetch_run_detail(provider.clone(), run.id, tx.clone(), state);
                     }
@@ -185,6 +191,18 @@ async fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Some(AppEvent::Quit);
     }
+    // While typing into a trigger-prompt field, route ALL keys to the editor
+    // so 'q', 'j', 't', etc. are treated as text input rather than commands.
+    if state.view == View::TriggerPrompt
+        && state
+            .trigger_prompt
+            .as_ref()
+            .map(|p| p.editing)
+            .unwrap_or(false)
+    {
+        handle_trigger_prompt_edit(state, key);
+        return None;
+    }
     match (state.view, key.code) {
         (_, KeyCode::Char('q')) => return Some(AppEvent::Quit),
         (_, KeyCode::Esc) => match state.view {
@@ -201,6 +219,9 @@ async fn handle_key(
             View::Logs => {
                 state.switch_view(View::RunDetail);
                 state.log_lines.clear();
+            }
+            View::TriggerPrompt => {
+                cancel_trigger_prompt(state);
             }
         },
         (View::Workflows, KeyCode::Char('j') | KeyCode::Down) => {
@@ -336,9 +357,58 @@ async fn handle_key(
         (View::Logs, KeyCode::Char('g')) => {
             state.log_scroll = 0;
         }
+        (View::TriggerPrompt, KeyCode::Char('j') | KeyCode::Down) => {
+            if let Some(p) = state.trigger_prompt.as_mut() {
+                let len = p.fields.len();
+                move_cursor(&mut p.cursor, len, 1);
+            }
+        }
+        (View::TriggerPrompt, KeyCode::Char('k') | KeyCode::Up) => {
+            if let Some(p) = state.trigger_prompt.as_mut() {
+                let len = p.fields.len();
+                move_cursor(&mut p.cursor, len, -1);
+            }
+        }
+        (View::TriggerPrompt, KeyCode::Char(' ')) => {
+            if let Some(p) = state.trigger_prompt.as_mut() {
+                p.cycle_option();
+            }
+        }
+        (View::TriggerPrompt, KeyCode::Enter | KeyCode::Char('i')) => {
+            if let Some(p) = state.trigger_prompt.as_mut() {
+                if p.current_field().is_some() {
+                    p.editing = true;
+                }
+            }
+        }
+        (View::TriggerPrompt, KeyCode::Char('t')) => {
+            submit_trigger_prompt(state, provider, tx);
+        }
         _ => {}
     }
     None
+}
+
+fn handle_trigger_prompt_edit(state: &mut AppState, key: KeyEvent) {
+    let Some(prompt) = state.trigger_prompt.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Enter | KeyCode::Esc => {
+            prompt.editing = false;
+        }
+        KeyCode::Backspace => {
+            if let Some(f) = prompt.current_field_mut() {
+                f.value.pop();
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Some(f) = prompt.current_field_mut() {
+                f.value.push(c);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn move_cursor(cursor: &mut usize, len: usize, delta: i32) {
@@ -448,18 +518,31 @@ fn trigger_workflow(
         ));
         return;
     }
-    let missing = workflow.missing_required_inputs();
-    if !missing.is_empty() {
-        state.status_msg = Some(format!(
-            "`{}` needs inputs: {}. Use CLI: jog run {} <ref> --input KEY=VAL",
-            workflow.name,
-            missing.join(", "),
-            workflow.file_name,
-        ));
+    if !workflow.inputs.is_empty() {
+        let return_view = state.view;
+        state.trigger_prompt = Some(TriggerPrompt::from_workflow(workflow, return_view));
+        state.switch_view(View::TriggerPrompt);
         return;
     }
-    let inputs = workflow.merge_defaults(HashMap::new());
-    let file = workflow.file_name.clone();
+    dispatch_trigger(
+        state,
+        &workflow.file_name,
+        &workflow.name,
+        HashMap::new(),
+        provider,
+        tx,
+    );
+}
+
+fn dispatch_trigger(
+    state: &mut AppState,
+    workflow_file: &str,
+    workflow_name: &str,
+    inputs: HashMap<String, String>,
+    provider: &Arc<GitHubProvider>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    let file = workflow_file.to_string();
     let r = state.current_branch.clone();
     let p = provider.clone();
     let tx2 = tx.clone();
@@ -470,7 +553,42 @@ fn trigger_workflow(
         };
         let _ = tx2.send(AppEvent::Status(msg));
     });
-    state.status_msg = Some(format!("triggering {} on {}", workflow.name, state.current_branch));
+    state.status_msg = Some(format!(
+        "triggering {} on {}",
+        workflow_name, state.current_branch
+    ));
+}
+
+fn submit_trigger_prompt(
+    state: &mut AppState,
+    provider: &Arc<GitHubProvider>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(prompt) = state.trigger_prompt.as_ref() else {
+        return;
+    };
+    let missing = prompt.missing_required();
+    if !missing.is_empty() {
+        state.status_msg = Some(format!("missing required: {}", missing.join(", ")));
+        return;
+    }
+    let inputs = prompt.collected();
+    let file = prompt.workflow_file.clone();
+    let name = prompt.workflow_name.clone();
+    let return_view = prompt.return_view;
+    state.trigger_prompt = None;
+    state.switch_view(return_view);
+    dispatch_trigger(state, &file, &name, inputs, provider, tx);
+}
+
+fn cancel_trigger_prompt(state: &mut AppState) {
+    let return_view = state
+        .trigger_prompt
+        .as_ref()
+        .map(|p| p.return_view)
+        .unwrap_or(View::Workflows);
+    state.trigger_prompt = None;
+    state.switch_view(return_view);
 }
 
 pub fn status_glyph(s: Status) -> &'static str {

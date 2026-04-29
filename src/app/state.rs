@@ -7,6 +7,84 @@ pub enum View {
     RunDetail,
     Logs,
     Watch,
+    TriggerPrompt,
+}
+
+#[derive(Debug, Clone)]
+pub struct TriggerField {
+    pub name: String,
+    pub value: String,
+    pub required: bool,
+    pub options: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TriggerPrompt {
+    pub workflow_file: String,
+    pub workflow_name: String,
+    pub fields: Vec<TriggerField>,
+    pub cursor: usize,
+    pub editing: bool,
+    /// View to return to on cancel or after submit.
+    pub return_view: View,
+}
+
+impl TriggerPrompt {
+    pub fn from_workflow(workflow: &Workflow, return_view: View) -> Self {
+        let fields = workflow
+            .inputs
+            .iter()
+            .map(|i| TriggerField {
+                name: i.name.clone(),
+                value: i.default.clone().unwrap_or_default(),
+                required: i.required,
+                options: i.options.clone(),
+            })
+            .collect();
+        Self {
+            workflow_file: workflow.file_name.clone(),
+            workflow_name: workflow.name.clone(),
+            fields,
+            cursor: 0,
+            editing: false,
+            return_view,
+        }
+    }
+
+    pub fn current_field(&self) -> Option<&TriggerField> {
+        self.fields.get(self.cursor)
+    }
+
+    pub fn current_field_mut(&mut self) -> Option<&mut TriggerField> {
+        self.fields.get_mut(self.cursor)
+    }
+
+    pub fn cycle_option(&mut self) {
+        if let Some(f) = self.current_field_mut() {
+            if let Some(opts) = f.options.clone() {
+                if opts.is_empty() {
+                    return;
+                }
+                let idx = opts.iter().position(|o| o == &f.value).unwrap_or(0);
+                f.value = opts[(idx + 1) % opts.len()].clone();
+            }
+        }
+    }
+
+    pub fn missing_required(&self) -> Vec<&str> {
+        self.fields
+            .iter()
+            .filter(|f| f.required && f.value.is_empty())
+            .map(|f| f.name.as_str())
+            .collect()
+    }
+
+    pub fn collected(&self) -> std::collections::HashMap<String, String> {
+        self.fields
+            .iter()
+            .map(|f| (f.name.clone(), f.value.clone()))
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -28,6 +106,7 @@ pub struct AppState {
     pub pending: usize,
     /// Set true when transitioning views so the event loop can `terminal.clear()`.
     pub needs_clear: bool,
+    pub trigger_prompt: Option<TriggerPrompt>,
 }
 
 impl AppState {
@@ -48,6 +127,7 @@ impl AppState {
             workflow_for_runs: None,
             pending: 0,
             needs_clear: false,
+            trigger_prompt: None,
         }
     }
 
