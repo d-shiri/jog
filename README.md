@@ -1,6 +1,6 @@
 # jog
 
-A small terminal UI for browsing and triggering GitHub Actions workflows.
+A terminal UI for browsing and triggering GitHub Actions workflows.
 
 ## Install
 
