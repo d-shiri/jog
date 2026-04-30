@@ -26,8 +26,10 @@ mod views;
 
 pub enum AppEvent {
     WorkflowStatus(String, Option<Run>),
+    WorkflowRunsPreviewLoaded(String, Vec<Run>),
     RunsLoaded(String, Vec<Run>),
     RunDetailLoaded(RunDetail),
+    RunPreviewLoaded(u64, RunDetail),
     LogsLoaded(Vec<String>),
     Status(String),
     /// Like Status but also decrements the pending counter (used by async tasks that bumped it).
@@ -113,6 +115,9 @@ async fn event_loop(
     let km = resolve_keymap(&config.keys)?;
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     spawn_initial_status_fetches(state, &provider, &tx);
+    if let Some(w) = state.selected_workflow().cloned() {
+        spawn_fetch_workflow_preview(provider.clone(), w.file_name, tx.clone(), state);
+    }
 
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(config.ui.poll_interval_ms.max(500)));
@@ -147,16 +152,31 @@ async fn event_loop(
                             w.last_run_at = run.map(|r| r.updated_at);
                         }
                     }
+                    AppEvent::WorkflowRunsPreviewLoaded(file, runs) => {
+                        if state.workflow_preview_file.as_deref() == Some(file.as_str()) {
+                            state.workflow_preview_runs = runs;
+                        }
+                        state.pending = state.pending.saturating_sub(1);
+                    }
                     AppEvent::RunsLoaded(file, runs) => {
                         if state.workflow_for_runs.as_deref() == Some(file.as_str()) {
                             state.runs = runs;
                             state.run_cursor = 0;
+                            if let Some(r) = state.runs.first().cloned() {
+                                spawn_fetch_run_preview(provider.clone(), r.id, tx.clone(), state);
+                            }
                         }
                         state.pending = state.pending.saturating_sub(1);
                     }
                     AppEvent::RunDetailLoaded(detail) => {
                         state.run_detail = Some(detail);
                         state.detail_cursor = 0;
+                        state.pending = state.pending.saturating_sub(1);
+                    }
+                    AppEvent::RunPreviewLoaded(run_id, detail) => {
+                        if state.runs_preview_id == Some(run_id) {
+                            state.runs_preview = Some(detail);
+                        }
                         state.pending = state.pending.saturating_sub(1);
                     }
                     AppEvent::LogsLoaded(lines) => {
@@ -245,6 +265,8 @@ async fn handle_key(
                 state.switch_view(View::Workflows);
                 state.runs.clear();
                 state.workflow_for_runs = None;
+                state.runs_preview = None;
+                state.runs_preview_id = None;
             }
             View::RunDetail | View::Watch => {
                 state.switch_view(View::Runs);
@@ -263,8 +285,10 @@ async fn handle_key(
         View::Workflows => {
             if key_is(&key, km.down) || key.code == KeyCode::Down {
                 move_cursor(&mut state.workflow_cursor, state.workflows.len(), 1);
+                maybe_fetch_workflow_preview(state, provider, tx);
             } else if key_is(&key, km.up) || key.code == KeyCode::Up {
                 move_cursor(&mut state.workflow_cursor, state.workflows.len(), -1);
+                maybe_fetch_workflow_preview(state, provider, tx);
             } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter {
                 if let Some(w) = state.selected_workflow().cloned() {
                     state.switch_view(View::Runs);
@@ -297,8 +321,10 @@ async fn handle_key(
         View::Runs => {
             if key_is(&key, km.down) || key.code == KeyCode::Down {
                 move_cursor(&mut state.run_cursor, state.runs.len(), 1);
+                maybe_fetch_preview(state, provider, tx);
             } else if key_is(&key, km.up) || key.code == KeyCode::Up {
                 move_cursor(&mut state.run_cursor, state.runs.len(), -1);
+                maybe_fetch_preview(state, provider, tx);
             } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter {
                 if let Some(r) = state.selected_run().cloned() {
                     state.switch_view(View::RunDetail);
@@ -386,12 +412,18 @@ async fn handle_key(
             }
         }
         View::Logs => {
+            // Approx max scroll: line count - viewport height. This is a lower
+            // bound on the true wrapped-line count, so the user can still
+            // scroll a little past the perfect bottom on long wrapped lines,
+            // but no longer scrolls forever into blank space.
+            let max_scroll = (state.log_lines.len() as u16)
+                .saturating_sub(state.last_logs_viewport_height.get());
             if key_is(&key, km.down) || key.code == KeyCode::Down {
-                state.log_scroll = state.log_scroll.saturating_add(1);
+                state.log_scroll = state.log_scroll.saturating_add(1).min(max_scroll);
             } else if key_is(&key, km.up) || key.code == KeyCode::Up {
                 state.log_scroll = state.log_scroll.saturating_sub(1);
             } else if key_is(&key, km.page_down) || key.code == KeyCode::PageDown {
-                state.log_scroll = state.log_scroll.saturating_add(20);
+                state.log_scroll = state.log_scroll.saturating_add(20).min(max_scroll);
             } else if key_is(&key, km.page_up) || key.code == KeyCode::PageUp {
                 state.log_scroll = state.log_scroll.saturating_sub(20);
             } else if key_is(&key, km.scroll_top) {
@@ -613,19 +645,47 @@ fn strip_time_prefix(s: &str) -> &str {
     }
 }
 
+/// Strip CSI sequences (`\x1b[…<final-byte>`) so titles/comparisons see clean text.
+/// Mirrors the escape-skipping shape of `views::ansi_line_to_spans`.
+fn strip_ansi(s: &str) -> String {
+    if !s.contains('\x1b') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            let mut j = i + 2;
+            while j < chars.len() && !chars[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            // Skip the final byte too (the alphabetic terminator).
+            i = if j < chars.len() { j + 1 } else { j };
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn parse_log_sections(raw: &[String]) -> Vec<String> {
     raw.iter()
         .filter_map(|l| {
             let content = strip_time_prefix(l);
             content.strip_prefix("##[group]")
                 .or_else(|| content.strip_prefix("##[section]"))
-                .map(|s| s.to_string())
+                .map(strip_ansi)
         })
         .collect()
 }
 
 fn extract_log_section(raw: &[String], section_idx: usize) -> Vec<String> {
+    // Track depth so a nested `##[group]` inside a section doesn't get treated
+    // as the next top-level boundary. Section indices count only top-level groups.
     let mut current = 0usize;
+    let mut depth: usize = 0;
     let mut capturing = false;
     let mut result = Vec::new();
     for line in raw {
@@ -633,16 +693,29 @@ fn extract_log_section(raw: &[String], section_idx: usize) -> Vec<String> {
         let is_group = content.starts_with("##[group]") || content.starts_with("##[section]");
         let is_endgroup = content.starts_with("##[endgroup]");
         if is_group {
-            if current == section_idx {
-                capturing = true;
-                result.push(line.clone());
+            if depth == 0 {
+                if current == section_idx {
+                    capturing = true;
+                    result.push(line.clone());
+                    depth += 1;
+                    current += 1;
+                    continue;
+                } else if capturing {
+                    break;
+                }
+                current += 1;
             } else if capturing {
-                break;
+                result.push(line.clone());
             }
-            current += 1;
-        } else if is_endgroup && capturing {
-            result.push(line.clone());
-            break;
+            depth += 1;
+        } else if is_endgroup {
+            if capturing {
+                result.push(line.clone());
+                if depth <= 1 {
+                    break;
+                }
+            }
+            depth = depth.saturating_sub(1);
         } else if capturing {
             result.push(line.clone());
         }
@@ -676,6 +749,62 @@ fn spawn_fetch_runs(
     tokio::spawn(async move {
         let runs = provider.list_runs(&file, 20).await.unwrap_or_default();
         let _ = tx.send(AppEvent::RunsLoaded(file, runs));
+    });
+}
+
+fn maybe_fetch_workflow_preview(
+    state: &mut AppState,
+    provider: &Arc<GitHubProvider>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    if let Some(w) = state.selected_workflow().cloned() {
+        if state.workflow_preview_file.as_deref() != Some(w.file_name.as_str()) {
+            spawn_fetch_workflow_preview(provider.clone(), w.file_name, tx.clone(), state);
+        }
+    }
+}
+
+fn spawn_fetch_workflow_preview(
+    provider: Arc<GitHubProvider>,
+    file: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+    state: &mut AppState,
+) {
+    state.workflow_preview_file = Some(file.clone());
+    state.workflow_preview_runs.clear();
+    state.pending += 1;
+    tokio::spawn(async move {
+        let runs = provider.list_runs(&file, 10).await.unwrap_or_default();
+        let _ = tx.send(AppEvent::WorkflowRunsPreviewLoaded(file, runs));
+    });
+}
+
+fn maybe_fetch_preview(
+    state: &mut AppState,
+    provider: &Arc<GitHubProvider>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    if let Some(r) = state.selected_run().cloned() {
+        if state.runs_preview_id != Some(r.id) {
+            spawn_fetch_run_preview(provider.clone(), r.id, tx.clone(), state);
+        }
+    }
+}
+
+fn spawn_fetch_run_preview(
+    provider: Arc<GitHubProvider>,
+    run_id: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+    state: &mut AppState,
+) {
+    state.runs_preview_id = Some(run_id);
+    state.runs_preview = None;
+    state.pending += 1;
+    tokio::spawn(async move {
+        match provider.get_run(run_id).await {
+            Ok(detail) => { let _ = tx.send(AppEvent::RunPreviewLoaded(run_id, detail)); }
+            Err(e) => { let _ = tx.send(AppEvent::TaskError(format!("preview: {e}"))); }
+        }
     });
 }
 
@@ -829,5 +958,58 @@ pub fn status_glyph(s: Status) -> &'static str {
         Status::Cancelled => "⊘",
         Status::Skipped => "↷",
         Status::Unknown => "?",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_ansi_removes_csi_sequences() {
+        assert_eq!(strip_ansi("\x1b[36;1mhello\x1b[0m"), "hello");
+        assert_eq!(strip_ansi("plain text"), "plain text");
+        assert_eq!(strip_ansi(""), "");
+    }
+
+    #[test]
+    fn parse_log_sections_strips_ansi_from_titles() {
+        let raw = vec![
+            "08:12:34 ##[group]\x1b[36;1mRun npm test\x1b[0m".to_string(),
+            "08:12:35 some content".to_string(),
+            "08:12:36 ##[endgroup]".to_string(),
+        ];
+        assert_eq!(parse_log_sections(&raw), vec!["Run npm test".to_string()]);
+    }
+
+    #[test]
+    fn extract_log_section_handles_nested_groups() {
+        // Two top-level sections; the first contains a nested group.
+        let raw = vec![
+            "##[group]Outer A".to_string(),
+            "  step 1".to_string(),
+            "##[group]Inner".to_string(),
+            "    nested step".to_string(),
+            "##[endgroup]".to_string(),
+            "  step 2".to_string(),
+            "##[endgroup]".to_string(),
+            "##[group]Outer B".to_string(),
+            "  other".to_string(),
+            "##[endgroup]".to_string(),
+        ];
+        // section 0 should contain everything between the first outer group
+        // and its matching endgroup, including the nested group.
+        let s0 = extract_log_section(&raw, 0);
+        assert!(s0.iter().any(|l| l.contains("Outer A")));
+        assert!(s0.iter().any(|l| l.contains("Inner")));
+        assert!(s0.iter().any(|l| l.contains("nested step")));
+        assert!(s0.iter().any(|l| l.contains("step 2")));
+        assert!(!s0.iter().any(|l| l.contains("Outer B")));
+
+        // section 1 should be Outer B (not the nested Inner).
+        let s1 = extract_log_section(&raw, 1);
+        assert!(s1.iter().any(|l| l.contains("Outer B")));
+        assert!(s1.iter().any(|l| l.contains("other")));
+        assert!(!s1.iter().any(|l| l.contains("Outer A")));
     }
 }

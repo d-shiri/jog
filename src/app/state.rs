@@ -1,5 +1,8 @@
+use std::cell::Cell;
+
 use crate::config::KeymapConfig;
 use crate::provider::{Run, RunDetail, Workflow};
+
 
 #[derive(Debug, Clone, Copy)]
 pub enum DetailItem {
@@ -122,10 +125,20 @@ pub struct AppState {
     /// step_number is the GitHub API number (1-based, may have gaps for internal sub-steps).
     pub log_pending_section: Option<(String, i64)>,
     pub log_scroll: u16,
+    /// Inner viewport height of the Logs pane, captured at last render.
+    /// Used to clamp `log_scroll` so users can't scroll past the bottom.
+    /// Cell so render can write through `&AppState`.
+    pub last_logs_viewport_height: Cell<u16>,
     pub status_msg: Option<String>,
     pub repo_label: String,
     pub current_branch: String,
     pub workflow_for_runs: Option<String>,
+    /// Preview pane in Workflows view: recent runs for the highlighted workflow.
+    pub workflow_preview_file: Option<String>,
+    pub workflow_preview_runs: Vec<Run>,
+    /// Preview pane in Runs view: detail for the highlighted run.
+    pub runs_preview: Option<RunDetail>,
+    pub runs_preview_id: Option<u64>,
     /// Pending async work indicator (count of in-flight tasks)
     pub pending: usize,
     /// Set true when transitioning views so the event loop can `terminal.clear()`.
@@ -150,10 +163,15 @@ impl AppState {
             log_section_idx: None,
             log_pending_section: None,
             log_scroll: 0,
+            last_logs_viewport_height: Cell::new(0),
             status_msg: None,
             repo_label,
             current_branch,
             workflow_for_runs: None,
+            workflow_preview_file: None,
+            workflow_preview_runs: Vec::new(),
+            runs_preview: None,
+            runs_preview_id: None,
             pending: 0,
             needs_clear: false,
             trigger_prompt: None,

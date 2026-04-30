@@ -1,5 +1,6 @@
 use chrono::Utc;
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -115,7 +116,7 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "move"),
             (display_key(&km.tp_cycle).into(), "cycle"),
             (format!("↵/{}", display_key(&km.tp_edit)), "edit"),
-            (display_key(&km.tp_submit).into(), "submit"),
+            (display_key(&km.tp_submit).into(), "trigger"),
             (display_key(&km.back).into(), "cancel"),
         ],
     };
@@ -154,6 +155,15 @@ fn styled_block(title: &str) -> Block<'_> {
 }
 
 fn render_workflows(f: &mut Frame, area: Rect, state: &AppState) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+    render_workflows_list(f, chunks[0], state);
+    render_workflows_preview(f, chunks[1], state);
+}
+
+fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
     let count = state.workflows.len();
     let title = format!("Workflows ({count})");
     let blk = styled_block(&title);
@@ -163,6 +173,14 @@ fn render_workflows(f: &mut Frame, area: Rect, state: &AppState) {
     if inner.height < 2 {
         return;
     }
+
+    // Distribute remaining cols between name and file (55/45 split), capped at original maxes.
+    let prefix = 4usize; // arrow + glyph + space
+    let time_cols = 10usize;
+    let trig_cols = 3usize;
+    let remaining = (inner.width as usize).saturating_sub(prefix + time_cols + trig_cols);
+    let name_cols = (remaining * 55 / 100).min(32);
+    let file_cols = remaining.saturating_sub(name_cols).min(28);
 
     let header_area = Rect { height: 1, ..inner };
     let (divider, list_area) = if inner.height >= 3 {
@@ -175,13 +193,12 @@ fn render_workflows(f: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let hdr = Style::default().fg(Color::Rgb(120, 120, 145));
-    // 4-col indent = 2 (arrow) + 1 (glyph) + 1 (space) — matches every item row exactly
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw("    "),
-            Span::styled(format!("{:<32}", "Workflow"), hdr),
-            Span::styled(format!("{:<28}", "File"), hdr),
-            Span::styled(format!("{:>10}", "Last run"), hdr),
+            Span::styled(pad_dw("Workflow", name_cols), hdr),
+            Span::styled(pad_dw("File", file_cols), hdr),
+            Span::styled(pad_dw("Last run", 10), hdr),
         ])),
         header_area,
     );
@@ -196,6 +213,8 @@ fn render_workflows(f: &mut Frame, area: Rect, state: &AppState) {
 
     let sel_bg = Color::Rgb(25, 85, 110);
     let sel_fg = Color::Rgb(220, 240, 255);
+    let row_cols = 4 + name_cols + file_cols + 10 + 3;
+    let trail = (inner.width as usize).saturating_sub(row_cols);
 
     let items: Vec<ListItem> = state
         .workflows
@@ -210,42 +229,36 @@ fn render_workflows(f: &mut Frame, area: Rect, state: &AppState) {
                 .map(|t| relative_styled(t.with_timezone(&Utc)))
                 .unwrap_or_else(|| ("—".into(), Style::default().fg(Color::DarkGray)));
 
-            // Adds selection bg (and, for selected, overrides fg) on a base style
             let sb = |s: Style| if sel { s.bg(sel_bg) } else { s };
 
-            ListItem::new(Line::from(vec![
-                // Arrow column (2 cols) — inside the item, so we own its width
+            let mut spans = vec![
                 Span::styled(
                     if sel { "▶ " } else { "  " },
                     sb(Style::default().fg(if sel { Color::Cyan } else { Color::Reset })),
                 ),
-                // Status glyph (1 col)
                 Span::styled(status_glyph(status), sb(style_for_status(status))),
-                // Space (1 col)
                 Span::styled(" ", sb(Style::default())),
-                // Workflow name (32 display cols)
                 Span::styled(
-                    pad_dw(&truncate_dw(&w.name, 32), 32),
+                    pad_dw(&truncate_dw(&w.name, name_cols), name_cols),
                     sb(if sel { Style::default().fg(sel_fg).bold() } else { Style::default() }),
                 ),
-                // File name (28 display cols)
                 Span::styled(
-                    pad_dw(&truncate_dw(&w.file_name, 28), 28),
+                    pad_dw(&truncate_dw(&w.file_name, file_cols), file_cols),
                     sb(Style::default().fg(if sel { Color::Rgb(180, 205, 230) } else { Color::Rgb(110, 110, 140) })),
                 ),
-                // Timestamp — right-aligned in a 10-col field so it lines up with the header
                 Span::styled(
-                    format!("{:>10}", when_text),
+                    pad_dw(&when_text, 10),
                     if sel { when_style.fg(sel_fg).bg(sel_bg) } else { when_style },
                 ),
-                // Trigger badge (3 cols)
                 Span::styled(trig, sb(Style::default().fg(Color::Rgb(150, 120, 50)))),
-            ]))
+            ];
+            if sel && trail > 0 {
+                spans.push(Span::styled(" ".repeat(trail), Style::default().bg(sel_bg)));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
-    // No highlight_symbol / highlight_style — selection is rendered inside each item above.
-    // We still use render_stateful_widget so ratatui can scroll the list when needed.
     let mut s = ListState::default();
     if !state.workflows.is_empty() {
         s.select(Some(state.workflow_cursor));
@@ -253,9 +266,105 @@ fn render_workflows(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_stateful_widget(List::new(items), list_area, &mut s);
 }
 
+fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
+    let selected = state.workflows.get(state.workflow_cursor);
+
+    let title = selected
+        .map(|w| w.name.clone())
+        .unwrap_or_else(|| "Runs".into());
+
+    let blk = styled_block(&title);
+    let inner = blk.inner(area);
+    f.render_widget(blk, area);
+
+    if inner.height < 2 {
+        return;
+    }
+
+    let preview_ready = selected
+        .map(|w| state.workflow_preview_file.as_deref() == Some(w.file_name.as_str()))
+        .unwrap_or(false)
+        && !state.workflow_preview_runs.is_empty();
+
+    if !preview_ready {
+        f.render_widget(
+            Paragraph::new(Span::styled("loading…", Style::default().fg(Color::DarkGray))),
+            inner,
+        );
+        return;
+    }
+
+    // Header
+    let branch_cols = (inner.width as usize).saturating_sub(4 + 10);
+    let hdr = Style::default().fg(Color::Rgb(120, 120, 145));
+    let header_area = Rect { height: 1, ..inner };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(pad_dw("Branch", branch_cols), hdr),
+            Span::styled(pad_dw("Updated", 10), hdr),
+        ])),
+        header_area,
+    );
+
+    let list_area = if inner.height > 1 {
+        Rect { y: inner.y + 1, height: inner.height - 1, ..inner }
+    } else {
+        return;
+    };
+
+    let sel_bg = Color::Rgb(25, 85, 110);
+    let sel_fg = Color::Rgb(220, 240, 255);
+    let row_cols = 4 + branch_cols + 10;
+    let trail = (inner.width as usize).saturating_sub(row_cols);
+
+    let items: Vec<ListItem> = state
+        .workflow_preview_runs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let sel = i == 0; // highlight the most recent run
+            let (when_text, when_style) = relative_styled(r.updated_at);
+            let sb = |s: Style| if sel { s.bg(sel_bg) } else { s };
+
+            let mut spans = vec![
+                Span::styled(
+                    if sel { "▶ " } else { "  " },
+                    sb(Style::default().fg(if sel { Color::Cyan } else { Color::Reset })),
+                ),
+                Span::styled(status_glyph(r.status), sb(style_for_status(r.status))),
+                Span::styled(" ", sb(Style::default())),
+                Span::styled(
+                    pad_dw(&truncate_dw(&r.head_branch, branch_cols), branch_cols),
+                    sb(Style::default().fg(if sel { Color::Rgb(255, 230, 120) } else { Color::Yellow })),
+                ),
+                Span::styled(
+                    pad_dw(&when_text, 10),
+                    if sel { when_style.fg(sel_fg).bg(sel_bg) } else { when_style },
+                ),
+            ];
+            if sel && trail > 0 {
+                spans.push(Span::styled(" ".repeat(trail), Style::default().bg(sel_bg)));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    f.render_widget(List::new(items), list_area);
+}
+
 fn render_runs(f: &mut Frame, area: Rect, state: &AppState) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(area);
+    render_runs_list(f, chunks[0], state);
+    render_runs_preview(f, chunks[1], state);
+}
+
+fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
     let title = match &state.workflow_for_runs {
-        Some(f) => format!("Runs — {} ({})", f, state.runs.len()),
+        Some(wf) => format!("Runs — {} ({})", wf, state.runs.len()),
         None => format!("Runs ({})", state.runs.len()),
     };
     let blk = styled_block(&title);
@@ -265,6 +374,9 @@ fn render_runs(f: &mut Frame, area: Rect, state: &AppState) {
     if inner.height < 2 {
         return;
     }
+
+    // Branch column width fills remaining space after prefix(4) + time(10).
+    let branch_cols = (inner.width.saturating_sub(4 + 10) as usize).min(28);
 
     let header_area = Rect { height: 1, ..inner };
     let (divider, list_area) = if inner.height >= 3 {
@@ -280,10 +392,8 @@ fn render_runs(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw("    "),
-            Span::styled(format!("{:<10}", "ID"), hdr),
-            Span::styled(format!("{:<24}", "Branch"), hdr),
-            Span::styled(format!("{:<36}", "Title"), hdr),
-            Span::styled(format!("{:>10}", "Updated"), hdr),
+            Span::styled(pad_dw("Branch", branch_cols), hdr),
+            Span::styled(pad_dw("Updated", 10), hdr),
         ])),
         header_area,
     );
@@ -298,6 +408,8 @@ fn render_runs(f: &mut Frame, area: Rect, state: &AppState) {
 
     let sel_bg = Color::Rgb(25, 85, 110);
     let sel_fg = Color::Rgb(220, 240, 255);
+    let row_cols = 4 + branch_cols + 10;
+    let trail = (inner.width as usize).saturating_sub(row_cols);
 
     let items: Vec<ListItem> = state
         .runs
@@ -308,7 +420,7 @@ fn render_runs(f: &mut Frame, area: Rect, state: &AppState) {
             let (when_text, when_style) = relative_styled(r.updated_at);
             let sb = |s: Style| if sel { s.bg(sel_bg) } else { s };
 
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     if sel { "▶ " } else { "  " },
                     sb(Style::default().fg(if sel { Color::Cyan } else { Color::Reset })),
@@ -316,22 +428,18 @@ fn render_runs(f: &mut Frame, area: Rect, state: &AppState) {
                 Span::styled(status_glyph(r.status), sb(style_for_status(r.status))),
                 Span::styled(" ", sb(Style::default())),
                 Span::styled(
-                    format!("{:<10}", r.id),
-                    sb(Style::default().fg(if sel { sel_fg } else { Color::Reset })),
-                ),
-                Span::styled(
-                    format!("{:<24}", truncate(&r.head_branch, 24)),
+                    pad_dw(&truncate_dw(&r.head_branch, branch_cols), branch_cols),
                     sb(Style::default().fg(if sel { Color::Rgb(255, 230, 120) } else { Color::Yellow })),
                 ),
                 Span::styled(
-                    format!("{:<36}", truncate(&r.display_title, 36)),
-                    sb(if sel { Style::default().fg(sel_fg).bold() } else { Style::default() }),
-                ),
-                Span::styled(
-                    format!("{:>10}", when_text),
+                    pad_dw(&when_text, 10),
                     if sel { when_style.fg(sel_fg).bg(sel_bg) } else { when_style },
                 ),
-            ]))
+            ];
+            if sel && trail > 0 {
+                spans.push(Span::styled(" ".repeat(trail), Style::default().bg(sel_bg)));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -340,6 +448,57 @@ fn render_runs(f: &mut Frame, area: Rect, state: &AppState) {
         s.select(Some(state.run_cursor));
     }
     f.render_stateful_widget(List::new(items), list_area, &mut s);
+}
+
+fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
+    let selected = state.runs.get(state.run_cursor);
+
+    let title = selected.map(|r| {
+        format!("{} — {}", r.display_title, r.head_branch)
+    }).unwrap_or_else(|| "Preview".into());
+
+    let blk = styled_block(&title);
+    let inner = blk.inner(area);
+    f.render_widget(blk, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let preview_ready = selected
+        .map(|r| state.runs_preview_id == Some(r.id))
+        .unwrap_or(false)
+        && state.runs_preview.is_some();
+
+    if !preview_ready {
+        f.render_widget(
+            Paragraph::new(Span::styled("loading…", Style::default().fg(Color::DarkGray))),
+            inner,
+        );
+        return;
+    }
+
+    if let Some(detail) = &state.runs_preview {
+        let mut lines: Vec<Line> = Vec::new();
+        for job in &detail.jobs {
+            lines.push(Line::from(vec![
+                Span::styled(status_glyph(job.status), style_for_status(job.status)),
+                Span::raw(" "),
+                Span::styled(job.name.clone(), Style::default().bold()),
+            ]));
+            for (si, step) in job.steps.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(status_glyph(step.status), style_for_status(step.status)),
+                    Span::raw(format!(" {}. {}", si + 1, step.name)),
+                ]));
+            }
+        }
+        f.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            inner,
+        );
+    }
 }
 
 fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
@@ -530,6 +689,10 @@ fn apply_sgr(params: &str, current: Style, default: Style) -> Style {
 }
 
 fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
+    // Inner area = area minus the rounded border (1 row top + 1 row bottom).
+    let viewport = area.height.saturating_sub(2);
+    state.last_logs_viewport_height.set(viewport);
+
     let log_title = if let Some(idx) = state.log_section_idx {
         let name = state.log_sections.get(idx).map(|s| s.as_str()).unwrap_or("?");
         let total = state.log_sections.len();
@@ -853,28 +1016,8 @@ fn relative_styled(t: chrono::DateTime<Utc>) -> (String, Style) {
     (text, style)
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
-}
-
 fn char_display_width(c: char) -> usize {
-    let cp = c as u32;
-    // Emoji (most common ranges) and CJK characters render as 2 terminal columns.
-    if (0x1F300..=0x1FAFF).contains(&cp)
-        || (0x2600..=0x27BF).contains(&cp)
-        || (0x4E00..=0x9FFF).contains(&cp)
-        || (0x3000..=0x303F).contains(&cp)
-    {
-        2
-    } else {
-        1
-    }
+    UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
 fn truncate_dw(s: &str, max_cols: usize) -> String {

@@ -2,6 +2,9 @@
 name = "jog"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "A small terminal UI for browsing and triggering GitHub Actions workflows."
+readme = "README.md"
 
 [dependencies]
 ratatui = "0.29"
@@ -19,6 +22,7 @@ futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 open = "5"
+unicode-width = "0.1"
 
 
 [profile.release]

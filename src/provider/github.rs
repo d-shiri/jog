@@ -202,13 +202,17 @@ impl Provider for GitHubProvider {
     async fn get_run(&self, id: u64) -> Result<RunDetail> {
         let run_id = octocrab::models::RunId(id);
         let handler = self.crab.workflows(&self.repo.owner, &self.repo.repo);
-        let run = handler.get(run_id).await.context("get run")?;
-        let jobs_page = handler
-            .list_jobs(run_id)
-            .per_page(50)
-            .send()
-            .await
-            .context("list jobs")?;
+        let (run, jobs_page) = tokio::try_join!(
+            async { handler.get(run_id).await.context("get run") },
+            async {
+                handler
+                    .list_jobs(run_id)
+                    .per_page(50)
+                    .send()
+                    .await
+                    .context("list jobs")
+            },
+        )?;
         let jobs = jobs_page.items.into_iter().map(map_job).collect();
         Ok(RunDetail {
             run: map_run(run),
