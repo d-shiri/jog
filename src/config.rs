@@ -8,6 +8,8 @@ pub struct Config {
     pub provider: ProviderConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub keys: KeymapConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -46,6 +48,75 @@ fn default_theme() -> String {
 }
 fn default_poll_ms() -> u64 {
     5000
+}
+
+/// Key name strings exactly as they appear in config.toml [keys].
+/// Single chars ("j", "R"), special names ("Enter", "Esc", "Space",
+/// "PageUp", "PageDown", "Up", "Down"), or modifier combos ("ctrl+c").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeymapConfig {
+    // global
+    pub quit: String,
+    pub back: String,
+    // navigation (shared across list views and scroll)
+    pub down: String,
+    pub up: String,
+    // confirm / open
+    pub confirm: String,
+    pub open_logs: String,
+    // log scrolling
+    pub page_down: String,
+    pub page_up: String,
+    pub scroll_top: String,
+    // log step navigation
+    pub next_step: String,
+    pub prev_step: String,
+    pub all_steps: String,
+    // workflow actions
+    pub trigger: String,
+    pub watch: String,
+    pub open_browser: String,
+    // run actions
+    pub cancel_run: String,
+    pub rerun: String,
+    pub rerun_failed: String,
+    // trigger-prompt (normal mode)
+    pub tp_edit: String,
+    pub tp_submit: String,
+    pub tp_yes: String,
+    pub tp_no: String,
+    pub tp_cycle: String,
+}
+
+impl Default for KeymapConfig {
+    fn default() -> Self {
+        Self {
+            quit: "q".into(),
+            back: "Esc".into(),
+            down: "j".into(),
+            up: "k".into(),
+            confirm: "Enter".into(),
+            open_logs: "l".into(),
+            page_down: "d".into(),
+            page_up: "u".into(),
+            scroll_top: "g".into(),
+            next_step: "n".into(),
+            prev_step: "p".into(),
+            all_steps: "a".into(),
+            trigger: "t".into(),
+            watch: "w".into(),
+            open_browser: "o".into(),
+            cancel_run: "x".into(),
+            rerun: "r".into(),
+            rerun_failed: "R".into(),
+            tp_edit: "i".into(),
+            tp_submit: "t".into(),
+            tp_yes: "y".into(),
+            tp_no: "n".into(),
+            tp_cycle: "Space".into(),
+        }
+    }
 }
 
 impl Config {

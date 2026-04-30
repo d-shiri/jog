@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
@@ -16,7 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::app::state::{AppState, TriggerPrompt, View};
+use crate::app::state::{AppState, DetailItem, TriggerPrompt, View, build_detail_items};
+use crate::config::KeymapConfig;
 use crate::config::Config;
 use crate::provider::github::{GitHubProvider, current_branch};
 use crate::provider::{Provider, Run, RunDetail, Status, Workflow};
@@ -29,6 +30,8 @@ pub enum AppEvent {
     RunDetailLoaded(RunDetail),
     LogsLoaded(Vec<String>),
     Status(String),
+    /// Like Status but also decrements the pending counter (used by async tasks that bumped it).
+    TaskError(String),
     Quit,
 }
 
@@ -45,7 +48,7 @@ pub async fn run(
 ) -> Result<()> {
     let branch = current_branch().unwrap_or_else(|_| "?".into());
     let repo_label = format!("{}/{}", provider.repo().owner, provider.repo().repo);
-    let mut state = AppState::new(repo_label, branch, sort_with_favorites(workflows, &config));
+    let mut state = AppState::new(repo_label, branch, sort_with_favorites(workflows, &config), config.keys.clone());
 
     if let Some(file) = opts.focus_workflow.as_deref() {
         if let Some(idx) = state
@@ -107,6 +110,7 @@ async fn event_loop(
     provider: Arc<GitHubProvider>,
     config: Config,
 ) -> Result<()> {
+    let km = resolve_keymap(&config.keys)?;
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     spawn_initial_status_fetches(state, &provider, &tx);
 
@@ -126,7 +130,7 @@ async fn event_loop(
                 if let Some(Ok(Event::Key(key))) = maybe_evt
                     && key.kind == KeyEventKind::Press
                 {
-                    if let Some(action) = handle_key(state, key, &provider, &tx).await {
+                    if let Some(action) = handle_key(state, key, &provider, &tx, &km).await {
                         match action {
                             AppEvent::Quit => return Ok(()),
                             _ => {}
@@ -152,21 +156,48 @@ async fn event_loop(
                     }
                     AppEvent::RunDetailLoaded(detail) => {
                         state.run_detail = Some(detail);
-                        state.job_cursor = 0;
+                        state.detail_cursor = 0;
                         state.pending = state.pending.saturating_sub(1);
                     }
                     AppEvent::LogsLoaded(lines) => {
-                        state.log_lines = lines;
+                        state.log_sections = parse_log_sections(&lines);
+                        state.log_raw = lines.clone();
+                        if let Some((step_name, step_number)) = state.log_pending_section.take() {
+                            let n = state.log_sections.len();
+                            // Try exact name match first, then substring, then fall back to
+                            // step_number-1 as the section index (GitHub's log has one ##[group]
+                            // per step including hidden internal sub-steps, so step_number is a
+                            // reliable 1-based index into the full section list).
+                            let idx = state.log_sections.iter()
+                                .position(|s| s.trim() == step_name.trim())
+                                .or_else(|| state.log_sections.iter()
+                                    .position(|s| s.contains(step_name.as_str()) || step_name.contains(s.as_str())))
+                                .or_else(|| {
+                                    let by_number = (step_number - 1) as usize;
+                                    if by_number < n { Some(by_number) } else { None }
+                                });
+                            state.log_section_idx = idx;
+                            state.log_lines = idx
+                                .map(|i| extract_log_section(&lines, i))
+                                .unwrap_or(lines);
+                        } else {
+                            state.log_section_idx = None;
+                            state.log_lines = lines;
+                        }
                         state.log_scroll = 0;
                         state.pending = state.pending.saturating_sub(1);
                     }
                     AppEvent::Status(msg) => {
                         state.status_msg = Some(msg);
                     }
+                    AppEvent::TaskError(msg) => {
+                        state.status_msg = Some(msg);
+                        state.pending = state.pending.saturating_sub(1);
+                    }
                 }
             }
             _ = tick.tick() => {
-                if state.view == View::Watch {
+                if state.view == View::Watch && state.pending == 0 {
                     // Refresh the runs list so a freshly triggered run replaces
                     // the previous one as `runs.first()`. Without this, the
                     // tick below keeps polling the OLD run id forever.
@@ -187,25 +218,28 @@ async fn handle_key(
     key: KeyEvent,
     provider: &Arc<GitHubProvider>,
     tx: &mpsc::UnboundedSender<AppEvent>,
+    km: &Keymap,
 ) -> Option<AppEvent> {
+    // ctrl+c always quits regardless of keymap
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Some(AppEvent::Quit);
     }
-    // While typing into a trigger-prompt field, route ALL keys to the editor
-    // so 'q', 'j', 't', etc. are treated as text input rather than commands.
+    // In trigger-prompt edit mode, route ALL keys to the text editor.
     if state.view == View::TriggerPrompt
-        && state
-            .trigger_prompt
-            .as_ref()
-            .map(|p| p.editing)
-            .unwrap_or(false)
+        && state.trigger_prompt.as_ref().map(|p| p.editing).unwrap_or(false)
     {
         handle_trigger_prompt_edit(state, key);
         return None;
     }
-    match (state.view, key.code) {
-        (_, KeyCode::Char('q')) => return Some(AppEvent::Quit),
-        (_, KeyCode::Esc) => match state.view {
+
+    // Global: quit
+    if key_is(&key, km.quit) {
+        return Some(AppEvent::Quit);
+    }
+
+    // Global: back — Esc is always accepted as a fallback regardless of config
+    if key_is(&key, km.back) || key.code == KeyCode::Esc {
+        match state.view {
             View::Workflows => return Some(AppEvent::Quit),
             View::Runs => {
                 state.switch_view(View::Workflows);
@@ -220,171 +254,219 @@ async fn handle_key(
                 state.switch_view(View::RunDetail);
                 state.log_lines.clear();
             }
-            View::TriggerPrompt => {
-                cancel_trigger_prompt(state);
+            View::TriggerPrompt => cancel_trigger_prompt(state),
+        }
+        return None;
+    }
+
+    match state.view {
+        View::Workflows => {
+            if key_is(&key, km.down) || key.code == KeyCode::Down {
+                move_cursor(&mut state.workflow_cursor, state.workflows.len(), 1);
+            } else if key_is(&key, km.up) || key.code == KeyCode::Up {
+                move_cursor(&mut state.workflow_cursor, state.workflows.len(), -1);
+            } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter {
+                if let Some(w) = state.selected_workflow().cloned() {
+                    state.switch_view(View::Runs);
+                    state.workflow_for_runs = Some(w.file_name.clone());
+                    state.runs.clear();
+                    spawn_fetch_runs(provider.clone(), w.file_name, tx.clone(), state);
+                }
+            } else if key_is(&key, km.trigger) {
+                trigger_workflow_at_cursor(state, provider, tx);
+            } else if key_is(&key, km.watch) {
+                if let Some(w) = state.selected_workflow().cloned() {
+                    state.switch_view(View::Watch);
+                    state.workflow_for_runs = Some(w.file_name.clone());
+                    state.runs.clear();
+                    spawn_fetch_runs(provider.clone(), w.file_name, tx.clone(), state);
+                }
+            } else if key_is(&key, km.open_browser) {
+                if let Some(w) = state.selected_workflow().cloned() {
+                    let p = provider.clone();
+                    let tx2 = tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(Some(run)) = p.get_latest_run(&w.file_name).await {
+                            let _ = open::that(run.url.clone());
+                            let _ = tx2.send(AppEvent::Status(format!("opened run {}", run.id)));
+                        }
+                    });
+                }
             }
-        },
-        (View::Workflows, KeyCode::Char('j') | KeyCode::Down) => {
-            move_cursor(&mut state.workflow_cursor, state.workflows.len(), 1);
         }
-        (View::Workflows, KeyCode::Char('k') | KeyCode::Up) => {
-            move_cursor(&mut state.workflow_cursor, state.workflows.len(), -1);
-        }
-        (View::Workflows, KeyCode::Enter) => {
-            if let Some(w) = state.selected_workflow().cloned() {
-                state.switch_view(View::Runs);
-                state.workflow_for_runs = Some(w.file_name.clone());
-                state.runs.clear();
-                spawn_fetch_runs(provider.clone(), w.file_name, tx.clone(), state);
-            }
-        }
-        (View::Workflows, KeyCode::Char('t')) => {
-            trigger_workflow_at_cursor(state, provider, tx);
-        }
-        (View::Workflows, KeyCode::Char('w')) => {
-            if let Some(w) = state.selected_workflow().cloned() {
+        View::Runs => {
+            if key_is(&key, km.down) || key.code == KeyCode::Down {
+                move_cursor(&mut state.run_cursor, state.runs.len(), 1);
+            } else if key_is(&key, km.up) || key.code == KeyCode::Up {
+                move_cursor(&mut state.run_cursor, state.runs.len(), -1);
+            } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter {
+                if let Some(r) = state.selected_run().cloned() {
+                    state.switch_view(View::RunDetail);
+                    spawn_fetch_run_detail(provider.clone(), r.id, tx.clone(), state);
+                }
+            } else if key_is(&key, km.watch) {
                 state.switch_view(View::Watch);
-                state.workflow_for_runs = Some(w.file_name.clone());
-                state.runs.clear();
-                spawn_fetch_runs(provider.clone(), w.file_name, tx.clone(), state);
-            }
-        }
-        (View::Workflows, KeyCode::Char('o')) => {
-            if let Some(w) = state.selected_workflow().cloned() {
-                let p = provider.clone();
-                let tx2 = tx.clone();
-                tokio::spawn(async move {
-                    if let Ok(Some(run)) = p.get_latest_run(&w.file_name).await {
-                        let _ = open::that(run.url.clone());
-                        let _ = tx2.send(AppEvent::Status(format!("opened run {}", run.id)));
+            } else if key_is(&key, km.trigger) {
+                if let Some(file) = state.workflow_for_runs.clone() {
+                    if let Some(w) = state.workflows.iter().find(|w| w.file_name == file).cloned() {
+                        trigger_workflow(state, &w, provider, tx);
                     }
-                });
-            }
-        }
-        (View::Runs, KeyCode::Char('j') | KeyCode::Down) => {
-            move_cursor(&mut state.run_cursor, state.runs.len(), 1);
-        }
-        (View::Runs, KeyCode::Char('k') | KeyCode::Up) => {
-            move_cursor(&mut state.run_cursor, state.runs.len(), -1);
-        }
-        (View::Runs, KeyCode::Enter) => {
-            if let Some(r) = state.selected_run().cloned() {
-                state.switch_view(View::RunDetail);
-                spawn_fetch_run_detail(provider.clone(), r.id, tx.clone(), state);
-            }
-        }
-        (View::Runs, KeyCode::Char('w')) => {
-            state.switch_view(View::Watch);
-        }
-        (View::Runs, KeyCode::Char('t')) => {
-            // Trigger a fresh run of the workflow we're viewing.
-            if let Some(file) = state.workflow_for_runs.clone() {
-                if let Some(w) = state.workflows.iter().find(|w| w.file_name == file).cloned() {
-                    trigger_workflow(state, &w, provider, tx);
+                }
+            } else if key_is(&key, km.cancel_run) {
+                if let Some(r) = state.selected_run().cloned() {
+                    let p = provider.clone();
+                    let tx2 = tx.clone();
+                    tokio::spawn(async move {
+                        let msg = match p.cancel(r.id).await {
+                            Ok(_) => format!("cancelled run {}", r.id),
+                            Err(e) => format!("cancel failed: {e}"),
+                        };
+                        let _ = tx2.send(AppEvent::Status(msg));
+                    });
+                }
+            } else if key_is(&key, km.rerun) {
+                if let Some(r) = state.selected_run().cloned() {
+                    let p = provider.clone();
+                    let tx2 = tx.clone();
+                    tokio::spawn(async move {
+                        let msg = match p.rerun(r.id).await {
+                            Ok(_) => format!("rerunning all jobs for {}", r.id),
+                            Err(e) => format!("rerun failed: {e}"),
+                        };
+                        let _ = tx2.send(AppEvent::Status(msg));
+                    });
+                }
+            } else if key_is(&key, km.rerun_failed) {
+                if let Some(r) = state.selected_run().cloned() {
+                    let p = provider.clone();
+                    let tx2 = tx.clone();
+                    tokio::spawn(async move {
+                        let msg = match p.rerun_failed(r.id).await {
+                            Ok(_) => format!("rerunning failed jobs for {}", r.id),
+                            Err(e) => format!("rerun-failed failed: {e}"),
+                        };
+                        let _ = tx2.send(AppEvent::Status(msg));
+                    });
                 }
             }
         }
-        (View::Runs, KeyCode::Char('x')) => {
-            if let Some(r) = state.selected_run().cloned() {
-                let p = provider.clone();
-                let tx2 = tx.clone();
-                tokio::spawn(async move {
-                    let msg = match p.cancel(r.id).await {
-                        Ok(_) => format!("cancelled run {}", r.id),
-                        Err(e) => format!("cancel failed: {e}"),
-                    };
-                    let _ = tx2.send(AppEvent::Status(msg));
-                });
-            }
-        }
-        (View::Runs, KeyCode::Char('r')) => {
-            // lowercase r = rerun all jobs in the selected run
-            if let Some(r) = state.selected_run().cloned() {
-                let p = provider.clone();
-                let tx2 = tx.clone();
-                tokio::spawn(async move {
-                    let msg = match p.rerun(r.id).await {
-                        Ok(_) => format!("rerunning all jobs for {}", r.id),
-                        Err(e) => format!("rerun failed: {e}"),
-                    };
-                    let _ = tx2.send(AppEvent::Status(msg));
-                });
-            }
-        }
-        (View::Runs, KeyCode::Char('R')) => {
-            // uppercase R = rerun only failed jobs
-            if let Some(r) = state.selected_run().cloned() {
-                let p = provider.clone();
-                let tx2 = tx.clone();
-                tokio::spawn(async move {
-                    let msg = match p.rerun_failed(r.id).await {
-                        Ok(_) => format!("rerunning failed jobs for {}", r.id),
-                        Err(e) => format!("rerun-failed failed: {e}"),
-                    };
-                    let _ = tx2.send(AppEvent::Status(msg));
-                });
-            }
-        }
-        (View::RunDetail, KeyCode::Char('j') | KeyCode::Down) => {
-            let max = state.run_detail.as_ref().map(|d| d.jobs.len()).unwrap_or(0);
-            move_cursor(&mut state.job_cursor, max, 1);
-        }
-        (View::RunDetail, KeyCode::Char('k') | KeyCode::Up) => {
-            let max = state.run_detail.as_ref().map(|d| d.jobs.len()).unwrap_or(0);
-            move_cursor(&mut state.job_cursor, max, -1);
-        }
-        (View::RunDetail, KeyCode::Enter | KeyCode::Char('l')) => {
-            if let Some(detail) = &state.run_detail {
-                if let Some(job) = detail.jobs.get(state.job_cursor).cloned() {
-                    state.switch_view(View::Logs);
-                    state.log_lines = vec!["loading...".into()];
-                    spawn_fetch_logs(provider.clone(), job.id, tx.clone(), state);
+        View::RunDetail => {
+            if key_is(&key, km.down) || key.code == KeyCode::Down {
+                let max = state.run_detail.as_ref().map(|d| build_detail_items(d).len()).unwrap_or(0);
+                move_cursor(&mut state.detail_cursor, max, 1);
+            } else if key_is(&key, km.up) || key.code == KeyCode::Up {
+                let max = state.run_detail.as_ref().map(|d| build_detail_items(d).len()).unwrap_or(0);
+                move_cursor(&mut state.detail_cursor, max, -1);
+            } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter || key_is(&key, km.open_logs) {
+                if let Some(detail) = &state.run_detail {
+                    let items = build_detail_items(detail);
+                    match items.get(state.detail_cursor).copied() {
+                        Some(DetailItem::Job(ji)) => {
+                            if let Some(job) = detail.jobs.get(ji).cloned() {
+                                state.log_pending_section = None;
+                                state.switch_view(View::Logs);
+                                state.log_lines = vec!["loading...".into()];
+                                spawn_fetch_logs(provider.clone(), job.id, tx.clone(), state);
+                            }
+                        }
+                        Some(DetailItem::Step { job: ji, step: si }) => {
+                            if let (Some(job), Some(step)) = (
+                                detail.jobs.get(ji).cloned(),
+                                detail.jobs.get(ji).and_then(|j| j.steps.get(si)).cloned(),
+                            ) {
+                                state.log_pending_section = Some((step.name.clone(), step.number));
+                                state.switch_view(View::Logs);
+                                state.log_lines = vec!["loading...".into()];
+                                spawn_fetch_logs(provider.clone(), job.id, tx.clone(), state);
+                            }
+                        }
+                        None => {}
+                    }
                 }
             }
         }
-        (View::Logs, KeyCode::Char('j') | KeyCode::Down) => {
-            state.log_scroll = state.log_scroll.saturating_add(1);
-        }
-        (View::Logs, KeyCode::Char('k') | KeyCode::Up) => {
-            state.log_scroll = state.log_scroll.saturating_sub(1);
-        }
-        (View::Logs, KeyCode::PageDown | KeyCode::Char('d')) => {
-            state.log_scroll = state.log_scroll.saturating_add(20);
-        }
-        (View::Logs, KeyCode::PageUp | KeyCode::Char('u')) => {
-            state.log_scroll = state.log_scroll.saturating_sub(20);
-        }
-        (View::Logs, KeyCode::Char('g')) => {
-            state.log_scroll = 0;
-        }
-        (View::TriggerPrompt, KeyCode::Char('j') | KeyCode::Down) => {
-            if let Some(p) = state.trigger_prompt.as_mut() {
-                let len = p.fields.len();
-                move_cursor(&mut p.cursor, len, 1);
-            }
-        }
-        (View::TriggerPrompt, KeyCode::Char('k') | KeyCode::Up) => {
-            if let Some(p) = state.trigger_prompt.as_mut() {
-                let len = p.fields.len();
-                move_cursor(&mut p.cursor, len, -1);
-            }
-        }
-        (View::TriggerPrompt, KeyCode::Char(' ')) => {
-            if let Some(p) = state.trigger_prompt.as_mut() {
-                p.cycle_option();
-            }
-        }
-        (View::TriggerPrompt, KeyCode::Enter | KeyCode::Char('i')) => {
-            if let Some(p) = state.trigger_prompt.as_mut() {
-                if p.current_field().is_some() {
-                    p.editing = true;
+        View::Logs => {
+            if key_is(&key, km.down) || key.code == KeyCode::Down {
+                state.log_scroll = state.log_scroll.saturating_add(1);
+            } else if key_is(&key, km.up) || key.code == KeyCode::Up {
+                state.log_scroll = state.log_scroll.saturating_sub(1);
+            } else if key_is(&key, km.page_down) || key.code == KeyCode::PageDown {
+                state.log_scroll = state.log_scroll.saturating_add(20);
+            } else if key_is(&key, km.page_up) || key.code == KeyCode::PageUp {
+                state.log_scroll = state.log_scroll.saturating_sub(20);
+            } else if key_is(&key, km.scroll_top) {
+                state.log_scroll = 0;
+            } else if key_is(&key, km.next_step) {
+                let n = state.log_sections.len();
+                if n > 0 {
+                    let next = state.log_section_idx.map(|i| (i + 1).min(n - 1)).unwrap_or(0);
+                    state.log_section_idx = Some(next);
+                    state.log_lines = extract_log_section(&state.log_raw, next);
+                    state.log_scroll = 0;
                 }
+            } else if key_is(&key, km.prev_step) {
+                match state.log_section_idx {
+                    None => {}
+                    Some(0) => {
+                        state.log_section_idx = None;
+                        state.log_lines = state.log_raw.clone();
+                        state.log_scroll = 0;
+                    }
+                    Some(i) => {
+                        let prev = i - 1;
+                        state.log_section_idx = Some(prev);
+                        state.log_lines = extract_log_section(&state.log_raw, prev);
+                        state.log_scroll = 0;
+                    }
+                }
+            } else if key_is(&key, km.all_steps) {
+                state.log_section_idx = None;
+                state.log_lines = state.log_raw.clone();
+                state.log_scroll = 0;
             }
         }
-        (View::TriggerPrompt, KeyCode::Char('t')) => {
-            submit_trigger_prompt(state, provider, tx);
+        View::TriggerPrompt => {
+            if key_is(&key, km.down) || key.code == KeyCode::Down {
+                if let Some(p) = state.trigger_prompt.as_mut() {
+                    let len = p.fields.len();
+                    move_cursor(&mut p.cursor, len, 1);
+                }
+            } else if key_is(&key, km.up) || key.code == KeyCode::Up {
+                if let Some(p) = state.trigger_prompt.as_mut() {
+                    let len = p.fields.len();
+                    move_cursor(&mut p.cursor, len, -1);
+                }
+            } else if key_is(&key, km.tp_cycle) {
+                if let Some(p) = state.trigger_prompt.as_mut() {
+                    p.cycle_option();
+                }
+            } else if key_is(&key, km.tp_yes) {
+                if let Some(p) = state.trigger_prompt.as_mut() {
+                    if let Some(f) = p.current_field_mut() {
+                        if f.options.as_deref().map_or(false, |o| o.iter().any(|x| x == "yes")) {
+                            f.value = "yes".to_string();
+                        }
+                    }
+                }
+            } else if key_is(&key, km.tp_no) {
+                if let Some(p) = state.trigger_prompt.as_mut() {
+                    if let Some(f) = p.current_field_mut() {
+                        if f.options.as_deref().map_or(false, |o| o.iter().any(|x| x == "no")) {
+                            f.value = "no".to_string();
+                        }
+                    }
+                }
+            } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter || key_is(&key, km.tp_edit) {
+                if let Some(p) = state.trigger_prompt.as_mut() {
+                    if p.current_field().is_some() {
+                        p.editing = true;
+                    }
+                }
+            } else if key_is(&key, km.tp_submit) {
+                submit_trigger_prompt(state, provider, tx);
+            }
         }
-        _ => {}
+        View::Watch => {}
     }
     None
 }
@@ -419,6 +501,153 @@ fn move_cursor(cursor: &mut usize, len: usize, delta: i32) {
     let last = len - 1;
     let new = (*cursor as i32 + delta).clamp(0, last as i32);
     *cursor = new as usize;
+}
+
+struct Keymap {
+    quit: (KeyCode, KeyModifiers),
+    back: (KeyCode, KeyModifiers),
+    down: (KeyCode, KeyModifiers),
+    up: (KeyCode, KeyModifiers),
+    confirm: (KeyCode, KeyModifiers),
+    open_logs: (KeyCode, KeyModifiers),
+    page_down: (KeyCode, KeyModifiers),
+    page_up: (KeyCode, KeyModifiers),
+    scroll_top: (KeyCode, KeyModifiers),
+    next_step: (KeyCode, KeyModifiers),
+    prev_step: (KeyCode, KeyModifiers),
+    all_steps: (KeyCode, KeyModifiers),
+    trigger: (KeyCode, KeyModifiers),
+    watch: (KeyCode, KeyModifiers),
+    open_browser: (KeyCode, KeyModifiers),
+    cancel_run: (KeyCode, KeyModifiers),
+    rerun: (KeyCode, KeyModifiers),
+    rerun_failed: (KeyCode, KeyModifiers),
+    tp_edit: (KeyCode, KeyModifiers),
+    tp_submit: (KeyCode, KeyModifiers),
+    tp_yes: (KeyCode, KeyModifiers),
+    tp_no: (KeyCode, KeyModifiers),
+    tp_cycle: (KeyCode, KeyModifiers),
+}
+
+fn parse_key(s: &str) -> Result<(KeyCode, KeyModifiers)> {
+    let s = s.trim();
+    let (mods, key_str) = if let Some((prefix, k)) = s.rsplit_once('+') {
+        let mods = prefix.split('+').try_fold(KeyModifiers::NONE, |acc, m| {
+            Ok(acc | match m.to_lowercase().as_str() {
+                "ctrl" => KeyModifiers::CONTROL,
+                "shift" => KeyModifiers::SHIFT,
+                "alt" => KeyModifiers::ALT,
+                other => return Err(anyhow!("unknown modifier `{other}` in key `{s}`")),
+            })
+        })?;
+        (mods, k)
+    } else {
+        (KeyModifiers::NONE, s)
+    };
+    let code = match key_str {
+        "Enter" => KeyCode::Enter,
+        "Esc" | "Escape" => KeyCode::Esc,
+        "Backspace" => KeyCode::Backspace,
+        "Tab" => KeyCode::Tab,
+        "Up" => KeyCode::Up,
+        "Down" => KeyCode::Down,
+        "Left" => KeyCode::Left,
+        "Right" => KeyCode::Right,
+        "PageUp" => KeyCode::PageUp,
+        "PageDown" => KeyCode::PageDown,
+        "Home" => KeyCode::Home,
+        "End" => KeyCode::End,
+        "Delete" => KeyCode::Delete,
+        "Space" => KeyCode::Char(' '),
+        c if c.chars().count() == 1 => KeyCode::Char(c.chars().next().unwrap()),
+        _ => return Err(anyhow!("unknown key `{key_str}` in config")),
+    };
+    Ok((code, mods))
+}
+
+fn key_is(event: &KeyEvent, (code, mods): (KeyCode, KeyModifiers)) -> bool {
+    event.code == code && event.modifiers == mods
+}
+
+fn resolve_keymap(cfg: &KeymapConfig) -> Result<Keymap> {
+    Ok(Keymap {
+        quit:          parse_key(&cfg.quit)?,
+        back:          parse_key(&cfg.back)?,
+        down:          parse_key(&cfg.down)?,
+        up:            parse_key(&cfg.up)?,
+        confirm:       parse_key(&cfg.confirm)?,
+        open_logs:     parse_key(&cfg.open_logs)?,
+        page_down:     parse_key(&cfg.page_down)?,
+        page_up:       parse_key(&cfg.page_up)?,
+        scroll_top:    parse_key(&cfg.scroll_top)?,
+        next_step:     parse_key(&cfg.next_step)?,
+        prev_step:     parse_key(&cfg.prev_step)?,
+        all_steps:     parse_key(&cfg.all_steps)?,
+        trigger:       parse_key(&cfg.trigger)?,
+        watch:         parse_key(&cfg.watch)?,
+        open_browser:  parse_key(&cfg.open_browser)?,
+        cancel_run:    parse_key(&cfg.cancel_run)?,
+        rerun:         parse_key(&cfg.rerun)?,
+        rerun_failed:  parse_key(&cfg.rerun_failed)?,
+        tp_edit:       parse_key(&cfg.tp_edit)?,
+        tp_submit:     parse_key(&cfg.tp_submit)?,
+        tp_yes:        parse_key(&cfg.tp_yes)?,
+        tp_no:         parse_key(&cfg.tp_no)?,
+        tp_cycle:      parse_key(&cfg.tp_cycle)?,
+    })
+}
+
+/// Strip the `HH:MM:SS ` prefix added by `clean_log_line`, returning the raw content.
+fn strip_time_prefix(s: &str) -> &str {
+    if s.len() > 9
+        && s.as_bytes().get(2) == Some(&b':')
+        && s.as_bytes().get(5) == Some(&b':')
+        && s.as_bytes().get(8) == Some(&b' ')
+        && s[..2].bytes().all(|b| b.is_ascii_digit())
+        && s[3..5].bytes().all(|b| b.is_ascii_digit())
+        && s[6..8].bytes().all(|b| b.is_ascii_digit())
+    {
+        &s[9..]
+    } else {
+        s
+    }
+}
+
+fn parse_log_sections(raw: &[String]) -> Vec<String> {
+    raw.iter()
+        .filter_map(|l| {
+            let content = strip_time_prefix(l);
+            content.strip_prefix("##[group]")
+                .or_else(|| content.strip_prefix("##[section]"))
+                .map(|s| s.to_string())
+        })
+        .collect()
+}
+
+fn extract_log_section(raw: &[String], section_idx: usize) -> Vec<String> {
+    let mut current = 0usize;
+    let mut capturing = false;
+    let mut result = Vec::new();
+    for line in raw {
+        let content = strip_time_prefix(line);
+        let is_group = content.starts_with("##[group]") || content.starts_with("##[section]");
+        let is_endgroup = content.starts_with("##[endgroup]");
+        if is_group {
+            if current == section_idx {
+                capturing = true;
+                result.push(line.clone());
+            } else if capturing {
+                break;
+            }
+            current += 1;
+        } else if is_endgroup && capturing {
+            result.push(line.clone());
+            break;
+        } else if capturing {
+            result.push(line.clone());
+        }
+    }
+    result
 }
 
 fn spawn_initial_status_fetches(
@@ -463,7 +692,7 @@ fn spawn_fetch_run_detail(
                 let _ = tx.send(AppEvent::RunDetailLoaded(detail));
             }
             Err(e) => {
-                let _ = tx.send(AppEvent::Status(format!("get run failed: {e}")));
+                let _ = tx.send(AppEvent::TaskError(format!("get run failed: {e}")));
             }
         }
     });
@@ -488,7 +717,7 @@ fn spawn_fetch_logs(
                 let _ = tx.send(AppEvent::LogsLoaded(lines));
             }
             Err(e) => {
-                let _ = tx.send(AppEvent::Status(format!("logs failed: {e}")));
+                let _ = tx.send(AppEvent::TaskError(format!("logs failed: {e}")));
             }
         }
     });

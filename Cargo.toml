@@ -19,4 +19,11 @@ futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 open = "5"
-strip-ansi-escapes = "0.2"
+
+
+[profile.release]
+opt-level = "z"      # or "s" (z = smallest)
+lto = true           # link-time optimization
+codegen-units = 1    # better optimization, smaller binary
+panic = "abort"      # removes unwinding machinery
+strip = true         # strips symbols (since Rust 1.70+)

@@ -1,4 +1,22 @@
+use crate::config::KeymapConfig;
 use crate::provider::{Run, RunDetail, Workflow};
+
+#[derive(Debug, Clone, Copy)]
+pub enum DetailItem {
+    Job(usize),
+    Step { job: usize, step: usize },
+}
+
+pub fn build_detail_items(detail: &RunDetail) -> Vec<DetailItem> {
+    let mut items = Vec::new();
+    for (ji, job) in detail.jobs.iter().enumerate() {
+        items.push(DetailItem::Job(ji));
+        for (si, _) in job.steps.iter().enumerate() {
+            items.push(DetailItem::Step { job: ji, step: si });
+        }
+    }
+    items
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -95,8 +113,14 @@ pub struct AppState {
     pub runs: Vec<Run>,
     pub run_cursor: usize,
     pub run_detail: Option<RunDetail>,
-    pub job_cursor: usize,
+    pub detail_cursor: usize,
     pub log_lines: Vec<String>,
+    pub log_raw: Vec<String>,
+    pub log_sections: Vec<String>,
+    pub log_section_idx: Option<usize>,
+    /// (step_name, step_number) stored when navigating into logs from a specific step.
+    /// step_number is the GitHub API number (1-based, may have gaps for internal sub-steps).
+    pub log_pending_section: Option<(String, i64)>,
     pub log_scroll: u16,
     pub status_msg: Option<String>,
     pub repo_label: String,
@@ -107,10 +131,11 @@ pub struct AppState {
     /// Set true when transitioning views so the event loop can `terminal.clear()`.
     pub needs_clear: bool,
     pub trigger_prompt: Option<TriggerPrompt>,
+    pub keymap: KeymapConfig,
 }
 
 impl AppState {
-    pub fn new(repo_label: String, current_branch: String, workflows: Vec<Workflow>) -> Self {
+    pub fn new(repo_label: String, current_branch: String, workflows: Vec<Workflow>, keymap: KeymapConfig) -> Self {
         Self {
             view: View::Workflows,
             workflows,
@@ -118,8 +143,12 @@ impl AppState {
             runs: Vec::new(),
             run_cursor: 0,
             run_detail: None,
-            job_cursor: 0,
+            detail_cursor: 0,
             log_lines: Vec::new(),
+            log_raw: Vec::new(),
+            log_sections: Vec::new(),
+            log_section_idx: None,
+            log_pending_section: None,
             log_scroll: 0,
             status_msg: None,
             repo_label,
@@ -128,6 +157,7 @@ impl AppState {
             pending: 0,
             needs_clear: false,
             trigger_prompt: None,
+            keymap,
         }
     }
 

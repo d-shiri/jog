@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::status_glyph;
-use crate::app::state::{AppState, View};
+use crate::app::state::{AppState, DetailItem, View, build_detail_items};
 use crate::provider::{Run, Status};
 
 pub fn render(f: &mut Frame, state: &AppState) {
@@ -32,63 +32,91 @@ pub fn render(f: &mut Frame, state: &AppState) {
 }
 
 fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
-    let view_name = format!("{:?}", state.view);
-    let badge = Span::styled(" ⚡ jog ", Style::default().fg(Color::White).bg(Color::Blue).bold());
-    let sep = Span::raw("  ");
-    let repo = Span::styled(state.repo_label.clone(), Style::default().fg(Color::White).bold());
-    let branch = Span::styled(
-        format!("  [{}]", state.current_branch),
-        Style::default().fg(Color::Yellow),
+    let view_name = match state.view {
+        View::Workflows => "Workflows",
+        View::Runs => "Runs",
+        View::RunDetail => "Run Detail",
+        View::Logs => "Logs",
+        View::Watch => "Watch",
+        View::TriggerPrompt => "Trigger",
+    };
+    let dot = Style::default().fg(Color::Rgb(55, 55, 80));
+    let line = Line::from(vec![
+        Span::styled(" ⚡ ", Style::default().fg(Color::Yellow)),
+        Span::styled("jog", Style::default().fg(Color::White).bold()),
+        Span::styled("  ·  ", dot),
+        Span::styled(state.repo_label.as_str(), Style::default().fg(Color::White)),
+        Span::styled("  ⎇ ", Style::default().fg(Color::Rgb(90, 110, 150))),
+        Span::styled(state.current_branch.as_str(), Style::default().fg(Color::Yellow)),
+        Span::styled("  ·  ", dot),
+        Span::styled(view_name, Style::default().fg(Color::Cyan).bold()),
+    ]);
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().bg(Color::Rgb(18, 20, 32))),
+        area,
     );
-    let pad = Span::raw("  ");
-    let view_label = Span::styled(view_name, Style::default().fg(Color::Magenta).bold());
-    let line = Line::from(vec![badge, sep, repo, branch, pad, view_label]);
-    f.render_widget(Paragraph::new(line), area);
+}
+
+fn display_key(s: &str) -> &str {
+    match s {
+        "Enter" => "↵",
+        "Esc" | "Escape" => "Esc",
+        "Space" => "␣",
+        other => other,
+    }
 }
 
 fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
-    let editing = state
-        .trigger_prompt
-        .as_ref()
-        .map(|p| p.editing)
-        .unwrap_or(false);
-    let hints: &[(&str, &str)] = match state.view {
-        View::Workflows => &[
-            ("↵", "runs"),
-            ("t", "trigger"),
-            ("w", "watch"),
-            ("o", "open"),
-            ("q", "quit"),
+    let km = &state.keymap;
+    let editing = state.trigger_prompt.as_ref().map(|p| p.editing).unwrap_or(false);
+
+    let hints: Vec<(String, &str)> = match state.view {
+        View::Workflows => vec![
+            ("↵".into(), "runs"),
+            (display_key(&km.trigger).into(), "trigger"),
+            (display_key(&km.watch).into(), "watch"),
+            (display_key(&km.open_browser).into(), "open"),
+            (display_key(&km.quit).into(), "quit"),
         ],
-        View::Runs => &[
-            ("↵", "detail"),
-            ("t", "trigger"),
-            ("r", "rerun"),
-            ("R", "rerun-failed"),
-            ("x", "cancel"),
-            ("w", "watch"),
-            ("Esc", "back"),
+        View::Runs => vec![
+            ("↵".into(), "detail"),
+            (display_key(&km.trigger).into(), "trigger"),
+            (display_key(&km.rerun).into(), "rerun"),
+            (display_key(&km.rerun_failed).into(), "rerun-failed"),
+            (display_key(&km.cancel_run).into(), "cancel"),
+            (display_key(&km.watch).into(), "watch"),
+            (display_key(&km.back).into(), "back"),
         ],
-        View::RunDetail => &[("↵/l", "logs"), ("Esc", "back"), ("q", "quit")],
-        View::Logs => &[
-            ("j/k", "scroll"),
-            ("d/u", "page"),
-            ("g", "top"),
-            ("Esc", "back"),
-            ("q", "quit"),
+        View::RunDetail => vec![
+            (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "step"),
+            (format!("↵/{}", display_key(&km.open_logs)), "logs"),
+            (display_key(&km.back).into(), "back"),
+            (display_key(&km.quit).into(), "quit"),
         ],
-        View::Watch => &[("Esc", "back"), ("q", "quit")],
-        View::TriggerPrompt if editing => &[
-            ("type", "edit"),
-            ("Bksp", "delete"),
-            ("Enter/Esc", "done"),
+        View::Logs => vec![
+            (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "scroll"),
+            (format!("{}/{}", display_key(&km.page_down), display_key(&km.page_up)), "page"),
+            (display_key(&km.scroll_top).into(), "top"),
+            (format!("{}/{}", display_key(&km.next_step), display_key(&km.prev_step)), "step"),
+            (display_key(&km.all_steps).into(), "all"),
+            (display_key(&km.back).into(), "back"),
+            (display_key(&km.quit).into(), "quit"),
         ],
-        View::TriggerPrompt => &[
-            ("j/k", "move"),
-            ("Space", "cycle"),
-            ("↵/i", "edit"),
-            ("t", "submit"),
-            ("Esc", "cancel"),
+        View::Watch => vec![
+            (display_key(&km.back).into(), "back"),
+            (display_key(&km.quit).into(), "quit"),
+        ],
+        View::TriggerPrompt if editing => vec![
+            ("type".into(), "edit"),
+            ("Bksp".into(), "delete"),
+            ("Enter/Esc".into(), "done"),
+        ],
+        View::TriggerPrompt => vec![
+            (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "move"),
+            (display_key(&km.tp_cycle).into(), "cycle"),
+            (format!("↵/{}", display_key(&km.tp_edit)), "edit"),
+            (display_key(&km.tp_submit).into(), "submit"),
+            (display_key(&km.back).into(), "cancel"),
         ],
     };
 
@@ -97,7 +125,7 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         if i > 0 {
             spans.push(Span::styled("  ", Style::default()));
         }
-        spans.push(Span::styled(*key, Style::default().fg(Color::White).bold()));
+        spans.push(Span::styled(key.clone(), Style::default().fg(Color::White).bold()));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(*desc, Style::default().fg(Color::DarkGray)));
     }
@@ -132,62 +160,97 @@ fn render_workflows(f: &mut Frame, area: Rect, state: &AppState) {
     let inner = blk.inner(area);
     f.render_widget(blk, area);
 
-    if inner.height == 0 {
+    if inner.height < 2 {
         return;
     }
 
     let header_area = Rect { height: 1, ..inner };
-    let list_area = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner };
+    let (divider, list_area) = if inner.height >= 3 {
+        (
+            Some(Rect { y: inner.y + 1, height: 1, ..inner }),
+            Rect { y: inner.y + 2, height: inner.height - 2, ..inner },
+        )
+    } else {
+        (None, Rect { y: inner.y + 1, height: 1, ..inner })
+    };
 
-    let hdr_style = Style::default().fg(Color::Rgb(140, 140, 160)).add_modifier(Modifier::UNDERLINED);
-    let header = Line::from(vec![
-        Span::raw("    "),
-        Span::styled(format!("{:<32}", "Workflow"), hdr_style),
-        Span::styled(format!("{:<28}", "File"), hdr_style),
-        Span::styled("Last run", hdr_style),
-    ]);
-    f.render_widget(Paragraph::new(header), header_area);
+    let hdr = Style::default().fg(Color::Rgb(120, 120, 145));
+    // 4-col indent = 2 (arrow) + 1 (glyph) + 1 (space) — matches every item row exactly
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("{:<32}", "Workflow"), hdr),
+            Span::styled(format!("{:<28}", "File"), hdr),
+            Span::styled(format!("{:>10}", "Last run"), hdr),
+        ])),
+        header_area,
+    );
+
+    if let Some(div) = divider {
+        f.render_widget(
+            Paragraph::new("─".repeat(inner.width as usize))
+                .style(Style::default().fg(Color::Rgb(40, 40, 60))),
+            div,
+        );
+    }
+
+    let sel_bg = Color::Rgb(25, 85, 110);
+    let sel_fg = Color::Rgb(220, 240, 255);
 
     let items: Vec<ListItem> = state
         .workflows
         .iter()
-        .map(|w| {
+        .enumerate()
+        .map(|(i, w)| {
+            let sel = i == state.workflow_cursor;
             let status = w.last_status.unwrap_or(Status::Unknown);
-            let glyph = status_glyph(status);
-            let glyph_style = style_for_status(status);
-            let trig = if w.triggerable { "[t]" } else { "   " };
-            let (when, when_style) = w
+            let trig = if w.triggerable { " t " } else { "   " };
+            let (when_text, when_style) = w
                 .last_run_at
                 .map(|t| relative_styled(t.with_timezone(&Utc)))
                 .unwrap_or_else(|| ("—".into(), Style::default().fg(Color::DarkGray)));
+
+            // Adds selection bg (and, for selected, overrides fg) on a base style
+            let sb = |s: Style| if sel { s.bg(sel_bg) } else { s };
+
             ListItem::new(Line::from(vec![
-                Span::styled(glyph, glyph_style),
-                Span::raw(" "),
-                Span::raw(pad_dw(&truncate_dw(&w.name, 32), 32)),
+                // Arrow column (2 cols) — inside the item, so we own its width
+                Span::styled(
+                    if sel { "▶ " } else { "  " },
+                    sb(Style::default().fg(if sel { Color::Cyan } else { Color::Reset })),
+                ),
+                // Status glyph (1 col)
+                Span::styled(status_glyph(status), sb(style_for_status(status))),
+                // Space (1 col)
+                Span::styled(" ", sb(Style::default())),
+                // Workflow name (32 display cols)
+                Span::styled(
+                    pad_dw(&truncate_dw(&w.name, 32), 32),
+                    sb(if sel { Style::default().fg(sel_fg).bold() } else { Style::default() }),
+                ),
+                // File name (28 display cols)
                 Span::styled(
                     pad_dw(&truncate_dw(&w.file_name, 28), 28),
-                    Style::default().fg(Color::Rgb(140, 140, 160)),
+                    sb(Style::default().fg(if sel { Color::Rgb(180, 205, 230) } else { Color::Rgb(110, 110, 140) })),
                 ),
-                Span::styled(format!("{:<10}", when), when_style),
-                Span::styled(trig, Style::default().fg(Color::Yellow).bold()),
+                // Timestamp — right-aligned in a 10-col field so it lines up with the header
+                Span::styled(
+                    format!("{:>10}", when_text),
+                    if sel { when_style.fg(sel_fg).bg(sel_bg) } else { when_style },
+                ),
+                // Trigger badge (3 cols)
+                Span::styled(trig, sb(Style::default().fg(Color::Rgb(150, 120, 50)))),
             ]))
         })
         .collect();
 
-    let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(0, 206, 209))
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
-
+    // No highlight_symbol / highlight_style — selection is rendered inside each item above.
+    // We still use render_stateful_widget so ratatui can scroll the list when needed.
     let mut s = ListState::default();
     if !state.workflows.is_empty() {
         s.select(Some(state.workflow_cursor));
     }
-    f.render_stateful_widget(list, list_area, &mut s);
+    f.render_stateful_widget(List::new(items), list_area, &mut s);
 }
 
 fn render_runs(f: &mut Frame, area: Rect, state: &AppState) {
@@ -199,53 +262,84 @@ fn render_runs(f: &mut Frame, area: Rect, state: &AppState) {
     let inner = blk.inner(area);
     f.render_widget(blk, area);
 
-    if inner.height == 0 {
+    if inner.height < 2 {
         return;
     }
 
     let header_area = Rect { height: 1, ..inner };
-    let list_area = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner };
+    let (divider, list_area) = if inner.height >= 3 {
+        (
+            Some(Rect { y: inner.y + 1, height: 1, ..inner }),
+            Rect { y: inner.y + 2, height: inner.height - 2, ..inner },
+        )
+    } else {
+        (None, Rect { y: inner.y + 1, height: 1, ..inner })
+    };
 
-    let header = Line::from(vec![
-        Span::raw("    "),
-        Span::styled(format!("{:<10}", "ID"), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{:<24}", "Branch"), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{:<40}", "Title"), Style::default().fg(Color::DarkGray)),
-        Span::styled("Updated", Style::default().fg(Color::DarkGray)),
-    ]);
-    f.render_widget(Paragraph::new(header), header_area);
+    let hdr = Style::default().fg(Color::Rgb(120, 120, 145));
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("{:<10}", "ID"), hdr),
+            Span::styled(format!("{:<24}", "Branch"), hdr),
+            Span::styled(format!("{:<36}", "Title"), hdr),
+            Span::styled(format!("{:>10}", "Updated"), hdr),
+        ])),
+        header_area,
+    );
+
+    if let Some(div) = divider {
+        f.render_widget(
+            Paragraph::new("─".repeat(inner.width as usize))
+                .style(Style::default().fg(Color::Rgb(40, 40, 60))),
+            div,
+        );
+    }
+
+    let sel_bg = Color::Rgb(25, 85, 110);
+    let sel_fg = Color::Rgb(220, 240, 255);
 
     let items: Vec<ListItem> = state
         .runs
         .iter()
-        .map(|r| {
-            let (when, when_style) = relative_styled(r.updated_at);
+        .enumerate()
+        .map(|(i, r)| {
+            let sel = i == state.run_cursor;
+            let (when_text, when_style) = relative_styled(r.updated_at);
+            let sb = |s: Style| if sel { s.bg(sel_bg) } else { s };
+
             ListItem::new(Line::from(vec![
-                Span::styled(status_glyph(r.status), style_for_status(r.status)),
-                Span::raw(" "),
-                Span::raw(format!("{:<10}", r.id)),
+                Span::styled(
+                    if sel { "▶ " } else { "  " },
+                    sb(Style::default().fg(if sel { Color::Cyan } else { Color::Reset })),
+                ),
+                Span::styled(status_glyph(r.status), sb(style_for_status(r.status))),
+                Span::styled(" ", sb(Style::default())),
+                Span::styled(
+                    format!("{:<10}", r.id),
+                    sb(Style::default().fg(if sel { sel_fg } else { Color::Reset })),
+                ),
                 Span::styled(
                     format!("{:<24}", truncate(&r.head_branch, 24)),
-                    Style::default().fg(Color::Yellow),
+                    sb(Style::default().fg(if sel { Color::Rgb(255, 230, 120) } else { Color::Yellow })),
                 ),
-                Span::raw(format!("{:<40}", truncate(&r.display_title, 40))),
-                Span::styled(when, when_style),
+                Span::styled(
+                    format!("{:<36}", truncate(&r.display_title, 36)),
+                    sb(if sel { Style::default().fg(sel_fg).bold() } else { Style::default() }),
+                ),
+                Span::styled(
+                    format!("{:>10}", when_text),
+                    if sel { when_style.fg(sel_fg).bg(sel_bg) } else { when_style },
+                ),
             ]))
         })
         .collect();
-    let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(64, 224, 208))
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
+
     let mut s = ListState::default();
     if !state.runs.is_empty() {
         s.select(Some(state.run_cursor));
     }
-    f.render_stateful_widget(list, list_area, &mut s);
+    f.render_stateful_widget(List::new(items), list_area, &mut s);
 }
 
 fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
@@ -257,30 +351,50 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
             return;
         }
     };
+
+    let items = build_detail_items(detail);
+    let cursor = state.detail_cursor;
     let mut lines = Vec::new();
-    for (i, job) in detail.jobs.iter().enumerate() {
-        let prefix = if i == state.job_cursor { "▶ " } else { "  " };
-        lines.push(Line::from(vec![
-            Span::raw(prefix),
-            Span::styled(status_glyph(job.status), style_for_status(job.status)),
-            Span::raw(" "),
-            Span::styled(
-                job.name.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        for step in &job.steps {
-            lines.push(Line::from(vec![
-                Span::raw("    "),
-                Span::styled(status_glyph(step.status), style_for_status(step.status)),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{}. {}", step.number, step.name),
-                    Style::default().fg(Color::Gray),
-                ),
-            ]));
+
+    for (flat_idx, item) in items.iter().enumerate() {
+        let selected = flat_idx == cursor;
+        match item {
+            DetailItem::Job(ji) => {
+                let job = &detail.jobs[*ji];
+                let prefix = if selected { "▶ " } else { "  " };
+                let name_style = if selected {
+                    Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(prefix),
+                    Span::styled(status_glyph(job.status), style_for_status(job.status)),
+                    Span::raw(" "),
+                    Span::styled(job.name.clone(), name_style),
+                ]));
+            }
+            DetailItem::Step { job: ji, step: si } => {
+                let step = &detail.jobs[*ji].steps[*si];
+                let prefix = if selected { "  ▶ " } else { "    " };
+                let name_style = if selected {
+                    Style::default().fg(Color::White).bold()
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(prefix),
+                    Span::styled(status_glyph(step.status), style_for_status(step.status)),
+                    Span::raw(" "),
+                    // Use sequential position (si+1) — step.number has gaps for
+                    // internal composite-action sub-steps that GitHub hides from
+                    // the job.steps list but still assigns numbers to.
+                    Span::styled(format!("{}. {}", si + 1, step.name), name_style),
+                ]));
+            }
         }
     }
+
     let title = format!(
         "Run {} — {} ({})",
         detail.run.id, detail.run.display_title, detail.run.head_branch
@@ -291,59 +405,223 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(p, area);
 }
 
+/// Return `(Some("HH:MM:SS"), content)` when the line has the short time prefix
+/// written by `clean_log_line`, otherwise `(None, whole_string)`.
+fn split_time_prefix(s: &str) -> (Option<&str>, &str) {
+    if s.len() > 9
+        && s.as_bytes().get(2) == Some(&b':')
+        && s.as_bytes().get(5) == Some(&b':')
+        && s.as_bytes().get(8) == Some(&b' ')
+        && s[..2].bytes().all(|b| b.is_ascii_digit())
+        && s[3..5].bytes().all(|b| b.is_ascii_digit())
+        && s[6..8].bytes().all(|b| b.is_ascii_digit())
+    {
+        (Some(&s[..8]), &s[9..])
+    } else {
+        (None, s)
+    }
+}
+
+/// Parse ANSI SGR escape sequences in `line` and produce styled spans.
+/// `default_style` is the baseline applied between resets (`\x1b[0m`).
+fn ansi_line_to_spans(line: &str, default_style: Style) -> Vec<Span<'static>> {
+    if !line.contains('\x1b') {
+        return if line.is_empty() {
+            vec![]
+        } else {
+            vec![Span::styled(line.to_string(), default_style)]
+        };
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current = default_style;
+    let chars: Vec<char> = line.chars().collect();
+    let mut seg = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            let text: String = chars[seg..i].iter().collect();
+            if !text.is_empty() {
+                spans.push(Span::styled(text, current));
+            }
+            let seq_start = i + 2;
+            let mut j = seq_start;
+            while j < chars.len() && !chars[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == 'm' {
+                let params: String = chars[seq_start..j].iter().collect();
+                current = apply_sgr(&params, current, default_style);
+            }
+            i = j + 1;
+            seg = i;
+        } else {
+            i += 1;
+        }
+    }
+    let tail: String = chars[seg..].iter().collect();
+    if !tail.is_empty() {
+        spans.push(Span::styled(tail, current));
+    }
+    spans
+}
+
+fn apply_sgr(params: &str, current: Style, default: Style) -> Style {
+    if params.is_empty() {
+        return default;
+    }
+    let nums: Vec<u32> = params.split(';').filter_map(|s| s.parse().ok()).collect();
+    let mut s = current;
+    let mut i = 0;
+    while i < nums.len() {
+        match nums[i] {
+            0 => s = default,
+            1 => s = s.add_modifier(Modifier::BOLD),
+            2 => s = s.add_modifier(Modifier::DIM),
+            3 => s = s.add_modifier(Modifier::ITALIC),
+            4 => s = s.add_modifier(Modifier::UNDERLINED),
+            22 => s = s.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            23 => s = s.remove_modifier(Modifier::ITALIC),
+            24 => s = s.remove_modifier(Modifier::UNDERLINED),
+            30 => s = s.fg(Color::Black),
+            31 => s = s.fg(Color::Red),
+            32 => s = s.fg(Color::Green),
+            33 => s = s.fg(Color::Yellow),
+            34 => s = s.fg(Color::Blue),
+            35 => s = s.fg(Color::Magenta),
+            36 => s = s.fg(Color::Cyan),
+            37 => s = s.fg(Color::Gray),
+            38 if i + 1 < nums.len() && nums[i + 1] == 2 && i + 4 < nums.len() => {
+                s = s.fg(Color::Rgb(nums[i+2] as u8, nums[i+3] as u8, nums[i+4] as u8));
+                i += 4;
+            }
+            38 if i + 1 < nums.len() && nums[i + 1] == 5 && i + 2 < nums.len() => {
+                s = s.fg(Color::Indexed(nums[i + 2] as u8));
+                i += 2;
+            }
+            40 => s = s.bg(Color::Black),
+            41 => s = s.bg(Color::Red),
+            42 => s = s.bg(Color::Green),
+            43 => s = s.bg(Color::Yellow),
+            44 => s = s.bg(Color::Blue),
+            45 => s = s.bg(Color::Magenta),
+            46 => s = s.bg(Color::Cyan),
+            47 => s = s.bg(Color::Gray),
+            48 if i + 1 < nums.len() && nums[i + 1] == 2 && i + 4 < nums.len() => {
+                s = s.bg(Color::Rgb(nums[i+2] as u8, nums[i+3] as u8, nums[i+4] as u8));
+                i += 4;
+            }
+            48 if i + 1 < nums.len() && nums[i + 1] == 5 && i + 2 < nums.len() => {
+                s = s.bg(Color::Indexed(nums[i + 2] as u8));
+                i += 2;
+            }
+            90 => s = s.fg(Color::DarkGray),
+            91 => s = s.fg(Color::LightRed),
+            92 => s = s.fg(Color::LightGreen),
+            93 => s = s.fg(Color::LightYellow),
+            94 => s = s.fg(Color::LightBlue),
+            95 => s = s.fg(Color::LightMagenta),
+            96 => s = s.fg(Color::LightCyan),
+            97 => s = s.fg(Color::White),
+            _ => {}
+        }
+        i += 1;
+    }
+    s
+}
+
 fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
-    // inner width = area minus the two border columns
+    let log_title = if let Some(idx) = state.log_section_idx {
+        let name = state.log_sections.get(idx).map(|s| s.as_str()).unwrap_or("?");
+        let total = state.log_sections.len();
+        format!("Logs — {name}  [{}/{}]", idx + 1, total)
+    } else {
+        "Logs".to_string()
+    };
+
     let sep = "─".repeat(area.width.saturating_sub(2) as usize);
+    let time_style = Style::default().fg(Color::Rgb(80, 80, 80));
 
     let body: Vec<Line> = state
         .log_lines
         .iter()
         .flat_map(|l| {
-            // ##[group] is GitHub Actions' step-level section header.
-            // ##[section] serves the same role in some runners.
-            if let Some(title) = l.strip_prefix("##[group]").or_else(|| l.strip_prefix("##[section]")) {
+            let (time, content) = split_time_prefix(l.as_str());
+            let mk_time = || time.map(|t| Span::styled(format!("{t} "), time_style));
+
+            if let Some(title) = content.strip_prefix("##[group]")
+                .or_else(|| content.strip_prefix("##[section]"))
+            {
+                let title_style = Style::default().fg(Color::Cyan).bold();
+                let mut header = vec![];
+                if let Some(ts) = mk_time() { header.push(ts); }
+                header.push(Span::styled("▸ ", title_style));
+                header.extend(ansi_line_to_spans(title, title_style));
                 vec![
                     Line::from(Span::styled(sep.clone(), Style::default().fg(Color::DarkGray))),
-                    Line::from(vec![
-                        Span::styled("▸ ", Style::default().fg(Color::Cyan).bold()),
-                        Span::styled(title.to_string(), Style::default().fg(Color::Cyan).bold()),
-                    ]),
+                    Line::from(header),
                     Line::default(),
                 ]
-            } else if l.starts_with("##[endgroup]") {
-                // blank line after each section body
+            } else if content.starts_with("##[endgroup]") {
                 vec![Line::default()]
-            } else if let Some(cmd) = l.strip_prefix("##[command]") {
-                vec![Line::from(vec![
-                    Span::styled("  $ ", Style::default().fg(Color::Green).bold()),
-                    Span::styled(cmd.to_string(), Style::default().fg(Color::White)),
-                ])]
-            } else if let Some(msg) = l.strip_prefix("##[error]") {
-                vec![Line::from(Span::styled(
-                    format!("✗ {msg}"),
-                    Style::default().fg(Color::Red).bold(),
-                ))]
-            } else if let Some(msg) = l.strip_prefix("##[warning]") {
-                vec![Line::from(Span::styled(
-                    format!("⚠ {msg}"),
-                    Style::default().fg(Color::Yellow).bold(),
-                ))]
+            } else if let Some(cmd) = content.strip_prefix("##[command]") {
+                let mut spans = vec![];
+                if let Some(ts) = mk_time() { spans.push(ts); }
+                spans.push(Span::styled("$ ", Style::default().fg(Color::Green).bold()));
+                spans.extend(ansi_line_to_spans(cmd, Style::default().fg(Color::White)));
+                vec![Line::from(spans)]
+            } else if let Some(msg) = content.strip_prefix("##[error]") {
+                let s = Style::default().fg(Color::Red).bold();
+                let mut spans = vec![];
+                if let Some(ts) = mk_time() { spans.push(ts); }
+                spans.push(Span::styled("✗ ", s));
+                spans.extend(ansi_line_to_spans(msg, s));
+                vec![Line::from(spans)]
+            } else if let Some(msg) = content.strip_prefix("##[warning]") {
+                let s = Style::default().fg(Color::Yellow);
+                let mut spans = vec![];
+                if let Some(ts) = mk_time() { spans.push(ts); }
+                spans.push(Span::styled("⚠ ", s.bold()));
+                spans.extend(ansi_line_to_spans(msg, s));
+                vec![Line::from(spans)]
+            } else if let Some(msg) = content.strip_prefix("##[debug]") {
+                let s = Style::default().fg(Color::DarkGray);
+                let mut spans = vec![];
+                if let Some(ts) = mk_time() { spans.push(ts); }
+                spans.push(Span::styled("# ", s));
+                spans.extend(ansi_line_to_spans(msg, s));
+                vec![Line::from(spans)]
+            } else if let Some(msg) = content.strip_prefix("##[notice]") {
+                let s = Style::default().fg(Color::Cyan);
+                let mut spans = vec![];
+                if let Some(ts) = mk_time() { spans.push(ts); }
+                spans.push(Span::styled("ℹ ", s));
+                spans.extend(ansi_line_to_spans(msg, s));
+                vec![Line::from(spans)]
             } else {
-                let lower = l.to_lowercase();
-                let style = if lower.contains("error") || lower.contains("failed") {
-                    Style::default().fg(Color::Red)
-                } else if lower.contains("warn") {
-                    Style::default().fg(Color::Yellow)
+                // Keyword fallback only when ANSI codes are absent; otherwise let
+                // the ANSI parser handle all coloring.
+                let base = if !content.contains('\x1b') {
+                    let lower = content.to_lowercase();
+                    if lower.contains("error") || lower.contains("failed") {
+                        Style::default().fg(Color::Red)
+                    } else if lower.contains("warn") {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::Rgb(200, 200, 200))
+                    }
                 } else {
                     Style::default().fg(Color::Rgb(200, 200, 200))
                 };
-                vec![Line::from(Span::styled(l.clone(), style))]
+                let mut spans = vec![];
+                if let Some(ts) = mk_time() { spans.push(ts); }
+                spans.extend(ansi_line_to_spans(content, base));
+                vec![Line::from(spans)]
             }
         })
         .collect();
 
     let p = Paragraph::new(body)
-        .block(styled_block("Logs"))
+        .block(styled_block(&log_title))
         .wrap(Wrap { trim: false })
         .scroll((state.log_scroll, 0));
     f.render_widget(p, area);
@@ -512,12 +790,20 @@ fn render_trigger_prompt(f: &mut Frame, area: Rect, state: &AppState) {
         lines.push(Line::from("(no inputs)"));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("t", Style::default().fg(Color::White).bold()),
+    let has_options = prompt.fields.iter().any(|f| f.options.is_some());
+    let submit_key = display_key(&state.keymap.tp_submit).to_string();
+    let cancel_key = display_key(&state.keymap.back).to_string();
+    let mut hint_spans = vec![
+        Span::styled(submit_key, Style::default().fg(Color::White).bold()),
         Span::styled(" trigger  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Esc", Style::default().fg(Color::White).bold()),
+        Span::styled(cancel_key, Style::default().fg(Color::White).bold()),
         Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
-    ]));
+    ];
+    if has_options {
+        hint_spans.push(Span::styled("  Space", Style::default().fg(Color::White).bold()));
+        hint_spans.push(Span::styled(" cycle", Style::default().fg(Color::DarkGray)));
+    }
+    lines.push(Line::from(hint_spans));
     let p = Paragraph::new(lines)
         .block(styled_block(&title))
         .wrap(Wrap { trim: false });
@@ -592,17 +878,23 @@ fn char_display_width(c: char) -> usize {
 }
 
 fn truncate_dw(s: &str, max_cols: usize) -> String {
+    let total: usize = s.chars().map(char_display_width).sum();
+    if total <= max_cols {
+        return s.to_string();
+    }
+    // Reserve one column for '…'.
+    let limit = max_cols.saturating_sub(1);
     let mut out = String::new();
     let mut width = 0;
     for c in s.chars() {
         let cw = char_display_width(c);
-        if width + cw > max_cols {
-            out.push('…');
-            return out;
+        if width + cw > limit {
+            break;
         }
         out.push(c);
         width += cw;
     }
+    out.push('…');
     out
 }
 

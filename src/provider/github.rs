@@ -235,7 +235,6 @@ impl Provider for GitHubProvider {
         let chunks: Vec<Result<LogChunk>> = text
             .lines()
             .map(clean_log_line)
-            .filter(|l| !l.is_empty())
             .map(|l| Ok(LogChunk { line: l }))
             .collect();
         Ok(stream::iter(chunks).boxed())
@@ -307,18 +306,21 @@ impl Provider for GitHubProvider {
 }
 
 /// Clean a single GitHub Actions log line:
-/// 1. Strip ANSI escape sequences (otherwise `\x1b[...m` writes mess up the terminal)
-/// 2. Strip control chars except `\t` (tab → 4 spaces)
-/// 3. Strip the leading ISO timestamp GitHub prepends to every line
+/// 1. Extract `HH:MM:SS` from the ISO timestamp and keep it as a short prefix
+/// 2. Preserve ANSI escape sequences so the renderer can display colors
+/// 3. Strip other control chars except `\t` (tab → 4 spaces) and `\x1b` (ESC for ANSI)
 fn clean_log_line(raw: &str) -> String {
-    let stripped = strip_ansi_escapes::strip(raw);
-    let s = String::from_utf8_lossy(&stripped);
-    let s = strip_timestamp(&s);
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
+    let (time, content) = extract_time(raw);
+    let mut out = String::new();
+    if let Some(t) = time {
+        out.push_str(t); // "HH:MM:SS"
+        out.push(' ');
+    }
+    for c in content.chars() {
         match c {
             '\t' => out.push_str("    "),
-            c if c == '\n' || c == '\r' => {}
+            '\n' | '\r' => {}
+            '\x1b' => out.push(c), // keep ESC so ANSI color sequences reach the renderer
             c if (c as u32) < 0x20 => {}
             c => out.push(c),
         }
@@ -326,19 +328,21 @@ fn clean_log_line(raw: &str) -> String {
     out
 }
 
-fn strip_timestamp(s: &str) -> &str {
-    // Format: 2025-04-29T08:12:34.5678901Z␠... — 28 chars then a space.
-    if s.len() > 28
+/// Returns `(Some("HH:MM:SS"), content)` when the line starts with a GitHub Actions
+/// ISO timestamp (`2025-04-29T08:12:34.5678901Z `), otherwise `(None, whole_line)`.
+fn extract_time(s: &str) -> (Option<&str>, &str) {
+    if s.len() > 20
         && s.as_bytes().get(4) == Some(&b'-')
         && s.as_bytes().get(7) == Some(&b'-')
         && s.as_bytes().get(10) == Some(&b'T')
         && s.as_bytes().get(13) == Some(&b':')
+        && s.as_bytes().get(16) == Some(&b':')
     {
         if let Some(idx) = s.find(' ') {
-            return &s[idx + 1..];
+            return (Some(&s[11..19]), &s[idx + 1..]);
         }
     }
-    s
+    (None, s)
 }
 
 #[cfg(test)]
@@ -360,13 +364,20 @@ mod tests {
     }
 
     #[test]
-    fn cleans_ansi_and_timestamp() {
+    fn extracts_time_and_keeps_ansi() {
         let raw = "2025-04-29T08:12:34.5678901Z \x1b[36;1mwith:\x1b[0m\r\n";
-        assert_eq!(clean_log_line(raw), "with:");
+        // Time prefix kept; ANSI codes preserved; CR/LF stripped
+        assert_eq!(clean_log_line(raw), "08:12:34 \x1b[36;1mwith:\x1b[0m");
     }
 
     #[test]
     fn keeps_plain_lines() {
         assert_eq!(clean_log_line("hello world"), "hello world");
+    }
+
+    #[test]
+    fn extracts_time_plain() {
+        let raw = "2025-04-29T08:12:34.5678901Z npm install";
+        assert_eq!(clean_log_line(raw), "08:12:34 npm install");
     }
 }
