@@ -231,11 +231,20 @@ impl Provider for GitHubProvider {
             .follow_location_to_data(resp)
             .await
             .context("follow log redirect")?;
+        let status = resp.status();
         let text = self
             .crab
             .body_to_string(resp)
             .await
             .context("read log body")?;
+        if !status.is_success() {
+            if text.contains("BlobNotFound") {
+                return Err(anyhow!(
+                    "logs not available yet (job still running or archive not finalized)"
+                ));
+            }
+            return Err(anyhow!("fetch job logs: HTTP {status}"));
+        }
         let chunks: Vec<Result<LogChunk>> = text
             .lines()
             .map(clean_log_line)
