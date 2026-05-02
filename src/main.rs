@@ -5,6 +5,7 @@ use std::sync::Arc;
 mod app;
 mod cli;
 mod config;
+mod history;
 mod provider;
 mod tui;
 

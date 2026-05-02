@@ -1,6 +1,7 @@
 use std::cell::Cell;
 
 use crate::config::KeymapConfig;
+use crate::history::History;
 use crate::provider::{Run, RunDetail, Workflow};
 
 
@@ -29,6 +30,7 @@ pub enum View {
     Logs,
     Watch,
     TriggerPrompt,
+    Diff,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +131,15 @@ pub struct AppState {
     /// Used to clamp `log_scroll` so users can't scroll past the bottom.
     /// Cell so render can write through `&AppState`.
     pub last_logs_viewport_height: Cell<u16>,
+    /// `Some` while user is typing into the search prompt; the inner string is
+    /// the in-progress query. Committed on Enter (moves to `log_search_query`).
+    pub log_search_input: Option<String>,
+    /// Active committed query. While set, `n`/`N` jump between matches.
+    pub log_search_query: Option<String>,
+    /// Indices into `log_lines` where the query matches (case-insensitive).
+    pub log_search_matches: Vec<usize>,
+    /// Index into `log_search_matches`.
+    pub log_search_match_idx: Option<usize>,
     pub status_msg: Option<String>,
     pub repo_label: String,
     pub current_branch: String,
@@ -145,10 +156,11 @@ pub struct AppState {
     pub needs_clear: bool,
     pub trigger_prompt: Option<TriggerPrompt>,
     pub keymap: KeymapConfig,
+    pub history: History,
 }
 
 impl AppState {
-    pub fn new(repo_label: String, current_branch: String, workflows: Vec<Workflow>, keymap: KeymapConfig) -> Self {
+    pub fn new(repo_label: String, current_branch: String, workflows: Vec<Workflow>, keymap: KeymapConfig, history: History) -> Self {
         Self {
             view: View::Workflows,
             workflows,
@@ -164,6 +176,10 @@ impl AppState {
             log_pending_section: None,
             log_scroll: 0,
             last_logs_viewport_height: Cell::new(0),
+            log_search_input: None,
+            log_search_query: None,
+            log_search_matches: Vec::new(),
+            log_search_match_idx: None,
             status_msg: None,
             repo_label,
             current_branch,
@@ -176,6 +192,7 @@ impl AppState {
             needs_clear: false,
             trigger_prompt: None,
             keymap,
+            history,
         }
     }
 
@@ -192,5 +209,97 @@ impl AppState {
 
     pub fn selected_run(&self) -> Option<&Run> {
         self.runs.get(self.run_cursor)
+    }
+
+    /// Drop in-progress and committed search state. Called whenever
+    /// `log_lines` is replaced (section change, fresh fetch).
+    pub fn clear_log_search(&mut self) {
+        self.log_search_input = None;
+        self.log_search_query = None;
+        self.log_search_matches.clear();
+        self.log_search_match_idx = None;
+    }
+
+    /// Recompute match positions for the current query against `log_lines`.
+    /// Matching uses the same "visible" form the renderer produces — ANSI,
+    /// time prefix, and `##[…]` markup are stripped so the user searches
+    /// what they actually see on screen.
+    pub fn recompute_log_matches(&mut self) {
+        self.log_search_matches.clear();
+        self.log_search_match_idx = None;
+        let Some(q) = self.log_search_query.as_deref() else { return };
+        if q.is_empty() {
+            return;
+        }
+        let needle = q.to_lowercase();
+        for (i, line) in self.log_lines.iter().enumerate() {
+            let hay = visible_text(line).to_lowercase();
+            if hay.contains(&needle) {
+                self.log_search_matches.push(i);
+            }
+        }
+        if !self.log_search_matches.is_empty() {
+            self.log_search_match_idx = Some(0);
+        }
+    }
+}
+
+/// Strip ANSI, the `HH:MM:SS` time prefix and any GitHub Actions `##[...]`
+/// markup so we operate on the same characters the renderer shows. Public
+/// because both the search/match and highlight code use it.
+pub fn visible_text(s: &str) -> String {
+    let no_ansi = strip_ansi(s);
+    let no_time = strip_time_prefix(&no_ansi).to_string();
+    for prefix in [
+        "##[group]",
+        "##[section]",
+        "##[endgroup]",
+        "##[command]",
+        "##[error]",
+        "##[warning]",
+        "##[debug]",
+        "##[notice]",
+    ] {
+        if let Some(rest) = no_time.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    no_time
+}
+
+fn strip_ansi(s: &str) -> String {
+    if !s.contains('\x1b') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            let mut j = i + 2;
+            while j < chars.len() && !chars[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            i = if j < chars.len() { j + 1 } else { j };
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn strip_time_prefix(s: &str) -> &str {
+    if s.len() > 9
+        && s.as_bytes().get(2) == Some(&b':')
+        && s.as_bytes().get(5) == Some(&b':')
+        && s.as_bytes().get(8) == Some(&b' ')
+        && s[..2].bytes().all(|b| b.is_ascii_digit())
+        && s[3..5].bytes().all(|b| b.is_ascii_digit())
+        && s[6..8].bytes().all(|b| b.is_ascii_digit())
+    {
+        &s[9..]
+    } else {
+        s
     }
 }

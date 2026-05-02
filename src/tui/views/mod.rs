@@ -7,8 +7,11 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState, Wrap,
 };
 
+use std::collections::HashMap;
+
 use super::status_glyph;
 use crate::app::state::{AppState, DetailItem, View, build_detail_items};
+use crate::history::HistoryEntry;
 use crate::provider::{Run, Status};
 
 pub fn render(f: &mut Frame, state: &AppState) {
@@ -29,6 +32,7 @@ pub fn render(f: &mut Frame, state: &AppState) {
         View::Logs => render_logs(f, chunks[1], state),
         View::Watch => render_watch(f, chunks[1], state),
         View::TriggerPrompt => render_trigger_prompt(f, chunks[1], state),
+        View::Diff => render_diff(f, chunks[1], state),
     }
     render_footer(f, chunks[2], state);
 }
@@ -41,6 +45,7 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         View::Logs => "Logs",
         View::Watch => "Watch",
         View::TriggerPrompt => "Trigger",
+        View::Diff => "Diff",
     };
     let dot = Style::default().fg(Color::Rgb(55, 55, 80));
     let line = Line::from(vec![
@@ -92,19 +97,28 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         View::RunDetail => vec![
             (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "step"),
             (format!("↵/{}", display_key(&km.open_logs)), "logs"),
+            (display_key(&km.diff).into(), "diff"),
             (display_key(&km.back).into(), "back"),
             (display_key(&km.quit).into(), "quit"),
         ],
-        View::Logs => vec![
-            (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "scroll"),
-            (format!("{}/{}", display_key(&km.page_down), display_key(&km.page_up)), "page"),
-            (display_key(&km.scroll_top).into(), "top"),
-            (format!("{}/{}", display_key(&km.next_step), display_key(&km.prev_step)), "step"),
-            (display_key(&km.all_steps).into(), "all"),
-            (display_key(&km.back).into(), "back"),
-            (display_key(&km.quit).into(), "quit"),
-        ],
+        View::Logs => {
+            let np_label = if state.log_search_query.is_some() { "match" } else { "step" };
+            vec![
+                (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "scroll"),
+                (format!("{}/{}", display_key(&km.page_down), display_key(&km.page_up)), "page"),
+                (display_key(&km.scroll_top).into(), "top"),
+                (format!("{}/{}", display_key(&km.next_step), display_key(&km.prev_step)), np_label),
+                (display_key(&km.all_steps).into(), "all"),
+                (display_key(&km.search).into(), "search"),
+                (display_key(&km.back).into(), "back"),
+                (display_key(&km.quit).into(), "quit"),
+            ]
+        },
         View::Watch => vec![
+            (display_key(&km.back).into(), "back"),
+            (display_key(&km.quit).into(), "quit"),
+        ],
+        View::Diff => vec![
             (display_key(&km.back).into(), "back"),
             (display_key(&km.quit).into(), "quit"),
         ],
@@ -436,6 +450,12 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
         }
     };
 
+    let stats: HashMap<String, (u32, u32)> = state
+        .workflow_for_runs
+        .as_deref()
+        .map(|wf| state.history.step_failure_stats(wf, 10))
+        .unwrap_or_default();
+
     let items = build_detail_items(detail);
     let cursor = state.detail_cursor;
     let mut lines = Vec::new();
@@ -466,7 +486,7 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
                 } else {
                     Style::default().fg(Color::Gray)
                 };
-                lines.push(Line::from(vec![
+                let mut spans = vec![
                     Span::raw(prefix),
                     Span::styled(status_glyph(step.status), style_for_status(step.status)),
                     Span::raw(" "),
@@ -474,7 +494,21 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
                     // internal composite-action sub-steps that GitHub hides from
                     // the job.steps list but still assigns numbers to.
                     Span::styled(format!("{}. {}", si + 1, step.name), name_style),
-                ]));
+                ];
+                if let Some((failed, total)) = stats.get(&step.name).copied() {
+                    if failed > 0 {
+                        let badge_style = if failed * 2 >= total {
+                            Style::default().fg(Color::Red).bold()
+                        } else {
+                            Style::default().fg(Color::Yellow)
+                        };
+                        spans.push(Span::styled(
+                            format!("  ({}/{} fails)", failed, total),
+                            badge_style,
+                        ));
+                    }
+                }
+                lines.push(Line::from(spans));
             }
         }
     }
@@ -613,12 +647,60 @@ fn apply_sgr(params: &str, current: Style, default: Style) -> Style {
     s
 }
 
+/// Re-style spans of `line` so the (case-insensitive) `needle` is highlighted.
+/// `current` picks the brighter highlight used for the active match.
+fn highlight_line(line: Line<'static>, needle: &str, current: bool) -> Line<'static> {
+    if needle.is_empty() {
+        return line;
+    }
+    let hit_bg = if current {
+        Color::Rgb(220, 200, 60)
+    } else {
+        Color::Rgb(120, 90, 30)
+    };
+    let hit_fg = Color::Black;
+
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
+    for span in line.spans {
+        let text = span.content.into_owned();
+        let style = span.style;
+        let lower = text.to_lowercase();
+        if !lower.contains(needle) {
+            out.push(Span::styled(text, style));
+            continue;
+        }
+        let bytes = text.as_bytes();
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            match lower[cursor..].find(needle) {
+                Some(rel) => {
+                    let start = cursor + rel;
+                    let end = start + needle.len();
+                    if start > cursor {
+                        out.push(Span::styled(text[cursor..start].to_string(), style));
+                    }
+                    out.push(Span::styled(
+                        text[start..end].to_string(),
+                        style.bg(hit_bg).fg(hit_fg).add_modifier(Modifier::BOLD),
+                    ));
+                    cursor = end;
+                }
+                None => {
+                    out.push(Span::styled(text[cursor..].to_string(), style));
+                    break;
+                }
+            }
+        }
+    }
+    Line::from(out)
+}
+
 fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
     // Inner area = area minus the rounded border (1 row top + 1 row bottom).
     let viewport = area.height.saturating_sub(2);
     state.last_logs_viewport_height.set(viewport);
 
-    let log_title = if let Some(idx) = state.log_section_idx {
+    let mut log_title = if let Some(idx) = state.log_section_idx {
         let name = state.log_sections.get(idx).map(|s| s.as_str()).unwrap_or("?");
         let total = state.log_sections.len();
         format!("Logs — {name}  [{}/{}]", idx + 1, total)
@@ -626,17 +708,42 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
         "Logs".to_string()
     };
 
+    if let Some(buf) = &state.log_search_input {
+        log_title.push_str(&format!("   /{buf}_"));
+    } else if let Some(q) = &state.log_search_query {
+        if state.log_search_matches.is_empty() {
+            log_title.push_str(&format!("   /{q}  (no match)"));
+        } else {
+            let pos = state.log_search_match_idx.map(|i| i + 1).unwrap_or(0);
+            log_title.push_str(&format!(
+                "   /{q}  [{}/{}]",
+                pos,
+                state.log_search_matches.len()
+            ));
+        }
+    }
+
     let sep = "─".repeat(area.width.saturating_sub(2) as usize);
     let time_style = Style::default().fg(Color::Rgb(80, 80, 80));
+
+    let needle_lower = state
+        .log_search_query
+        .as_deref()
+        .filter(|q| !q.is_empty())
+        .map(|q| q.to_lowercase());
+    let current_match_line = state
+        .log_search_match_idx
+        .and_then(|i| state.log_search_matches.get(i).copied());
 
     let body: Vec<Line> = state
         .log_lines
         .iter()
-        .flat_map(|l| {
+        .enumerate()
+        .flat_map(|(src_idx, l)| {
             let (time, content) = split_time_prefix(l.as_str());
             let mk_time = || time.map(|t| Span::styled(format!("{t} "), time_style));
 
-            if let Some(title) = content.strip_prefix("##[group]")
+            let lines: Vec<Line> = if let Some(title) = content.strip_prefix("##[group]")
                 .or_else(|| content.strip_prefix("##[section]"))
             {
                 let title_style = Style::default().fg(Color::Cyan).bold();
@@ -704,6 +811,15 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
                 if let Some(ts) = mk_time() { spans.push(ts); }
                 spans.extend(ansi_line_to_spans(content, base));
                 vec![Line::from(spans)]
+            };
+            if let Some(needle) = needle_lower.as_deref() {
+                let is_current = current_match_line == Some(src_idx);
+                lines
+                    .into_iter()
+                    .map(|line| highlight_line(line, needle, is_current))
+                    .collect::<Vec<Line>>()
+            } else {
+                lines
             }
         })
         .collect();
@@ -777,6 +893,121 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
         let p = Paragraph::new(lines).block(styled_block("Jobs"));
         f.render_widget(p, chunks[1]);
     }
+}
+
+fn render_diff(f: &mut Frame, area: Rect, state: &AppState) {
+    let blk = styled_block("Diff vs last successful run");
+    let inner = blk.inner(area);
+    f.render_widget(blk, area);
+
+    let Some(detail) = &state.run_detail else {
+        let p = Paragraph::new("(no run loaded)");
+        f.render_widget(p, inner);
+        return;
+    };
+    let Some(wf) = state.workflow_for_runs.as_deref() else {
+        let p = Paragraph::new("(no workflow context — diff needs to be opened from a workflow's run list)");
+        f.render_widget(p, inner);
+        return;
+    };
+
+    let baseline: Option<&HistoryEntry> = state
+        .history
+        .last_successful(wf)
+        .filter(|e| e.run_id != detail.run.id);
+
+    let header = Line::from(vec![
+        Span::styled(
+            format!("current run #{}", detail.run.id),
+            Style::default().fg(Color::White).bold(),
+        ),
+        Span::raw("   vs   "),
+        match &baseline {
+            Some(b) => Span::styled(
+                format!("last success #{}", b.run_id),
+                Style::default().fg(Color::Green).bold(),
+            ),
+            None => Span::styled(
+                "no successful run in history",
+                Style::default().fg(Color::DarkGray).italic(),
+            ),
+        },
+    ]);
+
+    let mut lines: Vec<Line> = vec![header, Line::default()];
+
+    // Build baseline lookup (job, step) -> Status.
+    let mut baseline_steps: HashMap<(String, String), Status> = HashMap::new();
+    if let Some(b) = baseline {
+        for j in &b.jobs {
+            for s in &j.steps {
+                baseline_steps.insert((j.name.clone(), s.name.clone()), s.status);
+            }
+        }
+    }
+
+    let mut any_diff = false;
+    for job in &detail.jobs {
+        let mut job_lines: Vec<Line> = Vec::new();
+        for step in &job.steps {
+            let prev = baseline_steps
+                .get(&(job.name.clone(), step.name.clone()))
+                .copied();
+            let changed = match prev {
+                Some(p) => p != step.status,
+                None => baseline.is_some(),
+            };
+            if !changed {
+                continue;
+            }
+            any_diff = true;
+            let prev_text = match prev {
+                Some(p) => format!("{:?}", p),
+                None => "(absent)".into(),
+            };
+            job_lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    status_glyph(step.status),
+                    style_for_status(step.status),
+                ),
+                Span::raw(" "),
+                Span::styled(step.name.clone(), Style::default().fg(Color::White)),
+                Span::raw("  "),
+                Span::styled(prev_text, Style::default().fg(Color::DarkGray)),
+                Span::raw(" → "),
+                Span::styled(
+                    format!("{:?}", step.status),
+                    style_for_status(step.status),
+                ),
+            ]));
+        }
+        if !job_lines.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(status_glyph(job.status), style_for_status(job.status)),
+                Span::raw(" "),
+                Span::styled(job.name.clone(), Style::default().bold()),
+            ]));
+            lines.extend(job_lines);
+            lines.push(Line::default());
+        }
+    }
+
+    if !any_diff {
+        if baseline.is_some() {
+            lines.push(Line::from(Span::styled(
+                "no step-status differences",
+                Style::default().fg(Color::DarkGray).italic(),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "browse a few completed runs first to populate history",
+                Style::default().fg(Color::DarkGray).italic(),
+            )));
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn style_for_status(s: Status) -> Style {

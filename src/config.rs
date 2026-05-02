@@ -73,6 +73,8 @@ pub struct KeymapConfig {
     pub next_step: String,
     pub prev_step: String,
     pub all_steps: String,
+    // log search (`n`/`p` reused for next/prev match while a query is active)
+    pub search: String,
     // workflow actions
     pub trigger: String,
     pub watch: String,
@@ -81,6 +83,7 @@ pub struct KeymapConfig {
     pub cancel_run: String,
     pub rerun: String,
     pub rerun_failed: String,
+    pub diff: String,
     // trigger-prompt (normal mode)
     pub tp_edit: String,
     pub tp_submit: String,
@@ -104,12 +107,14 @@ impl Default for KeymapConfig {
             next_step: "n".into(),
             prev_step: "p".into(),
             all_steps: "a".into(),
+            search: "/".into(),
             trigger: "t".into(),
             watch: "w".into(),
             open_browser: "o".into(),
             cancel_run: "x".into(),
             rerun: "r".into(),
             rerun_failed: "R".into(),
+            diff: "D".into(),
             tp_edit: "i".into(),
             tp_submit: "t".into(),
             tp_yes: "y".into(),

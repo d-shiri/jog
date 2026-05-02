@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use crate::app::state::{AppState, DetailItem, TriggerPrompt, View, build_detail_items};
 use crate::config::KeymapConfig;
 use crate::config::Config;
+use crate::history::History;
 use crate::provider::github::{GitHubProvider, current_branch};
 use crate::provider::{Provider, Run, RunDetail, Status, Workflow};
 
@@ -50,7 +51,14 @@ pub async fn run(
 ) -> Result<()> {
     let branch = current_branch().unwrap_or_else(|_| "?".into());
     let repo_label = format!("{}/{}", provider.repo().owner, provider.repo().repo);
-    let mut state = AppState::new(repo_label, branch, sort_with_favorites(workflows, &config), config.keys.clone());
+    let history = History::load_for_repo(&provider.repo().owner, &provider.repo().repo);
+    let mut state = AppState::new(
+        repo_label,
+        branch,
+        sort_with_favorites(workflows, &config),
+        config.keys.clone(),
+        history,
+    );
 
     if let Some(file) = opts.focus_workflow.as_deref() {
         if let Some(idx) = state
@@ -169,17 +177,24 @@ async fn event_loop(
                         state.pending = state.pending.saturating_sub(1);
                     }
                     AppEvent::RunDetailLoaded(detail) => {
+                        if let Some(file) = state.workflow_for_runs.as_deref() {
+                            state.history.record(file, &detail);
+                        }
                         state.run_detail = Some(detail);
                         state.detail_cursor = 0;
                         state.pending = state.pending.saturating_sub(1);
                     }
                     AppEvent::RunPreviewLoaded(run_id, detail) => {
+                        if let Some(file) = state.workflow_for_runs.as_deref() {
+                            state.history.record(file, &detail);
+                        }
                         if state.runs_preview_id == Some(run_id) {
                             state.runs_preview = Some(detail);
                         }
                         state.pending = state.pending.saturating_sub(1);
                     }
                     AppEvent::LogsLoaded(lines) => {
+                        state.clear_log_search();
                         state.log_sections = parse_log_sections(&lines);
                         state.log_raw = lines.clone();
                         if let Some((step_name, step_number)) = state.log_pending_section.take() {
@@ -251,6 +266,21 @@ async fn handle_key(
         handle_trigger_prompt_edit(state, key);
         return None;
     }
+    // While typing into the log search prompt, route every key to the editor.
+    if state.view == View::Logs && state.log_search_input.is_some() {
+        handle_log_search_input(state, key);
+        return None;
+    }
+    // Esc clears an active log query before falling through to view-back.
+    if state.view == View::Logs
+        && key.code == KeyCode::Esc
+        && state.log_search_query.is_some()
+    {
+        state.log_search_query = None;
+        state.log_search_matches.clear();
+        state.log_search_match_idx = None;
+        return None;
+    }
 
     // Global: quit
     if key_is(&key, km.quit) {
@@ -275,6 +305,9 @@ async fn handle_key(
             View::Logs => {
                 state.switch_view(View::RunDetail);
                 state.log_lines.clear();
+            }
+            View::Diff => {
+                state.switch_view(View::RunDetail);
             }
             View::TriggerPrompt => cancel_trigger_prompt(state),
         }
@@ -383,6 +416,8 @@ async fn handle_key(
             } else if key_is(&key, km.up) || key.code == KeyCode::Up {
                 let max = state.run_detail.as_ref().map(|d| build_detail_items(d).len()).unwrap_or(0);
                 move_cursor(&mut state.detail_cursor, max, -1);
+            } else if key_is(&key, km.diff) {
+                state.switch_view(View::Diff);
             } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter || key_is(&key, km.open_logs) {
                 if let Some(detail) = &state.run_detail {
                     let items = build_detail_items(detail);
@@ -428,33 +463,47 @@ async fn handle_key(
                 state.log_scroll = state.log_scroll.saturating_sub(20);
             } else if key_is(&key, km.scroll_top) {
                 state.log_scroll = 0;
+            } else if key_is(&key, km.search) {
+                state.log_search_input = Some(String::new());
             } else if key_is(&key, km.next_step) {
-                let n = state.log_sections.len();
-                if n > 0 {
-                    let next = state.log_section_idx.map(|i| (i + 1).min(n - 1)).unwrap_or(0);
-                    state.log_section_idx = Some(next);
-                    state.log_lines = extract_log_section(&state.log_raw, next);
-                    state.log_scroll = 0;
+                if state.log_search_query.is_some() {
+                    jump_log_match(state, 1);
+                } else {
+                    let n = state.log_sections.len();
+                    if n > 0 {
+                        let next = state.log_section_idx.map(|i| (i + 1).min(n - 1)).unwrap_or(0);
+                        state.log_section_idx = Some(next);
+                        state.log_lines = extract_log_section(&state.log_raw, next);
+                        state.log_scroll = 0;
+                        state.clear_log_search();
+                    }
                 }
             } else if key_is(&key, km.prev_step) {
-                match state.log_section_idx {
-                    None => {}
-                    Some(0) => {
-                        state.log_section_idx = None;
-                        state.log_lines = state.log_raw.clone();
-                        state.log_scroll = 0;
-                    }
-                    Some(i) => {
-                        let prev = i - 1;
-                        state.log_section_idx = Some(prev);
-                        state.log_lines = extract_log_section(&state.log_raw, prev);
-                        state.log_scroll = 0;
+                if state.log_search_query.is_some() {
+                    jump_log_match(state, -1);
+                } else {
+                    match state.log_section_idx {
+                        None => {}
+                        Some(0) => {
+                            state.log_section_idx = None;
+                            state.log_lines = state.log_raw.clone();
+                            state.log_scroll = 0;
+                            state.clear_log_search();
+                        }
+                        Some(i) => {
+                            let prev = i - 1;
+                            state.log_section_idx = Some(prev);
+                            state.log_lines = extract_log_section(&state.log_raw, prev);
+                            state.log_scroll = 0;
+                            state.clear_log_search();
+                        }
                     }
                 }
             } else if key_is(&key, km.all_steps) {
                 state.log_section_idx = None;
                 state.log_lines = state.log_raw.clone();
                 state.log_scroll = 0;
+                state.clear_log_search();
             }
         }
         View::TriggerPrompt => {
@@ -499,8 +548,80 @@ async fn handle_key(
             }
         }
         View::Watch => {}
+        View::Diff => {}
     }
     None
+}
+
+fn handle_log_search_input(state: &mut AppState, key: KeyEvent) {
+    let Some(buf) = state.log_search_input.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            state.log_search_input = None;
+        }
+        KeyCode::Enter => {
+            let q = std::mem::take(buf);
+            state.log_search_input = None;
+            if q.is_empty() {
+                state.log_search_query = None;
+                state.log_search_matches.clear();
+                state.log_search_match_idx = None;
+                return;
+            }
+            state.log_search_query = Some(q);
+            state.recompute_log_matches();
+            scroll_to_current_match(state);
+        }
+        KeyCode::Backspace => {
+            buf.pop();
+        }
+        KeyCode::Char(c) => {
+            buf.push(c);
+        }
+        _ => {}
+    }
+}
+
+fn jump_log_match(state: &mut AppState, dir: i32) {
+    if state.log_search_matches.is_empty() {
+        return;
+    }
+    let n = state.log_search_matches.len() as i32;
+    let cur = state.log_search_match_idx.unwrap_or(0) as i32;
+    let next = ((cur + dir) % n + n) % n;
+    state.log_search_match_idx = Some(next as usize);
+    scroll_to_current_match(state);
+}
+
+fn scroll_to_current_match(state: &mut AppState) {
+    let Some(idx) = state.log_search_match_idx else { return };
+    let Some(&src_line) = state.log_search_matches.get(idx) else { return };
+    let viewport = state.last_logs_viewport_height.get().max(1);
+
+    // Mirror render expansion: each `##[group]`/`##[section]` source line
+    // becomes 3 rendered lines (separator, header, blank). All other prefixes
+    // are 1:1. Without this correction the scroll target lands above the
+    // actual match by 2 rows per preceding group.
+    let render_offset_through = |upto: usize| -> u32 {
+        let mut total: u32 = 0;
+        for line in state.log_lines.iter().take(upto) {
+            let content = strip_time_prefix(line);
+            if content.starts_with("##[group]") || content.starts_with("##[section]") {
+                total += 3;
+            } else {
+                total += 1;
+            }
+        }
+        total
+    };
+
+    let target_render = render_offset_through(src_line);
+    let total_render = render_offset_through(state.log_lines.len());
+    let target = (target_render as u16).saturating_sub(viewport / 3);
+    let max = (total_render as u16).saturating_sub(viewport);
+    state.log_scroll = target.min(max);
 }
 
 fn handle_trigger_prompt_edit(state: &mut AppState, key: KeyEvent) {
@@ -548,12 +669,14 @@ struct Keymap {
     next_step: (KeyCode, KeyModifiers),
     prev_step: (KeyCode, KeyModifiers),
     all_steps: (KeyCode, KeyModifiers),
+    search: (KeyCode, KeyModifiers),
     trigger: (KeyCode, KeyModifiers),
     watch: (KeyCode, KeyModifiers),
     open_browser: (KeyCode, KeyModifiers),
     cancel_run: (KeyCode, KeyModifiers),
     rerun: (KeyCode, KeyModifiers),
     rerun_failed: (KeyCode, KeyModifiers),
+    diff: (KeyCode, KeyModifiers),
     tp_edit: (KeyCode, KeyModifiers),
     tp_submit: (KeyCode, KeyModifiers),
     tp_yes: (KeyCode, KeyModifiers),
@@ -615,12 +738,14 @@ fn resolve_keymap(cfg: &KeymapConfig) -> Result<Keymap> {
         next_step:     parse_key(&cfg.next_step)?,
         prev_step:     parse_key(&cfg.prev_step)?,
         all_steps:     parse_key(&cfg.all_steps)?,
+        search:        parse_key(&cfg.search)?,
         trigger:       parse_key(&cfg.trigger)?,
         watch:         parse_key(&cfg.watch)?,
         open_browser:  parse_key(&cfg.open_browser)?,
         cancel_run:    parse_key(&cfg.cancel_run)?,
         rerun:         parse_key(&cfg.rerun)?,
         rerun_failed:  parse_key(&cfg.rerun_failed)?,
+        diff:          parse_key(&cfg.diff)?,
         tp_edit:       parse_key(&cfg.tp_edit)?,
         tp_submit:     parse_key(&cfg.tp_submit)?,
         tp_yes:        parse_key(&cfg.tp_yes)?,

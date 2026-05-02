@@ -2,12 +2,13 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub mod discovery;
 pub mod github;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
     Queued,
     Running,
