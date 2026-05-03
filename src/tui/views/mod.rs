@@ -455,6 +455,7 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Rgb(55, 55, 80)))
+        .style(Style::default().bg(Color::Rgb(18, 20, 32)))
         .title(title_line);
     let inner = blk.inner(area);
     f.render_widget(blk, area);
@@ -499,8 +500,8 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
                     chars.iter().collect()
                 };
                 Line::from(vec![
-                    Span::styled("⎿ ", Style::default().fg(Color::Rgb(70, 70, 90))),
-                    Span::styled(msg, Style::default().fg(Color::Rgb(100, 100, 130)).italic()),
+                    Span::styled("⎿ ", Style::default().fg(Color::Rgb(65, 65, 80))),
+                    Span::styled(msg, Style::default().fg(Color::Rgb(110, 110, 140))).italic(),
                 ])
             };
             let branch_cell = ratatui::text::Text::from(vec![

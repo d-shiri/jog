@@ -5,7 +5,27 @@ A terminal UI for browsing and triggering GitHub Actions workflows.
 ![Main](./images/main.png)
 ![Runs](./images/runs.png)
 
-## Install
+## Download
+
+Pre-built binaries are on the [Releases](https://github.com/d-shiri/jog/releases/latest) page.
+
+| Platform | File |
+|----------|------|
+| Linux x86_64 (static) | `jog-linux-x86_64` |
+| macOS Apple Silicon | `jog-macos-aarch64` |
+| Windows x86_64 | `jog-windows-x86_64.exe` |
+
+```sh
+# Linux
+curl -fsSL https://github.com/d-shiri/jog/releases/latest/download/jog-linux-x86_64 -o jog
+chmod +x jog && sudo mv jog /usr/local/bin/
+
+# macOS
+curl -fsSL https://github.com/d-shiri/jog/releases/latest/download/jog-macos-aarch64 -o jog
+chmod +x jog && sudo mv jog /usr/local/bin/
+```
+
+## Install from source
 
 ```sh
 cargo install --path .
