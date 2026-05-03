@@ -114,7 +114,6 @@ impl TriggerPrompt {
 
 #[derive(Debug, Clone)]
 pub struct Theme {
-    pub bg: Color,
     pub header_bg: Color,
     pub footer_bg: Color,
     pub primary: Color,
@@ -129,7 +128,6 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            bg: Color::Rgb(18, 20, 32),
             header_bg: Color::Rgb(28, 30, 42),
             footer_bg: Color::Rgb(28, 30, 42),
             primary: Color::Cyan,
@@ -324,7 +322,7 @@ impl AppState {
                     header.push(Span::styled("▸ ", title_style));
                     header.extend(ansi_line_to_spans(title, title_style));
                     vec![
-                        Line::from(Span::styled("────────────────────────────────────────────────────────────────────────────────", sep_style)),
+                        Line::from(Span::styled("────────────────────────────────────────────────────────────────────────", sep_style)),
                         Line::from(header),
                         Line::default(),
                     ]
@@ -375,15 +373,28 @@ impl AppState {
                     spans.extend(ansi_line_to_spans(msg, s));
                     vec![Line::from(spans)]
                 } else {
-                    let base = if !content.contains('\x1b') {
-                        let trimmed = content.trim_start().to_lowercase();
-                        if trimmed.starts_with("error") || trimmed.starts_with("failed") {
-                            Style::default().fg(Color::Red)
-                        } else if trimmed.starts_with("warn") || trimmed.starts_with("warning") {
-                            Style::default().fg(Color::Yellow)
-                        } else {
-                            Style::default().fg(Color::Rgb(200, 200, 200))
-                        }
+                    // Keyword detection runs on plain text regardless of ANSI presence.
+                    // For ANSI lines the detected style becomes the default that ANSI
+                    // resets (`\x1b[0m`) fall back to, so "FAILED" lines stay red even
+                    // after the escape sequence ends.
+                    let plain = if content.contains('\x1b') {
+                        strip_ansi(content)
+                    } else {
+                        content.to_string()
+                    };
+                    let trimmed_lower = plain.trim_start().to_lowercase();
+                    let base = if trimmed_lower.starts_with("error") || trimmed_lower.starts_with("failed") {
+                        Style::default().fg(Color::Red)
+                    } else if trimmed_lower.starts_with("warn") {
+                        Style::default().fg(Color::Yellow)
+                    } else if trimmed_lower.starts_with('=') && trimmed_lower.len() > 3
+                        && trimmed_lower[..4].chars().all(|c| c == '=')
+                    {
+                        Style::default().fg(Color::Yellow).bold()
+                    } else if trimmed_lower.starts_with('-') && trimmed_lower.len() > 3
+                        && trimmed_lower[..4].chars().all(|c| c == '-')
+                    {
+                        Style::default().fg(Color::Rgb(100, 100, 100))
                     } else {
                         Style::default().fg(Color::Rgb(200, 200, 200))
                     };

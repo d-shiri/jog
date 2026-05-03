@@ -69,6 +69,7 @@ pub struct KeymapConfig {
     pub page_down: String,
     pub page_up: String,
     pub scroll_top: String,
+    pub scroll_bottom: String,
     // log step navigation
     pub next_step: String,
     pub prev_step: String,
@@ -104,6 +105,7 @@ impl Default for KeymapConfig {
             page_down: "d".into(),
             page_up: "u".into(),
             scroll_top: "g".into(),
+            scroll_bottom: "G".into(),
             next_step: "n".into(),
             prev_step: "p".into(),
             all_steps: "a".into(),

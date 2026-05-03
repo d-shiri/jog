@@ -108,7 +108,7 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             vec![
                 (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "scroll"),
                 (format!("{}/{}", display_key(&km.page_down), display_key(&km.page_up)), "page"),
-                (display_key(&km.scroll_top).into(), "top"),
+                (format!("{}/{}", display_key(&km.scroll_top), display_key(&km.scroll_bottom)), "top/bot"),
                 (format!("{}/{}", display_key(&km.next_step), display_key(&km.prev_step)), np_label),
                 (display_key(&km.all_steps).into(), "all"),
                 (display_key(&km.search).into(), "search"),
@@ -934,6 +934,7 @@ mod tests {
             id: 1,
             display_title: "x".into(),
             head_branch: "main".into(),
+            commit_msg: String::new(),
             status: Status::Skipped,
             created_at: created,
             updated_at: updated,

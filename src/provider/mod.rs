@@ -81,6 +81,7 @@ pub struct Run {
     pub id: u64,
     pub display_title: String,
     pub head_branch: String,
+    pub commit_msg: String,
     pub status: Status,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

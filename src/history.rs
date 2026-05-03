@@ -160,6 +160,7 @@ mod tests {
             id,
             display_title: "x".into(),
             head_branch: "main".into(),
+            commit_msg: String::new(),
             status,
             created_at: Utc.with_ymd_and_hms(2026, 5, 1, h, 0, 0).unwrap(),
             updated_at: Utc.with_ymd_and_hms(2026, 5, 1, h, 1, 0).unwrap(),

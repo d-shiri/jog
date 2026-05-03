@@ -116,10 +116,12 @@ impl GitHubProvider {
 
 fn map_run(r: gh_workflows::Run) -> Run {
     let status = parse_run_status(&r.status, r.conclusion.as_deref());
+    let commit_msg = r.head_commit.message.lines().next().unwrap_or("").to_string();
     Run {
         id: r.id.0,
         display_title: r.name.clone(),
         head_branch: r.head_branch,
+        commit_msg,
         status,
         created_at: r.created_at,
         updated_at: r.updated_at,

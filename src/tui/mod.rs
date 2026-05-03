@@ -478,6 +478,8 @@ async fn handle_key(
                 state.log_scroll = state.log_scroll.saturating_sub(20);
             } else if key_is(&key, km.scroll_top) {
                 state.log_scroll = 0;
+            } else if key_is(&key, km.scroll_bottom) {
+                state.log_scroll = max_scroll;
             } else if key_is(&key, km.search) {
                 state.log_search_input = Some(String::new());
             } else if key_is(&key, km.next_step) {
@@ -689,6 +691,7 @@ struct Keymap {
     page_down: (KeyCode, KeyModifiers),
     page_up: (KeyCode, KeyModifiers),
     scroll_top: (KeyCode, KeyModifiers),
+    scroll_bottom: (KeyCode, KeyModifiers),
     next_step: (KeyCode, KeyModifiers),
     prev_step: (KeyCode, KeyModifiers),
     all_steps: (KeyCode, KeyModifiers),
@@ -758,6 +761,7 @@ fn resolve_keymap(cfg: &KeymapConfig) -> Result<Keymap> {
         page_down:     parse_key(&cfg.page_down)?,
         page_up:       parse_key(&cfg.page_up)?,
         scroll_top:    parse_key(&cfg.scroll_top)?,
+        scroll_bottom: parse_key(&cfg.scroll_bottom)?,
         next_step:     parse_key(&cfg.next_step)?,
         prev_step:     parse_key(&cfg.prev_step)?,
         all_steps:     parse_key(&cfg.all_steps)?,
