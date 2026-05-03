@@ -189,6 +189,15 @@ async fn event_loop(
                         if let Some(file) = state.workflow_for_runs.as_deref() {
                             state.history.record(file, &detail);
                         }
+                        // Sound notification: play when a run we saw as Running finishes.
+                        let id = detail.run.id;
+                        if detail.run.status.is_terminal() {
+                            if state.watch_seen_running.remove(&id) {
+                                play_sound("/usr/share/sounds/freedesktop/stereo/complete.oga");
+                            }
+                        } else {
+                            state.watch_seen_running.insert(id);
+                        }
                         state.run_detail = Some(detail);
                         state.detail_cursor = 0;
                         state.pending = state.pending.saturating_sub(1);
@@ -329,6 +338,28 @@ async fn handle_key(
         return None;
     }
 
+    // Global: open current run in browser.
+    // Resolution order: loaded run_detail → selected run in list → async-fetch latest for workflow.
+    if key_is(&key, km.open_browser) {
+        if let Some(url) = state.run_detail.as_ref().map(|d| d.run.url.clone())
+            .or_else(|| state.runs.get(state.run_cursor).map(|r| r.url.clone()))
+        {
+            let _ = open::that(&url);
+            state.set_status(format!("opened in browser"));
+        } else if let Some(w) = state.selected_workflow().cloned() {
+            // Workflows view: no run loaded yet, fetch the latest one.
+            let p = provider.clone();
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                if let Ok(Some(run)) = p.get_latest_run(&w.file_name).await {
+                    let _ = open::that(&run.url);
+                    let _ = tx2.send(AppEvent::Status(format!("opened run {}", run.id)));
+                }
+            });
+        }
+        return None;
+    }
+
     match state.view {
         View::Workflows => {
             if key_is(&key, km.down) || key.code == KeyCode::Down {
@@ -352,17 +383,6 @@ async fn handle_key(
                     state.workflow_for_runs = Some(w.file_name.clone());
                     state.runs.clear();
                     spawn_fetch_runs(provider.clone(), w.file_name, tx.clone(), state);
-                }
-            } else if key_is(&key, km.open_browser) {
-                if let Some(w) = state.selected_workflow().cloned() {
-                    let p = provider.clone();
-                    let tx2 = tx.clone();
-                    tokio::spawn(async move {
-                        if let Ok(Some(run)) = p.get_latest_run(&w.file_name).await {
-                            let _ = open::that(run.url.clone());
-                            let _ = tx2.send(AppEvent::Status(format!("opened run {}", run.id)));
-                        }
-                    });
                 }
             }
         }
@@ -1118,6 +1138,17 @@ pub fn status_glyph(s: Status) -> &'static str {
         Status::Skipped => "↷",
         Status::Unknown => "?",
     }
+}
+
+/// Play a sound file non-blocking. Tries `paplay` (PulseAudio/PipeWire),
+/// falls back to `pw-play`, then silently gives up.
+fn play_sound(path: &str) {
+    let path = path.to_string();
+    std::thread::spawn(move || {
+        if std::process::Command::new("paplay").arg(&path).spawn().is_err() {
+            let _ = std::process::Command::new("pw-play").arg(&path).spawn();
+        }
+    });
 }
 
 pub fn animated_glyph(s: Status, tick: u64) -> &'static str {

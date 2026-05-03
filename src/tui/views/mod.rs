@@ -130,11 +130,13 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             (display_key(&km.rerun_failed).into(), "rerun-failed"),
             (display_key(&km.cancel_run).into(), "cancel"),
             (display_key(&km.watch).into(), "watch"),
+            (display_key(&km.open_browser).into(), "open"),
             (display_key(&km.back).into(), "back"),
         ],
         View::RunDetail => vec![
             (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "step"),
             (format!("↵/{}", display_key(&km.open_logs)), "logs"),
+            (display_key(&km.open_browser).into(), "open"),
             (display_key(&km.diff).into(), "diff"),
             (display_key(&km.back).into(), "back"),
             (display_key(&km.quit).into(), "quit"),
@@ -148,15 +150,18 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                 (format!("{}/{}", display_key(&km.next_step), display_key(&km.prev_step)), np_label),
                 (display_key(&km.all_steps).into(), "all"),
                 (display_key(&km.search).into(), "search"),
+                (display_key(&km.open_browser).into(), "open"),
                 (display_key(&km.back).into(), "back"),
                 (display_key(&km.quit).into(), "quit"),
             ]
         },
         View::Watch => vec![
+            (display_key(&km.open_browser).into(), "open"),
             (display_key(&km.back).into(), "back"),
             (display_key(&km.quit).into(), "quit"),
         ],
         View::Diff => vec![
+            (display_key(&km.open_browser).into(), "open"),
             (display_key(&km.back).into(), "back"),
             (display_key(&km.quit).into(), "quit"),
         ],
@@ -501,7 +506,7 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
                 };
                 Line::from(vec![
                     Span::styled("⎿ ", Style::default().fg(Color::Rgb(65, 65, 80))),
-                    Span::styled(msg, Style::default().fg(Color::Rgb(110, 110, 140))).italic(),
+                    Span::styled(msg, Style::default().fg(Color::Rgb(110, 110, 140))),
                 ])
             };
             let branch_cell = ratatui::text::Text::from(vec![

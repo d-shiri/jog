@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashSet;
 use ratatui::text::{Line, Span};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 
@@ -194,6 +195,9 @@ pub struct AppState {
     pub keymap: KeymapConfig,
     pub history: History,
     pub theme: Theme,
+    /// Run IDs we have seen in a non-terminal state during this Watch session.
+    /// Used to fire a sound only when a run we were actively watching finishes.
+    pub watch_seen_running: HashSet<u64>,
 }
 
 impl AppState {
@@ -234,6 +238,7 @@ impl AppState {
             keymap,
             history,
             theme: Theme::default(),
+            watch_seen_running: HashSet::new(),
         }
     }
 
