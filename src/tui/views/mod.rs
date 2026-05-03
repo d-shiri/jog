@@ -4,12 +4,12 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState, Wrap,
+    Block, BorderType, Borders, Cell, LineGauge, Paragraph, Row, Sparkline, Table, TableState, Wrap,
 };
 
 use std::collections::HashMap;
 
-use super::status_glyph;
+use super::animated_glyph;
 use crate::app::state::{AppState, DetailItem, Theme, View, build_detail_items};
 use crate::history::HistoryEntry;
 use crate::provider::{Run, Status};
@@ -39,17 +39,52 @@ pub fn render(f: &mut Frame, state: &AppState) {
 
 fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
-    let view_name = match state.view {
-        View::Workflows => "Workflows",
-        View::Runs => "Runs",
-        View::RunDetail => "Run Detail",
-        View::Logs => "Logs",
-        View::Watch => "Watch",
-        View::TriggerPrompt => "Trigger",
-        View::Diff => "Diff",
+    let sep = || Span::styled("  ›  ", Style::default().fg(Color::Rgb(55, 55, 80)));
+    let crumb: Vec<Span> = match state.view {
+        View::Workflows => vec![
+            Span::styled("Workflows", Style::default().fg(theme.primary).bold()),
+        ],
+        View::Runs => vec![
+            Span::styled("Workflows", Style::default().fg(theme.secondary)),
+            sep(),
+            Span::styled(
+                state.workflow_for_runs.as_deref().unwrap_or("?").to_string(),
+                Style::default().fg(theme.primary).bold(),
+            ),
+        ],
+        View::RunDetail => {
+            let wf = state.workflow_for_runs.as_deref().unwrap_or("?");
+            let rid = state.run_detail.as_ref()
+                .map(|d| format!("#{}", d.run.id))
+                .unwrap_or_else(|| state.runs.get(state.run_cursor)
+                    .map(|r| format!("#{}", r.id))
+                    .unwrap_or_else(|| "?".into()));
+            vec![
+                Span::styled("Workflows", Style::default().fg(theme.secondary)),
+                sep(),
+                Span::styled(wf.to_string(), Style::default().fg(theme.secondary)),
+                sep(),
+                Span::styled(rid, Style::default().fg(theme.primary).bold()),
+            ]
+        }
+        View::Logs => {
+            let step = state.log_section_idx
+                .and_then(|i| state.log_sections.get(i))
+                .map(|s| s.as_str())
+                .unwrap_or("all steps");
+            vec![
+                Span::styled("Logs", Style::default().fg(theme.secondary)),
+                sep(),
+                Span::styled(step.to_string(), Style::default().fg(theme.primary).bold()),
+            ]
+        }
+        View::Watch         => vec![Span::styled("Watch",   Style::default().fg(theme.primary).bold())],
+        View::Diff          => vec![Span::styled("Diff",    Style::default().fg(theme.primary).bold())],
+        View::TriggerPrompt => vec![Span::styled("Trigger", Style::default().fg(theme.primary).bold())],
     };
+
     let dot = Style::default().fg(Color::Rgb(55, 55, 80));
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(" ⚡ ", Style::default().fg(theme.accent)),
         Span::styled("jog", Style::default().fg(Color::White).bold()),
         Span::styled("  ·  ", dot),
@@ -57,8 +92,9 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled("  ⎇ ", Style::default().fg(Color::Rgb(90, 110, 150))),
         Span::styled(state.current_branch.as_str(), Style::default().fg(theme.accent)),
         Span::styled("  ·  ", dot),
-        Span::styled(view_name, Style::default().fg(theme.primary).bold()),
-    ]);
+    ];
+    spans.extend(crumb);
+    let line = Line::from(spans);
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(theme.header_bg)),
         area,
@@ -188,8 +224,26 @@ fn render_workflows(f: &mut Frame, area: Rect, state: &AppState) {
 fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     let count = state.workflows.len();
-    let title = format!("Workflows ({count})");
-    let blk = styled_block(&title, &state.theme);
+    let (wf_ok, wf_fail, wf_run) = state.workflows.iter().fold((0u32, 0u32, 0u32), |(o, f, r), w| {
+        match w.last_status.unwrap_or(Status::Unknown) {
+            Status::Success => (o + 1, f, r),
+            Status::Failure => (o, f + 1, r),
+            Status::Running => (o, f, r + 1),
+            _ => (o, f, r),
+        }
+    });
+    let wf_title = Line::from(vec![
+        Span::styled(format!(" Workflows ({count}"), Style::default().fg(theme.primary).bold()),
+        Span::styled(format!("  ✓{wf_ok}"), Style::default().fg(theme.success)),
+        Span::styled(format!("  ✗{wf_fail}"), Style::default().fg(theme.failure)),
+        if wf_run > 0 { Span::styled(format!("  ⏵{wf_run}"), Style::default().fg(theme.warning).bold()) } else { Span::raw("") },
+        Span::styled(" ) ", Style::default().fg(theme.primary).bold()),
+    ]);
+    let blk = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(55, 55, 80)))
+        .title(wf_title);
     let inner = blk.inner(area);
     f.render_widget(blk, area);
 
@@ -222,8 +276,9 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
                 .unwrap_or_else(|| ("—".into(), Style::default().fg(theme.unknown)));
             let trig = if w.triggerable { "t" } else { " " };
 
+            let row_bg = row_bg_for_status(status);
             Row::new(vec![
-                Cell::from(Span::styled(status_glyph(status), style_for_status(status, &state.theme))),
+                Cell::from(Span::styled(animated_glyph(status, state.tick_count), style_for_status(status, &state.theme))),
                 Cell::from(Span::styled(w.name.clone(), Style::default())),
                 Cell::from(Span::styled(
                     w.file_name.clone(),
@@ -235,6 +290,7 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
                     Style::default().fg(theme.accent),
                 )),
             ])
+            .style(Style::default().bg(row_bg))
         })
         .collect();
 
@@ -287,6 +343,35 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
+    let theme = &state.theme;
+
+    // Split inner: top 3 rows for sparkline trend, rest for the runs table
+    let inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(inner);
+
+    let spark_data: Vec<u64> = state.workflow_preview_runs.iter().rev()
+        .map(|r| match r.status {
+            Status::Success => 2,
+            Status::Running => 1,
+            _               => 0,
+        })
+        .collect();
+    let spark_color = state.workflow_preview_runs.first()
+        .map(|r| match r.status {
+            Status::Success => theme.success,
+            Status::Failure => theme.failure,
+            Status::Running => theme.warning,
+            _               => theme.unknown,
+        })
+        .unwrap_or(theme.secondary);
+    f.render_widget(
+        Sparkline::default().data(&spark_data).max(2)
+            .style(Style::default().fg(spark_color)),
+        inner_chunks[0],
+    );
+
     let sel_bg = Color::Rgb(25, 85, 110);
     let sel_fg = Color::Rgb(220, 240, 255);
     let hdr = Style::default().fg(Color::Rgb(120, 120, 145));
@@ -305,10 +390,11 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
         .map(|r| {
             let (when_text, when_style) = relative_styled(r.updated_at);
             Row::new(vec![
-                Cell::from(Span::styled(status_glyph(r.status), style_for_status(r.status, &state.theme))),
+                Cell::from(Span::styled(animated_glyph(r.status, state.tick_count), style_for_status(r.status, &state.theme))),
                 Cell::from(Span::styled(r.head_branch.clone(), Style::default().fg(Color::Yellow))),
                 Cell::from(Span::styled(when_text, when_style)),
             ])
+            .style(Style::default().bg(row_bg_for_status(r.status)))
         })
         .collect();
 
@@ -328,7 +414,7 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
     if !state.workflow_preview_runs.is_empty() {
         ts.select(Some(0)); // highlight most recent
     }
-    f.render_stateful_widget(table, inner, &mut ts);
+    f.render_stateful_widget(table, inner_chunks[1], &mut ts);
 }
 
 fn render_runs(f: &mut Frame, area: Rect, state: &AppState) {
@@ -341,11 +427,35 @@ fn render_runs(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
-    let title = match &state.workflow_for_runs {
-        Some(wf) => format!("Runs — {} ({})", wf, state.runs.len()),
-        None => format!("Runs ({})", state.runs.len()),
-    };
-    let blk = styled_block(&title, &state.theme);
+    let theme = &state.theme;
+    let wf_label = state.workflow_for_runs.as_deref().unwrap_or("?");
+    let (ok, fail, running) = state.runs.iter().fold((0u32, 0u32, 0u32), |(o, f, r), x| {
+        match x.status {
+            Status::Success => (o + 1, f, r),
+            Status::Failure => (o, f + 1, r),
+            Status::Running => (o, f, r + 1),
+            _ => (o, f, r),
+        }
+    });
+    let title_line = Line::from(vec![
+        Span::styled(
+            if state.workflow_for_runs.is_some() {
+                format!(" Runs — {} ({}", wf_label, state.runs.len())
+            } else {
+                format!(" Runs ({}", state.runs.len())
+            },
+            Style::default().fg(theme.primary).bold(),
+        ),
+        Span::styled(format!("  ✓{ok}"), Style::default().fg(theme.success)),
+        Span::styled(format!("  ✗{fail}"), Style::default().fg(theme.failure)),
+        if running > 0 { Span::styled(format!("  ⏵{running}"), Style::default().fg(theme.warning).bold()) } else { Span::raw("") },
+        Span::styled(" ) ", Style::default().fg(theme.primary).bold()),
+    ]);
+    let blk = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(55, 55, 80)))
+        .title(title_line);
     let inner = blk.inner(area);
     f.render_widget(blk, area);
 
@@ -361,6 +471,7 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
         Cell::from(""),
         Cell::from(Span::styled("Branch", hdr)),
         Cell::from(Span::styled("Updated", hdr)),
+        Cell::from(Span::styled("Dur", hdr)),
     ])
     .height(1)
     .bottom_margin(1);
@@ -370,18 +481,40 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
         .iter()
         .map(|r| {
             let (when_text, when_style) = relative_styled(r.updated_at);
+            let dur_secs = elapsed_seconds(r);
+            let dur_text = format_elapsed(dur_secs);
+            let dur_style = if dur_secs > 900 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Rgb(110, 110, 140))
+            };
+            let commit_sub = if r.commit_msg.is_empty() {
+                String::new()
+            } else if r.commit_msg.len() > 42 {
+                format!("{}…", &r.commit_msg[..42])
+            } else {
+                r.commit_msg.clone()
+            };
+            let branch_cell = ratatui::text::Text::from(vec![
+                Line::from(Span::styled(r.head_branch.clone(), Style::default().fg(Color::Yellow))),
+                Line::from(Span::styled(commit_sub, Style::default().fg(Color::Rgb(100, 100, 130)).italic())),
+            ]);
             Row::new(vec![
-                Cell::from(Span::styled(status_glyph(r.status), style_for_status(r.status, &state.theme))),
-                Cell::from(Span::styled(r.head_branch.clone(), Style::default().fg(Color::Yellow))),
+                Cell::from(Span::styled(animated_glyph(r.status, state.tick_count), style_for_status(r.status, &state.theme))),
+                Cell::from(branch_cell),
                 Cell::from(Span::styled(when_text, when_style)),
+                Cell::from(Span::styled(dur_text, dur_style)),
             ])
+            .height(2)
+            .style(Style::default().bg(row_bg_for_status(r.status)))
         })
         .collect();
 
     let widths = [
-        Constraint::Length(1),       // status glyph
-        Constraint::Fill(1),         // branch
-        Constraint::Length(10),      // updated
+        Constraint::Length(1),   // glyph
+        Constraint::Fill(1),     // branch + commit
+        Constraint::Length(10),  // updated
+        Constraint::Length(7),   // duration
     ];
 
     let table = Table::new(rows, widths)
@@ -427,16 +560,27 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
 
     if let Some(detail) = &state.runs_preview {
         let mut lines: Vec<Line> = Vec::new();
+
+        if let Some(run) = selected {
+            if !run.commit_msg.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("󰊢 ", Style::default().fg(Color::Rgb(120, 120, 145))),
+                    Span::styled(run.commit_msg.clone(), Style::default().fg(Color::Rgb(180, 180, 210)).italic()),
+                ]));
+                lines.push(Line::default());
+            }
+        }
+
         for job in &detail.jobs {
             lines.push(Line::from(vec![
-                Span::styled(status_glyph(job.status), style_for_status(job.status, &state.theme)),
+                Span::styled(animated_glyph(job.status, state.tick_count), style_for_status(job.status, &state.theme)),
                 Span::raw(" "),
                 Span::styled(job.name.clone(), Style::default().bold()),
             ]));
             for (si, step) in job.steps.iter().enumerate() {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(status_glyph(step.status), style_for_status(step.status, &state.theme)),
+                    Span::styled(animated_glyph(step.status, state.tick_count), style_for_status(step.status, &state.theme)),
                     Span::raw(format!(" {}. {}", si + 1, step.name)),
                 ]));
             }
@@ -481,7 +625,7 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
                 };
                 lines.push(Line::from(vec![
                     Span::raw(prefix),
-                    Span::styled(status_glyph(job.status), style_for_status(job.status, &state.theme)),
+                    Span::styled(animated_glyph(job.status, state.tick_count), style_for_status(job.status, &state.theme)),
                     Span::raw(" "),
                     Span::styled(job.name.clone(), name_style),
                 ]));
@@ -496,7 +640,7 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
                 };
                 let mut spans = vec![
                     Span::raw(prefix),
-                    Span::styled(status_glyph(step.status), style_for_status(step.status, &state.theme)),
+                    Span::styled(animated_glyph(step.status, state.tick_count), style_for_status(step.status, &state.theme)),
                     Span::raw(" "),
                     // Use sequential position (si+1) — step.number has gaps for
                     // internal composite-action sub-steps that GitHub hides from
@@ -525,10 +669,35 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
         "Run {} — {} ({})",
         detail.run.id, detail.run.display_title, detail.run.head_branch
     );
-    let p = Paragraph::new(lines)
-        .block(styled_block(&title, &state.theme))
-        .wrap(Wrap { trim: false });
-    f.render_widget(p, area);
+    let blk = styled_block(&title, &state.theme);
+    let inner = blk.inner(area);
+    f.render_widget(blk, area);
+
+    let inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(inner);
+
+    let total_jobs = detail.jobs.len();
+    let failed_jobs = detail.jobs.iter().filter(|j| j.status == Status::Failure).count();
+    let dur = format_elapsed(elapsed_seconds(&detail.run));
+    let theme = &state.theme;
+    let summary = Line::from(vec![
+        Span::styled(
+            format!("{total_jobs} job{}", if total_jobs == 1 { "" } else { "s" }),
+            Style::default().fg(theme.primary),
+        ),
+        if failed_jobs > 0 {
+            Span::styled(format!("  ✗ {failed_jobs} failed"), Style::default().fg(theme.failure).bold())
+        } else {
+            Span::styled("  ✓ all passed", Style::default().fg(theme.success))
+        },
+        Span::styled(format!("  ⏱ {dur}"), Style::default().fg(theme.secondary)),
+    ]);
+    f.render_widget(Paragraph::new(summary), inner_chunks[0]);
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(p, inner_chunks[1]);
 }
 
 fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
@@ -558,6 +727,8 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
             ));
         }
     }
+
+    log_title.push_str(&format!("  ({} lines)", state.log_lines.len()));
 
     let p = Paragraph::new(state.log_rendered.clone())
         .block(styled_block(&log_title, &state.theme))
@@ -609,24 +780,41 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(summary, chunks[0]);
 
     if let Some(detail) = &state.run_detail {
-        let mut lines = Vec::new();
-        for job in &detail.jobs {
-            lines.push(Line::from(vec![
-                Span::styled(status_glyph(job.status), style_for_status(job.status, &state.theme)),
+        let theme = &state.theme;
+        let job_constraints: Vec<Constraint> = detail.jobs.iter()
+            .map(|_| Constraint::Length(1))
+            .collect();
+        if job_constraints.is_empty() {
+            return;
+        }
+        let gauge_areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(job_constraints)
+            .split(chunks[1]);
+
+        for (i, job) in detail.jobs.iter().enumerate() {
+            let total = job.steps.len().max(1) as f64;
+            let done = job.steps.iter().filter(|s| s.status.is_terminal()).count() as f64;
+            let ratio = (done / total).clamp(0.0, 1.0);
+            let g_style = style_for_status(job.status, theme);
+            let label = Line::from(vec![
+                Span::styled(animated_glyph(job.status, state.tick_count), g_style),
                 Span::raw(" "),
                 Span::styled(job.name.clone(), Style::default().bold()),
-            ]));
-            for step in &job.steps {
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(status_glyph(step.status), style_for_status(step.status, &state.theme)),
-                    Span::raw(" "),
-                    Span::raw(step.name.clone()),
-                ]));
-            }
+                Span::styled(
+                    format!("  {}/{}", done as u32, total as u32),
+                    Style::default().fg(theme.secondary),
+                ),
+            ]);
+            f.render_widget(
+                LineGauge::default()
+                    .ratio(ratio)
+                    .label(label)
+                    .filled_style(g_style)
+                    .unfilled_style(Style::default().fg(Color::Rgb(55, 55, 80))),
+                gauge_areas[i],
+            );
         }
-        let p = Paragraph::new(lines).block(styled_block("Jobs", &state.theme));
-        f.render_widget(p, chunks[1]);
     }
 }
 
@@ -703,7 +891,7 @@ fn render_diff(f: &mut Frame, area: Rect, state: &AppState) {
             job_lines.push(Line::from(vec![
                 Span::raw("    "),
                 Span::styled(
-                    status_glyph(step.status),
+                    animated_glyph(step.status, state.tick_count),
                     style_for_status(step.status, &state.theme),
                 ),
                 Span::raw(" "),
@@ -719,7 +907,7 @@ fn render_diff(f: &mut Frame, area: Rect, state: &AppState) {
         }
         if !job_lines.is_empty() {
             lines.push(Line::from(vec![
-                Span::styled(status_glyph(job.status), style_for_status(job.status, &state.theme)),
+                Span::styled(animated_glyph(job.status, state.tick_count), style_for_status(job.status, &state.theme)),
                 Span::raw(" "),
                 Span::styled(job.name.clone(), Style::default().bold()),
             ]));
@@ -754,6 +942,17 @@ fn style_for_status(s: Status, theme: &Theme) -> Style {
         Status::Cancelled => Style::default().fg(theme.unknown),
         Status::Skipped => Style::default().fg(theme.unknown),
         Status::Unknown => Style::default().fg(theme.unknown),
+    }
+}
+
+fn row_bg_for_status(s: Status) -> Color {
+    match s {
+        Status::Failure            => Color::Rgb(45, 20, 20),
+        Status::Running            => Color::Rgb(40, 36, 12),
+        Status::Queued             => Color::Rgb(18, 20, 40),
+        Status::Cancelled
+        | Status::Skipped          => Color::Rgb(32, 32, 36),
+        _                          => Color::Rgb(28, 30, 42),
     }
 }
 

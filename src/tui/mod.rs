@@ -1120,6 +1120,15 @@ pub fn status_glyph(s: Status) -> &'static str {
     }
 }
 
+pub fn animated_glyph(s: Status, tick: u64) -> &'static str {
+    if s == Status::Running {
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        FRAMES[(tick % 10) as usize]
+    } else {
+        status_glyph(s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
