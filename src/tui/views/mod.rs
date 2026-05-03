@@ -488,16 +488,24 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
             } else {
                 Style::default().fg(Color::Rgb(110, 110, 140))
             };
-            let commit_sub = if r.commit_msg.is_empty() {
-                String::new()
-            } else if r.commit_msg.len() > 42 {
-                format!("{}…", &r.commit_msg[..42])
+            let commit_line = if r.commit_msg.is_empty() {
+                Line::default()
             } else {
-                r.commit_msg.clone()
+                const MAX: usize = 52;
+                let chars: Vec<char> = r.commit_msg.chars().collect();
+                let msg = if chars.len() > MAX {
+                    format!("{}…", chars[..MAX].iter().collect::<String>())
+                } else {
+                    chars.iter().collect()
+                };
+                Line::from(vec![
+                    Span::styled("⎿ ", Style::default().fg(Color::Rgb(70, 70, 90))),
+                    Span::styled(msg, Style::default().fg(Color::Rgb(100, 100, 130)).italic()),
+                ])
             };
             let branch_cell = ratatui::text::Text::from(vec![
                 Line::from(Span::styled(r.head_branch.clone(), Style::default().fg(Color::Yellow))),
-                Line::from(Span::styled(commit_sub, Style::default().fg(Color::Rgb(100, 100, 130)).italic())),
+                commit_line,
             ]);
             Row::new(vec![
                 Cell::from(Span::styled(animated_glyph(r.status, state.tick_count), style_for_status(r.status, &state.theme))),
@@ -506,7 +514,6 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
                 Cell::from(Span::styled(dur_text, dur_style)),
             ])
             .height(2)
-            .style(Style::default().bg(row_bg_for_status(r.status)))
         })
         .collect();
 
@@ -781,15 +788,22 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
 
     if let Some(detail) = &state.run_detail {
         let theme = &state.theme;
-        let job_constraints: Vec<Constraint> = detail.jobs.iter()
-            .map(|_| Constraint::Length(1))
+
+        // Build alternating constraints: 1 row for the job gauge, N rows for its steps.
+        let constraints: Vec<Constraint> = detail.jobs.iter()
+            .flat_map(|job| [
+                Constraint::Length(1),
+                Constraint::Length(job.steps.len() as u16),
+            ])
             .collect();
-        if job_constraints.is_empty() {
+
+        if constraints.is_empty() {
             return;
         }
-        let gauge_areas = Layout::default()
+
+        let areas = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(job_constraints)
+            .constraints(constraints)
             .split(chunks[1]);
 
         for (i, job) in detail.jobs.iter().enumerate() {
@@ -797,10 +811,12 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
             let done = job.steps.iter().filter(|s| s.status.is_terminal()).count() as f64;
             let ratio = (done / total).clamp(0.0, 1.0);
             let g_style = style_for_status(job.status, theme);
+
+            // ── Gauge row ──────────────────────────────────────────────
             let label = Line::from(vec![
                 Span::styled(animated_glyph(job.status, state.tick_count), g_style),
                 Span::raw(" "),
-                Span::styled(job.name.clone(), Style::default().bold()),
+                Span::styled(job.name.clone(), Style::default().fg(Color::White).bold()),
                 Span::styled(
                     format!("  {}/{}", done as u32, total as u32),
                     Style::default().fg(theme.secondary),
@@ -812,7 +828,47 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
                     .label(label)
                     .filled_style(g_style)
                     .unfilled_style(Style::default().fg(Color::Rgb(55, 55, 80))),
-                gauge_areas[i],
+                areas[i * 2],
+            );
+
+            // ── Steps list ─────────────────────────────────────────────
+            if job.steps.is_empty() {
+                continue;
+            }
+            let step_lines: Vec<Line> = job.steps.iter().enumerate().map(|(si, step)| {
+                let (glyph_style, name_style) = match step.status {
+                    Status::Success =>  (
+                        Style::default().fg(theme.success),
+                        Style::default().fg(Color::Rgb(100, 110, 100)),
+                    ),
+                    Status::Failure =>  (
+                        Style::default().fg(theme.failure).bold(),
+                        Style::default().fg(Color::Rgb(200, 120, 120)).bold(),
+                    ),
+                    Status::Running =>  (
+                        style_for_status(step.status, theme).bold(),
+                        Style::default().fg(Color::White).bold(),
+                    ),
+                    Status::Cancelled | Status::Skipped => (
+                        Style::default().fg(theme.unknown),
+                        Style::default().fg(Color::Rgb(75, 75, 85)),
+                    ),
+                    _ => (
+                        Style::default().fg(Color::Rgb(60, 60, 75)),
+                        Style::default().fg(Color::Rgb(75, 75, 90)),
+                    ),
+                };
+                Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(animated_glyph(step.status, state.tick_count), glyph_style),
+                    Span::styled(format!(" {}. ", si + 1), Style::default().fg(Color::Rgb(70, 70, 90))),
+                    Span::styled(step.name.clone(), name_style),
+                ])
+            }).collect();
+
+            f.render_widget(
+                Paragraph::new(step_lines),
+                areas[i * 2 + 1],
             );
         }
     }
