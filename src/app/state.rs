@@ -1,4 +1,6 @@
 use std::cell::Cell;
+use ratatui::text::{Line, Span};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 
 use crate::config::KeymapConfig;
 use crate::history::History;
@@ -110,6 +112,37 @@ impl TriggerPrompt {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Theme {
+    pub bg: Color,
+    pub header_bg: Color,
+    pub footer_bg: Color,
+    pub primary: Color,
+    pub secondary: Color,
+    pub accent: Color,
+    pub success: Color,
+    pub failure: Color,
+    pub warning: Color,
+    pub unknown: Color,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            bg: Color::Rgb(18, 20, 32),
+            header_bg: Color::Rgb(28, 30, 42),
+            footer_bg: Color::Rgb(28, 30, 42),
+            primary: Color::Cyan,
+            secondary: Color::Rgb(120, 120, 145),
+            accent: Color::Yellow,
+            success: Color::Green,
+            failure: Color::Red,
+            warning: Color::Yellow,
+            unknown: Color::DarkGray,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub view: View,
@@ -141,6 +174,7 @@ pub struct AppState {
     /// Index into `log_search_matches`.
     pub log_search_match_idx: Option<usize>,
     pub status_msg: Option<String>,
+    pub status_msg_tick: u64,
     pub repo_label: String,
     pub current_branch: String,
     pub workflow_for_runs: Option<String>,
@@ -150,13 +184,18 @@ pub struct AppState {
     /// Preview pane in Runs view: detail for the highlighted run.
     pub runs_preview: Option<RunDetail>,
     pub runs_preview_id: Option<u64>,
+    /// Pre-rendered log lines for TUI performance.
+    pub log_rendered: Vec<Line<'static>>,
     /// Pending async work indicator (count of in-flight tasks)
     pub pending: usize,
+    /// Counter incremented on every UI tick (used for animations)
+    pub tick_count: u64,
     /// Set true when transitioning views so the event loop can `terminal.clear()`.
     pub needs_clear: bool,
     pub trigger_prompt: Option<TriggerPrompt>,
     pub keymap: KeymapConfig,
     pub history: History,
+    pub theme: Theme,
 }
 
 impl AppState {
@@ -181,6 +220,7 @@ impl AppState {
             log_search_matches: Vec::new(),
             log_search_match_idx: None,
             status_msg: None,
+            status_msg_tick: 0,
             repo_label,
             current_branch,
             workflow_for_runs: None,
@@ -188,11 +228,14 @@ impl AppState {
             workflow_preview_runs: Vec::new(),
             runs_preview: None,
             runs_preview_id: None,
+            log_rendered: Vec::new(),
             pending: 0,
+            tick_count: 0,
             needs_clear: false,
             trigger_prompt: None,
             keymap,
             history,
+            theme: Theme::default(),
         }
     }
 
@@ -201,6 +244,11 @@ impl AppState {
             self.view = v;
             self.needs_clear = true;
         }
+    }
+
+    pub fn set_status(&mut self, msg: String) {
+        self.status_msg = Some(msg);
+        self.status_msg_tick = self.tick_count;
     }
 
     pub fn selected_workflow(&self) -> Option<&Workflow> {
@@ -242,6 +290,123 @@ impl AppState {
             self.log_search_match_idx = Some(0);
         }
     }
+
+    pub fn recompute_log_rendered(&mut self) {
+        let needle_lower = self
+            .log_search_query
+            .as_deref()
+            .filter(|q| !q.is_empty())
+            .map(|q| q.to_lowercase());
+        let current_match_line = self
+            .log_search_match_idx
+            .and_then(|i| self.log_search_matches.get(i).copied());
+
+        let time_style = Style::default().fg(Color::Rgb(80, 80, 80));
+        let sep_style = Style::default().fg(Color::DarkGray);
+
+        self.log_rendered = self
+            .log_lines
+            .iter()
+            .enumerate()
+            .flat_map(|(src_idx, l)| {
+                let (time, content) = split_time_prefix(l.as_str());
+                let mk_time = || time.map(|t| Span::styled(format!("{t} "), time_style));
+
+                let lines: Vec<Line> = if let Some(title) = content
+                    .strip_prefix("##[group]")
+                    .or_else(|| content.strip_prefix("##[section]"))
+                {
+                    let title_style = Style::default().fg(Color::Cyan).bold();
+                    let mut header = vec![];
+                    if let Some(ts) = mk_time() {
+                        header.push(ts);
+                    }
+                    header.push(Span::styled("▸ ", title_style));
+                    header.extend(ansi_line_to_spans(title, title_style));
+                    vec![
+                        Line::from(Span::styled("────────────────────────────────────────────────────────────────────────────────", sep_style)),
+                        Line::from(header),
+                        Line::default(),
+                    ]
+                } else if content.starts_with("##[endgroup]") {
+                    vec![Line::default()]
+                } else if let Some(cmd) = content.strip_prefix("##[command]") {
+                    let mut spans = vec![];
+                    if let Some(ts) = mk_time() {
+                        spans.push(ts);
+                    }
+                    spans.push(Span::styled("$ ", Style::default().fg(Color::Green).bold()));
+                    spans.extend(ansi_line_to_spans(cmd, Style::default().fg(Color::White)));
+                    vec![Line::from(spans)]
+                } else if let Some(msg) = content.strip_prefix("##[error]") {
+                    let s = Style::default().fg(Color::Red).bold();
+                    let mut spans = vec![];
+                    if let Some(ts) = mk_time() {
+                        spans.push(ts);
+                    }
+                    spans.push(Span::styled("✗ ", s));
+                    spans.extend(ansi_line_to_spans(msg, s));
+                    vec![Line::from(spans)]
+                } else if let Some(msg) = content.strip_prefix("##[warning]") {
+                    let s = Style::default().fg(Color::Yellow);
+                    let mut spans = vec![];
+                    if let Some(ts) = mk_time() {
+                        spans.push(ts);
+                    }
+                    spans.push(Span::styled("⚠ ", s.bold()));
+                    spans.extend(ansi_line_to_spans(msg, s));
+                    vec![Line::from(spans)]
+                } else if let Some(msg) = content.strip_prefix("##[debug]") {
+                    let s = Style::default().fg(Color::DarkGray);
+                    let mut spans = vec![];
+                    if let Some(ts) = mk_time() {
+                        spans.push(ts);
+                    }
+                    spans.push(Span::styled("# ", s));
+                    spans.extend(ansi_line_to_spans(msg, s));
+                    vec![Line::from(spans)]
+                } else if let Some(msg) = content.strip_prefix("##[notice]") {
+                    let s = Style::default().fg(Color::Cyan);
+                    let mut spans = vec![];
+                    if let Some(ts) = mk_time() {
+                        spans.push(ts);
+                    }
+                    spans.push(Span::styled("ℹ ", s));
+                    spans.extend(ansi_line_to_spans(msg, s));
+                    vec![Line::from(spans)]
+                } else {
+                    let base = if !content.contains('\x1b') {
+                        let trimmed = content.trim_start().to_lowercase();
+                        if trimmed.starts_with("error") || trimmed.starts_with("failed") {
+                            Style::default().fg(Color::Red)
+                        } else if trimmed.starts_with("warn") || trimmed.starts_with("warning") {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default().fg(Color::Rgb(200, 200, 200))
+                        }
+                    } else {
+                        Style::default().fg(Color::Rgb(200, 200, 200))
+                    };
+                    let mut spans = vec![];
+                    if let Some(ts) = mk_time() {
+                        spans.push(ts);
+                    }
+                    spans.extend(ansi_line_to_spans(content, base));
+                    vec![Line::from(spans)]
+                };
+
+                if let Some(needle) = needle_lower.as_deref() {
+                    let is_current = current_match_line == Some(src_idx);
+                    lines
+                        .into_iter()
+                        .map(|line| highlight_line(line, needle, is_current))
+                        .collect::<Vec<Line>>()
+                } else {
+                    lines
+                }
+            })
+            .collect();
+    }
 }
 
 /// Strip ANSI, the `HH:MM:SS` time prefix and any GitHub Actions `##[...]`
@@ -265,6 +430,180 @@ pub fn visible_text(s: &str) -> String {
         }
     }
     no_time
+}
+
+pub fn split_time_prefix(s: &str) -> (Option<&str>, &str) {
+    if s.len() > 9
+        && s.as_bytes().get(2) == Some(&b':')
+        && s.as_bytes().get(5) == Some(&b':')
+        && s.as_bytes().get(8) == Some(&b' ')
+        && s[..2].bytes().all(|b| b.is_ascii_digit())
+        && s[3..5].bytes().all(|b| b.is_ascii_digit())
+        && s[6..8].bytes().all(|b| b.is_ascii_digit())
+    {
+        (Some(&s[..8]), &s[9..])
+    } else {
+        (None, s)
+    }
+}
+
+pub fn ansi_line_to_spans(line: &str, default_style: Style) -> Vec<Span<'static>> {
+    if !line.contains('\x1b') {
+        return if line.is_empty() {
+            vec![]
+        } else {
+            vec![Span::styled(line.to_string(), default_style)]
+        };
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current = default_style;
+    let chars: Vec<char> = line.chars().collect();
+    let mut seg = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            let text: String = chars[seg..i].iter().collect();
+            if !text.is_empty() {
+                spans.push(Span::styled(text, current));
+            }
+            let seq_start = i + 2;
+            let mut j = seq_start;
+            while j < chars.len() && !chars[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == 'm' {
+                let params: String = chars[seq_start..j].iter().collect();
+                current = apply_sgr(&params, current, default_style);
+            }
+            i = j + 1;
+            seg = i;
+        } else {
+            i += 1;
+        }
+    }
+    let tail: String = chars[seg..].iter().collect();
+    if !tail.is_empty() {
+        spans.push(Span::styled(tail, current));
+    }
+    spans
+}
+
+fn apply_sgr(params: &str, current: Style, default: Style) -> Style {
+    if params.is_empty() {
+        return default;
+    }
+    let nums: Vec<u32> = params.split(';').filter_map(|s| s.parse().ok()).collect();
+    let mut s = current;
+    let mut i = 0;
+    while i < nums.len() {
+        match nums[i] {
+            0 => s = default,
+            1 => s = s.add_modifier(Modifier::BOLD),
+            2 => s = s.add_modifier(Modifier::DIM),
+            3 => s = s.add_modifier(Modifier::ITALIC),
+            4 => s = s.add_modifier(Modifier::UNDERLINED),
+            22 => s = s.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            23 => s = s.remove_modifier(Modifier::ITALIC),
+            24 => s = s.remove_modifier(Modifier::UNDERLINED),
+            30 => s = s.fg(Color::Black),
+            31 => s = s.fg(Color::Red),
+            32 => s = s.fg(Color::Green),
+            33 => s = s.fg(Color::Yellow),
+            34 => s = s.fg(Color::Blue),
+            35 => s = s.fg(Color::Magenta),
+            36 => s = s.fg(Color::Cyan),
+            37 => s = s.fg(Color::Gray),
+            38 if i + 1 < nums.len() && nums[i + 1] == 2 && i + 4 < nums.len() => {
+                s = s.fg(Color::Rgb(
+                    nums[i + 2] as u8,
+                    nums[i + 3] as u8,
+                    nums[i + 4] as u8,
+                ));
+                i += 4;
+            }
+            38 if i + 1 < nums.len() && nums[i + 1] == 5 && i + 2 < nums.len() => {
+                s = s.fg(Color::Indexed(nums[i + 2] as u8));
+                i += 2;
+            }
+            40 => s = s.bg(Color::Black),
+            41 => s = s.bg(Color::Red),
+            42 => s = s.bg(Color::Green),
+            43 => s = s.bg(Color::Yellow),
+            44 => s = s.bg(Color::Blue),
+            45 => s = s.bg(Color::Magenta),
+            46 => s = s.bg(Color::Cyan),
+            47 => s = s.bg(Color::Gray),
+            48 if i + 1 < nums.len() && nums[i + 1] == 2 && i + 4 < nums.len() => {
+                s = s.bg(Color::Rgb(
+                    nums[i + 2] as u8,
+                    nums[i + 3] as u8,
+                    nums[i + 4] as u8,
+                ));
+                i += 4;
+            }
+            48 if i + 1 < nums.len() && nums[i + 1] == 5 && i + 2 < nums.len() => {
+                s = s.bg(Color::Indexed(nums[i + 2] as u8));
+                i += 2;
+            }
+            90 => s = s.fg(Color::DarkGray),
+            91 => s = s.fg(Color::LightRed),
+            92 => s = s.fg(Color::LightGreen),
+            93 => s = s.fg(Color::LightYellow),
+            94 => s = s.fg(Color::LightBlue),
+            95 => s = s.fg(Color::LightMagenta),
+            96 => s = s.fg(Color::LightCyan),
+            97 => s = s.fg(Color::White),
+            _ => {}
+        }
+        i += 1;
+    }
+    s
+}
+
+pub fn highlight_line(line: Line<'static>, needle: &str, current: bool) -> Line<'static> {
+    if needle.is_empty() {
+        return line;
+    }
+    let hit_bg = if current {
+        Color::Rgb(220, 200, 60)
+    } else {
+        Color::Rgb(120, 90, 30)
+    };
+    let hit_fg = Color::Black;
+
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
+    for span in line.spans {
+        let text = span.content.into_owned();
+        let style = span.style;
+        let lower = text.to_lowercase();
+        if !lower.contains(needle) {
+            out.push(Span::styled(text, style));
+            continue;
+        }
+        let bytes = text.as_bytes();
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            match lower[cursor..].find(needle) {
+                Some(rel) => {
+                    let start = cursor + rel;
+                    let end = start + needle.len();
+                    if start > cursor {
+                        out.push(Span::styled(text[cursor..start].to_string(), style));
+                    }
+                    out.push(Span::styled(
+                        text[start..end].to_string(),
+                        style.bg(hit_bg).fg(hit_fg).add_modifier(Modifier::BOLD),
+                    ));
+                    cursor = end;
+                }
+                None => {
+                    out.push(Span::styled(text[cursor..].to_string(), style));
+                    break;
+                }
+            }
+        }
+    }
+    Line::from(out)
 }
 
 fn strip_ansi(s: &str) -> String {

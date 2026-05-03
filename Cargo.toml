@@ -1,6 +1,6 @@
 [package]
 name = "jog"
-version = "0.1.1"
+version = "0.1.4"
 edition = "2024"
 license = "MIT"
 description = "A small terminal UI for browsing and triggering GitHub Actions workflows."
@@ -10,6 +10,7 @@ readme = "README.md"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 octocrab = "0.44"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use futures::stream::{self, StreamExt};
+use futures::stream::StreamExt;
 use octocrab::Octocrab;
 use octocrab::models::workflows as gh_workflows;
 use std::collections::HashMap;
@@ -124,6 +124,7 @@ fn map_run(r: gh_workflows::Run) -> Run {
         created_at: r.created_at,
         updated_at: r.updated_at,
         url: r.html_url.to_string(),
+        workflow_file: None,
     }
 }
 
@@ -194,6 +195,18 @@ impl Provider for GitHubProvider {
         Ok(page.items.into_iter().map(map_run).collect())
     }
 
+    async fn list_repo_runs(&self, limit: u8) -> Result<Vec<Run>> {
+        let page = self
+            .crab
+            .workflows(&self.repo.owner, &self.repo.repo)
+            .list_all_runs()
+            .per_page(limit)
+            .send()
+            .await
+            .context("list all repo runs")?;
+        Ok(page.items.into_iter().map(map_run).collect())
+    }
+
     async fn get_latest_run(&self, workflow_file: &str) -> Result<Option<Run>> {
         let mut runs = self.list_runs(workflow_file, 1).await?;
         Ok(runs.drain(..).next())
@@ -247,10 +260,9 @@ impl Provider for GitHubProvider {
         }
         let chunks: Vec<Result<LogChunk>> = text
             .lines()
-            .map(clean_log_line)
-            .map(|l| Ok(LogChunk { line: l }))
+            .map(|l| Ok(LogChunk { line: clean_log_line(l) }))
             .collect();
-        Ok(stream::iter(chunks).boxed())
+        Ok(futures::stream::iter(chunks).boxed())
     }
 
     async fn trigger(

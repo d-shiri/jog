@@ -164,6 +164,7 @@ mod tests {
             created_at: Utc.with_ymd_and_hms(2026, 5, 1, h, 0, 0).unwrap(),
             updated_at: Utc.with_ymd_and_hms(2026, 5, 1, h, 1, 0).unwrap(),
             url: String::new(),
+            workflow_file: None,
         }
     }
 

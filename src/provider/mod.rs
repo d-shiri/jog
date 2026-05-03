@@ -85,6 +85,10 @@ pub struct Run {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub url: String,
+    /// The filename of the workflow (e.g. `ci.yml`). Optional because some
+    /// API endpoints (like "list all runs for repo") might include it
+    /// while others (list runs for a specific workflow) already imply it.
+    pub workflow_file: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +133,7 @@ pub type LogStream = BoxStream<'static, Result<LogChunk>>;
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn list_runs(&self, workflow_file: &str, limit: u8) -> Result<Vec<Run>>;
+    async fn list_repo_runs(&self, limit: u8) -> Result<Vec<Run>>;
     async fn get_latest_run(&self, workflow_file: &str) -> Result<Option<Run>>;
     async fn get_run(&self, id: u64) -> Result<RunDetail>;
     async fn stream_logs(&self, job_id: u64) -> Result<LogStream>;

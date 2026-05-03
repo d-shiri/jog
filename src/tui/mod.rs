@@ -26,7 +26,7 @@ use crate::provider::{Provider, Run, RunDetail, Status, Workflow};
 mod views;
 
 pub enum AppEvent {
-    WorkflowStatus(String, Option<Run>),
+    RepoStatuses(Vec<Run>),
     WorkflowRunsPreviewLoaded(String, Vec<Run>),
     RunsLoaded(String, Vec<Run>),
     RunDetailLoaded(RunDetail),
@@ -122,14 +122,16 @@ async fn event_loop(
 ) -> Result<()> {
     let km = resolve_keymap(&config.keys)?;
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
-    spawn_initial_status_fetches(state, &provider, &tx);
+    spawn_repo_status_fetch(provider.clone(), tx.clone());
     if let Some(w) = state.selected_workflow().cloned() {
         spawn_fetch_workflow_preview(provider.clone(), w.file_name, tx.clone(), state);
     }
 
     let mut events = EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(config.ui.poll_interval_ms.max(500)));
-    tick.tick().await; // discard first immediate tick
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut last_poll = tokio::time::Instant::now();
+    let poll_interval = Duration::from_millis(config.ui.poll_interval_ms.max(1000));
+    tick.tick().await;
 
     loop {
         if state.needs_clear {
@@ -154,10 +156,17 @@ async fn event_loop(
             Some(app_evt) = rx.recv() => {
                 match app_evt {
                     AppEvent::Quit => return Ok(()),
-                    AppEvent::WorkflowStatus(file, run) => {
-                        if let Some(w) = state.workflows.iter_mut().find(|w| w.file_name == file) {
-                            w.last_status = run.as_ref().map(|r| r.status);
-                            w.last_run_at = run.map(|r| r.updated_at);
+                    AppEvent::RepoStatuses(runs) => {
+                        let mut seen = std::collections::HashSet::new();
+                        for r in runs {
+                            if let Some(file) = &r.workflow_file {
+                                if seen.insert(file.clone()) {
+                                    if let Some(w) = state.workflows.iter_mut().find(|w| &w.file_name == file) {
+                                        w.last_status = Some(r.status);
+                                        w.last_run_at = Some(r.updated_at);
+                                    }
+                                }
+                            }
                         }
                     }
                     AppEvent::WorkflowRunsPreviewLoaded(file, runs) => {
@@ -220,27 +229,33 @@ async fn event_loop(
                             state.log_lines = lines;
                         }
                         state.log_scroll = 0;
+                        state.recompute_log_rendered();
                         state.pending = state.pending.saturating_sub(1);
                     }
                     AppEvent::Status(msg) => {
-                        state.status_msg = Some(msg);
+                        state.set_status(msg);
                     }
                     AppEvent::TaskError(msg) => {
-                        state.status_msg = Some(msg);
+                        state.set_status(msg);
                         state.pending = state.pending.saturating_sub(1);
                     }
                 }
             }
             _ = tick.tick() => {
-                if state.view == View::Watch && state.pending == 0 {
-                    // Refresh the runs list so a freshly triggered run replaces
-                    // the previous one as `runs.first()`. Without this, the
-                    // tick below keeps polling the OLD run id forever.
-                    if let Some(file) = state.workflow_for_runs.clone() {
-                        spawn_fetch_runs(provider.clone(), file, tx.clone(), state);
-                    }
-                    if let Some(run) = state.runs.first().cloned() {
-                        spawn_fetch_run_detail(provider.clone(), run.id, tx.clone(), state);
+                state.tick_count += 1;
+                if state.status_msg.is_some() && state.tick_count.saturating_sub(state.status_msg_tick) > 30 {
+                    state.status_msg = None;
+                }
+                let now = tokio::time::Instant::now();
+                if now.duration_since(last_poll) >= poll_interval {
+                    last_poll = now;
+                    if state.view == View::Watch && state.pending == 0 {
+                        if let Some(file) = state.workflow_for_runs.clone() {
+                            spawn_fetch_runs(provider.clone(), file, tx.clone(), state);
+                        }
+                        if let Some(run) = state.runs.first().cloned() {
+                            spawn_fetch_run_detail(provider.clone(), run.id, tx.clone(), state);
+                        }
                     }
                 }
             }
@@ -451,7 +466,7 @@ async fn handle_key(
             // bound on the true wrapped-line count, so the user can still
             // scroll a little past the perfect bottom on long wrapped lines,
             // but no longer scrolls forever into blank space.
-            let max_scroll = (state.log_lines.len() as u16)
+            let max_scroll = (state.log_rendered.len() as u16)
                 .saturating_sub(state.last_logs_viewport_height.get());
             if key_is(&key, km.down) || key.code == KeyCode::Down {
                 state.log_scroll = state.log_scroll.saturating_add(1).min(max_scroll);
@@ -468,6 +483,7 @@ async fn handle_key(
             } else if key_is(&key, km.next_step) {
                 if state.log_search_query.is_some() {
                     jump_log_match(state, 1);
+                    state.recompute_log_rendered();
                 } else {
                     let n = state.log_sections.len();
                     if n > 0 {
@@ -476,11 +492,13 @@ async fn handle_key(
                         state.log_lines = extract_log_section(&state.log_raw, next);
                         state.log_scroll = 0;
                         state.clear_log_search();
+                        state.recompute_log_rendered();
                     }
                 }
             } else if key_is(&key, km.prev_step) {
                 if state.log_search_query.is_some() {
                     jump_log_match(state, -1);
+                    state.recompute_log_rendered();
                 } else {
                     match state.log_section_idx {
                         None => {}
@@ -489,6 +507,7 @@ async fn handle_key(
                             state.log_lines = state.log_raw.clone();
                             state.log_scroll = 0;
                             state.clear_log_search();
+                            state.recompute_log_rendered();
                         }
                         Some(i) => {
                             let prev = i - 1;
@@ -496,6 +515,7 @@ async fn handle_key(
                             state.log_lines = extract_log_section(&state.log_raw, prev);
                             state.log_scroll = 0;
                             state.clear_log_search();
+                            state.recompute_log_rendered();
                         }
                     }
                 }
@@ -504,6 +524,7 @@ async fn handle_key(
                 state.log_lines = state.log_raw.clone();
                 state.log_scroll = 0;
                 state.clear_log_search();
+                state.recompute_log_rendered();
             }
         }
         View::TriggerPrompt => {
@@ -568,10 +589,12 @@ fn handle_log_search_input(state: &mut AppState, key: KeyEvent) {
                 state.log_search_query = None;
                 state.log_search_matches.clear();
                 state.log_search_match_idx = None;
+                state.recompute_log_rendered();
                 return;
             }
             state.log_search_query = Some(q);
             state.recompute_log_matches();
+            state.recompute_log_rendered();
             scroll_to_current_match(state);
         }
         KeyCode::Backspace => {
@@ -796,14 +819,26 @@ fn strip_ansi(s: &str) -> String {
 }
 
 fn parse_log_sections(raw: &[String]) -> Vec<String> {
-    raw.iter()
-        .filter_map(|l| {
-            let content = strip_time_prefix(l);
-            content.strip_prefix("##[group]")
-                .or_else(|| content.strip_prefix("##[section]"))
-                .map(strip_ansi)
-        })
-        .collect()
+    let mut depth: usize = 0;
+    let mut result = Vec::new();
+    for line in raw {
+        let content = strip_time_prefix(line);
+        let is_group = content.starts_with("##[group]") || content.starts_with("##[section]");
+        let is_endgroup = content.starts_with("##[endgroup]");
+        if is_group {
+            if depth == 0 {
+                result.push(strip_ansi(
+                    content.strip_prefix("##[group]")
+                        .or_else(|| content.strip_prefix("##[section]"))
+                        .unwrap_or("")
+                ));
+            }
+            depth += 1;
+        } else if is_endgroup {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    result
 }
 
 fn extract_log_section(raw: &[String], section_idx: usize) -> Vec<String> {
@@ -848,20 +883,15 @@ fn extract_log_section(raw: &[String], section_idx: usize) -> Vec<String> {
     result
 }
 
-fn spawn_initial_status_fetches(
-    state: &mut AppState,
-    provider: &Arc<GitHubProvider>,
-    tx: &mpsc::UnboundedSender<AppEvent>,
+fn spawn_repo_status_fetch(
+    provider: Arc<GitHubProvider>,
+    tx: mpsc::UnboundedSender<AppEvent>,
 ) {
-    for w in &state.workflows {
-        let file = w.file_name.clone();
-        let p = provider.clone();
-        let tx2 = tx.clone();
-        tokio::spawn(async move {
-            let latest = p.get_latest_run(&file).await.ok().flatten();
-            let _ = tx2.send(AppEvent::WorkflowStatus(file, latest));
-        });
-    }
+    tokio::spawn(async move {
+        if let Ok(runs) = provider.list_repo_runs(50).await {
+            let _ = tx.send(AppEvent::RepoStatuses(runs));
+        }
+    });
 }
 
 fn spawn_fetch_runs(
@@ -995,7 +1025,7 @@ fn trigger_workflow(
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
     if !workflow.triggerable {
-        state.status_msg = Some(format!(
+        state.set_status(format!(
             "`{}` has no workflow_dispatch trigger",
             workflow.name
         ));
@@ -1036,7 +1066,7 @@ fn dispatch_trigger(
         };
         let _ = tx2.send(AppEvent::Status(msg));
     });
-    state.status_msg = Some(format!(
+    state.set_status(format!(
         "triggering {} on {}",
         workflow_name, state.current_branch
     ));
@@ -1052,7 +1082,7 @@ fn submit_trigger_prompt(
     };
     let missing = prompt.missing_required();
     if !missing.is_empty() {
-        state.status_msg = Some(format!("missing required: {}", missing.join(", ")));
+        state.set_status(format!("missing required: {}", missing.join(", ")));
         return;
     }
     let inputs = prompt.collected();
@@ -1105,6 +1135,22 @@ mod tests {
             "08:12:36 ##[endgroup]".to_string(),
         ];
         assert_eq!(parse_log_sections(&raw), vec!["Run npm test".to_string()]);
+    }
+
+    #[test]
+    fn parse_log_sections_skips_nested_groups() {
+        let raw = vec![
+            "##[group]Step 1".to_string(),
+            "  ##[group]Nested".to_string(),
+            "  ##[endgroup]".to_string(),
+            "##[endgroup]".to_string(),
+            "##[group]Step 2".to_string(),
+            "##[endgroup]".to_string(),
+        ];
+        assert_eq!(
+            parse_log_sections(&raw),
+            vec!["Step 1".to_string(), "Step 2".to_string()]
+        );
     }
 
     #[test]
