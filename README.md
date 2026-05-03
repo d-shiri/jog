@@ -86,6 +86,7 @@ All keys are remappable in `config.toml` (see [Config](#config)).
 theme = "dark"
 poll_interval_ms = 5000
 favorites = ["ci.yml", "deploy.yml"]   # pinned to the top of the list
+complete_sound = "/usr/share/sounds/freedesktop/stereo/complete.oga"  # set to "" to disable
 
 [provider]
 kind = "github"

@@ -192,8 +192,10 @@ async fn event_loop(
                         // Sound notification: play when a run we saw as Running finishes.
                         let id = detail.run.id;
                         if detail.run.status.is_terminal() {
-                            if state.watch_seen_running.remove(&id) {
-                                play_sound("/usr/share/sounds/freedesktop/stereo/complete.oga");
+                            if state.watch_seen_running.remove(&id)
+                                && !config.ui.complete_sound.is_empty()
+                            {
+                                play_sound(&config.ui.complete_sound);
                             }
                         } else {
                             state.watch_seen_running.insert(id);

@@ -31,6 +31,9 @@ pub struct UiConfig {
     pub poll_interval_ms: u64,
     #[serde(default)]
     pub favorites: Vec<String>,
+    /// Sound file played when a watched run finishes. Set to "" to disable.
+    #[serde(default = "default_complete_sound")]
+    pub complete_sound: String,
 }
 
 impl Default for UiConfig {
@@ -39,6 +42,7 @@ impl Default for UiConfig {
             theme: default_theme(),
             poll_interval_ms: default_poll_ms(),
             favorites: Vec::new(),
+            complete_sound: default_complete_sound(),
         }
     }
 }
@@ -48,6 +52,9 @@ fn default_theme() -> String {
 }
 fn default_poll_ms() -> u64 {
     5000
+}
+fn default_complete_sound() -> String {
+    "/usr/share/sounds/freedesktop/stereo/complete.oga".into()
 }
 
 /// Key name strings exactly as they appear in config.toml [keys].
