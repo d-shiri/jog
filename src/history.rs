@@ -130,6 +130,11 @@ impl History {
         out
     }
 
+    /// Most recent run (any status) for the given workflow.
+    pub fn last_run(&self, workflow_file: &str) -> Option<&HistoryEntry> {
+        self.entries.iter().find(|e| e.workflow_file == workflow_file)
+    }
+
     /// Most recent successful run for the given workflow.
     pub fn last_successful(&self, workflow_file: &str) -> Option<&HistoryEntry> {
         self.entries

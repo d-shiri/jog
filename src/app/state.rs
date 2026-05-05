@@ -201,7 +201,13 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(repo_label: String, current_branch: String, workflows: Vec<Workflow>, keymap: KeymapConfig, history: History) -> Self {
+    pub fn new(repo_label: String, current_branch: String, mut workflows: Vec<Workflow>, keymap: KeymapConfig, history: History) -> Self {
+        for w in &mut workflows {
+            if let Some(entry) = history.last_run(&w.file_name) {
+                w.last_run_at = Some(entry.created_at);
+                w.last_status = Some(entry.status);
+            }
+        }
         Self {
             view: View::Workflows,
             workflows,

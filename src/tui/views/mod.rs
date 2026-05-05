@@ -4,7 +4,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, LineGauge, Paragraph, Row, Sparkline, Table, TableState, Wrap,
+    Block, BorderType, Borders, Cell, Clear, LineGauge, Paragraph, Row, Sparkline, Table, TableState, Wrap,
 };
 
 use std::collections::HashMap;
@@ -35,6 +35,9 @@ pub fn render(f: &mut Frame, state: &AppState) {
         View::Diff => render_diff(f, chunks[1], state),
     }
     render_footer(f, chunks[2], state);
+    if state.view == View::Logs {
+        render_search_overlay(f, area, state);
+    }
 }
 
 fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
@@ -726,9 +729,7 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
         "Logs".to_string()
     };
 
-    if let Some(buf) = &state.log_search_input {
-        log_title.push_str(&format!("   /{buf}_"));
-    } else if let Some(q) = &state.log_search_query {
+    if let Some(q) = &state.log_search_query {
         if state.log_search_matches.is_empty() {
             log_title.push_str(&format!("   /{q}  (no match)"));
         } else {
@@ -748,6 +749,35 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
         .wrap(Wrap { trim: false })
         .scroll((state.log_scroll, 0));
     f.render_widget(p, area);
+}
+
+fn render_search_overlay(f: &mut Frame, area: Rect, state: &AppState) {
+    let Some(buf) = &state.log_search_input else { return };
+
+    let dialog_w = (area.width * 60 / 100).max(40).min(area.width);
+    let dialog_h = 3u16;
+    let x = area.x + area.width.saturating_sub(dialog_w) / 2;
+    let y = area.y + area.height.saturating_sub(dialog_h) / 2;
+    let popup_area = Rect { x, y, width: dialog_w, height: dialog_h };
+
+    let accent = state.theme.accent;
+    let block = Block::default()
+        .title(Span::styled(" Search ", Style::default().fg(accent).bold()))
+        .title_alignment(ratatui::layout::Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent));
+
+    let inner = block.inner(popup_area);
+    let content = Line::from(vec![
+        Span::styled("  ", Style::default().fg(accent)),
+        Span::styled(buf.as_str(), Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(accent)),
+    ]);
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(block, popup_area);
+    f.render_widget(Paragraph::new(content), inner);
 }
 
 fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
