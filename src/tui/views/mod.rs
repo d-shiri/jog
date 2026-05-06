@@ -4,7 +4,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, LineGauge, Paragraph, Row, Sparkline, Table, TableState, Wrap,
+    Block, BorderType, Borders, Cell, Clear, LineGauge, Paragraph, Row, Table, TableState, Wrap,
 };
 
 use std::collections::HashMap;
@@ -359,26 +359,26 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(inner);
 
-    let spark_data: Vec<u64> = state.workflow_preview_runs.iter().rev()
-        .map(|r| match r.status {
-            Status::Success => 2,
-            Status::Running => 1,
-            _               => 0,
-        })
-        .collect();
-    let spark_color = state.workflow_preview_runs.first()
-        .map(|r| match r.status {
-            Status::Success => theme.success,
-            Status::Failure => theme.failure,
-            Status::Running => theme.warning,
-            _               => theme.unknown,
-        })
-        .unwrap_or(theme.secondary);
-    f.render_widget(
-        Sparkline::default().data(&spark_data).max(2)
-            .style(Style::default().fg(spark_color)),
-        inner_chunks[0],
-    );
+    let bar_area = inner_chunks[0];
+    let bar_w: u16 = 3;
+    let gap: u16 = 1;
+    let step = bar_w + gap;
+    let max_bars = ((bar_area.width + gap) / step) as usize;
+    for (i, run) in state.workflow_preview_runs.iter().rev().take(max_bars).enumerate() {
+        let bar_color = match run.status {
+            Status::Success                     => theme.success,
+            Status::Failure                     => theme.failure,
+            Status::Running                     => theme.warning,
+            Status::Cancelled | Status::Skipped => theme.unknown,
+            _                                   => theme.unknown,
+        };
+        let x = bar_area.x + i as u16 * step;
+        if x + bar_w > bar_area.x + bar_area.width { break; }
+        let h = (bar_area.height / 2).max(1);
+        let y = bar_area.y + (bar_area.height - h) / 2;
+        let rect = Rect { x, y, width: bar_w, height: h };
+        f.render_widget(Block::default().style(Style::default().bg(bar_color)), rect);
+    }
 
     let sel_bg = Color::Rgb(25, 85, 110);
     let sel_fg = Color::Rgb(220, 240, 255);
