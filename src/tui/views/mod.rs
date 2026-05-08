@@ -627,27 +627,38 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
         .map(|wf| state.history.step_failure_stats(wf, 10))
         .unwrap_or_default();
 
+    // Max completed step duration per job — used to scale the ■ bars.
+    let max_secs_per_job: Vec<f64> = detail.jobs.iter().map(|job| {
+        job.steps.iter().filter_map(|s| {
+            let ms = (s.completed_at? - s.started_at?).num_milliseconds();
+            if ms > 0 { Some(ms as f64 / 1000.0) } else { None }
+        }).fold(0.0_f64, f64::max)
+    }).collect();
+
     let items = build_detail_items(detail);
     let cursor = state.detail_cursor;
-    let mut lines = Vec::new();
+    let sel_bg = Color::Rgb(28, 38, 58);
 
-    for (flat_idx, item) in items.iter().enumerate() {
+    let rows: Vec<Row> = items.iter().enumerate().map(|(flat_idx, item)| {
         let selected = flat_idx == cursor;
+        let row_style = if selected { Style::default().bg(sel_bg) } else { Style::default() };
         match item {
             DetailItem::Job(ji) => {
                 let job = &detail.jobs[*ji];
                 let prefix = if selected { "▶ " } else { "  " };
                 let name_style = if selected {
-                    Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)
+                    Style::default().bold().fg(Color::Cyan)
                 } else {
-                    Style::default().add_modifier(Modifier::BOLD)
+                    Style::default().bold()
                 };
-                lines.push(Line::from(vec![
+                let name_cell = Cell::from(Line::from(vec![
                     Span::raw(prefix),
                     Span::styled(animated_glyph(job.status, state.tick_count), style_for_status(job.status, &state.theme)),
                     Span::raw(" "),
                     Span::styled(job.name.clone(), name_style),
                 ]));
+                Row::new(vec![name_cell, Cell::from(""), Cell::from(""), Cell::from("")])
+                    .style(row_style)
             }
             DetailItem::Step { job: ji, step: si } => {
                 let step = &detail.jobs[*ji].steps[*si];
@@ -657,31 +668,41 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
                 } else {
                     Style::default().fg(Color::Gray)
                 };
-                let mut spans = vec![
+                let name_cell = Cell::from(Line::from(vec![
                     Span::raw(prefix),
                     Span::styled(animated_glyph(step.status, state.tick_count), style_for_status(step.status, &state.theme)),
-                    Span::raw(" "),
-                    // Use sequential position (si+1) — step.number has gaps for
-                    // internal composite-action sub-steps that GitHub hides from
-                    // the job.steps list but still assigns numbers to.
-                    Span::styled(format!("{}. {}", si + 1, step.name), name_style),
-                ];
-                if let Some((failed, total)) = stats.get(&step.name).copied()
-                    && failed > 0 {
-                        let badge_style = if failed * 2 >= total {
-                            Style::default().fg(Color::Red).bold()
-                        } else {
-                            Style::default().fg(Color::Yellow)
-                        };
-                        spans.push(Span::styled(
-                            format!("  (historical: {}/{} fails)", failed, total),
-                            badge_style,
-                        ));
-                    }
-                lines.push(Line::from(spans));
+                    Span::raw(format!(" {:2}. ", si + 1)),
+                    Span::styled(step.name.clone(), name_style),
+                ]));
+                let (dur_cell, bar_cell) = if let Some((dur, bar)) =
+                    step_timing(step, max_secs_per_job[*ji], state.tick_count)
+                {
+                    let bar_color = style_for_status(step.status, &state.theme)
+                        .fg.unwrap_or(Color::DarkGray);
+                    (
+                        Cell::from(format!("{dur:>6}")).style(Style::default().fg(Color::Rgb(80, 80, 100))),
+                        Cell::from(bar).style(Style::default().fg(bar_color)),
+                    )
+                } else {
+                    (Cell::from(""), Cell::from(""))
+                };
+                let badge_cell = if let Some((failed, total)) = stats.get(&step.name).copied()
+                    && failed > 0
+                {
+                    let s = if failed * 2 >= total {
+                        Style::default().fg(Color::Red).bold()
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    };
+                    Cell::from(format!("  {failed}/{total} fails")).style(s)
+                } else {
+                    Cell::from("")
+                };
+                Row::new(vec![name_cell, dur_cell, bar_cell, badge_cell])
+                    .style(row_style)
             }
         }
-    }
+    }).collect();
 
     let title = format!(
         "Run {} — {} ({})",
@@ -714,8 +735,14 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
     ]);
     f.render_widget(Paragraph::new(summary), inner_chunks[0]);
 
-    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(p, inner_chunks[1]);
+    let table = Table::new(rows, [
+        Constraint::Min(20),     // name
+        Constraint::Length(6),   // duration (right-aligned inside cell)
+        Constraint::Length(10),  // ■ bar
+        Constraint::Fill(1),     // historical badge
+    ])
+    .column_spacing(1);
+    f.render_widget(table, inner_chunks[1]);
 }
 
 fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
@@ -1185,6 +1212,44 @@ fn format_elapsed(secs: i64) -> String {
     } else {
         format!("{}:{:02}", m, s)
     }
+}
+
+fn format_step_dur(secs: f64) -> String {
+    if secs < 60.0 {
+        format!("{:.0}s", secs.max(0.0))
+    } else {
+        let m = (secs / 60.0) as u64;
+        let s = (secs % 60.0) as u64;
+        if s == 0 { format!("{m}m") } else { format!("{m}m {s}s") }
+    }
+}
+
+fn step_timing(
+    step: &crate::provider::Step,
+    max_secs: f64,
+    tick: u64,
+) -> Option<(String, String)> {
+    use crate::provider::Status;
+    let start = step.started_at?;
+    let (secs, running) = if let Some(end) = step.completed_at {
+        ((end - start).num_milliseconds().max(0) as f64 / 1000.0, false)
+    } else {
+        ((Utc::now() - start).num_milliseconds().max(0) as f64 / 1000.0,
+         step.status == Status::Running)
+    };
+    let dur = format_step_dur(secs);
+    let bar = if running {
+        let n = ((tick / 3) % 11) as usize;
+        format!("{}{}", "■".repeat(n), "□".repeat(10 - n))
+    } else {
+        let filled = if max_secs > 0.0 {
+            ((secs / max_secs * 10.0).round() as usize).clamp(if secs > 0.0 { 1 } else { 0 }, 10)
+        } else {
+            0
+        };
+        format!("{}{}", "■".repeat(filled), "□".repeat(10 - filled))
+    };
+    Some((dur, bar))
 }
 
 fn relative_styled(t: chrono::DateTime<Utc>) -> (String, Style) {
