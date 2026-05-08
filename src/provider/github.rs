@@ -54,11 +54,10 @@ fn parse_remote_url(url: &str) -> Result<RepoSpec> {
 }
 
 pub fn resolve_token() -> Result<String> {
-    if let Ok(t) = std::env::var("GITHUB_TOKEN") {
-        if !t.is_empty() {
+    if let Ok(t) = std::env::var("GITHUB_TOKEN")
+        && !t.is_empty() {
             return Ok(t);
         }
-    }
     let out = match Command::new("gh").args(["auth", "token"]).output() {
         Ok(o) => o,
         Err(_) => {
@@ -365,11 +364,9 @@ fn extract_time(s: &str) -> (Option<&str>, &str) {
         && s.as_bytes().get(10) == Some(&b'T')
         && s.as_bytes().get(13) == Some(&b':')
         && s.as_bytes().get(16) == Some(&b':')
-    {
-        if let Some(idx) = s.find(' ') {
+        && let Some(idx) = s.find(' ') {
             return (Some(&s[11..19]), &s[idx + 1..]);
         }
-    }
     (None, s)
 }
 

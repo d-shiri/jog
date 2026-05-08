@@ -84,7 +84,7 @@ impl History {
             self.entries.push(entry);
         }
         self.entries
-            .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            .sort_by_key(|b| std::cmp::Reverse(b.created_at));
         if self.entries.len() > CAP {
             self.entries.truncate(CAP);
         }
@@ -184,10 +184,11 @@ mod tests {
                 steps: steps
                     .iter()
                     .enumerate()
-                    .map(|(i, (n, s))| Step {
+                    .map(|(_, (n, s))| Step {
                         name: (*n).into(),
                         status: *s,
-                        number: i as i64 + 1,
+                        started_at: None,
+                        completed_at: None,
                     })
                     .collect(),
             }],

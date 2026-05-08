@@ -92,15 +92,14 @@ impl TriggerPrompt {
     }
 
     pub fn cycle_option(&mut self) {
-        if let Some(f) = self.current_field_mut() {
-            if let Some(opts) = f.options.clone() {
+        if let Some(f) = self.current_field_mut()
+            && let Some(opts) = f.options.clone() {
                 if opts.is_empty() {
                     return;
                 }
                 let idx = opts.iter().position(|o| o == &f.value).unwrap_or(0);
                 f.value = opts[(idx + 1) % opts.len()].clone();
             }
-        }
     }
 
     pub fn missing_required(&self) -> Vec<&str> {
@@ -161,6 +160,9 @@ pub struct AppState {
     pub log_raw: Vec<String>,
     pub log_sections: Vec<String>,
     pub log_section_idx: Option<usize>,
+    pub log_job_idx: Option<usize>,
+    pub log_step_line_starts: Vec<usize>,
+    pub log_step_names: Vec<String>,
     pub log_groups: Vec<LogGroup>,
     pub log_collapsed: HashSet<usize>,
     pub log_line_cursor: u16,
@@ -231,6 +233,9 @@ impl AppState {
             log_raw: Vec::new(),
             log_sections: Vec::new(),
             log_section_idx: None,
+            log_job_idx: None,
+            log_step_line_starts: Vec::new(),
+            log_step_names: Vec::new(),
             log_groups: Vec::new(),
             log_collapsed: HashSet::new(),
             log_line_cursor: 0,
@@ -274,6 +279,10 @@ impl AppState {
     pub fn set_status(&mut self, msg: String) {
         self.status_msg = Some(msg);
         self.status_msg_tick = self.tick_count;
+    }
+
+    pub fn current_step_idx(&self) -> Option<usize> {
+        if self.log_step_names.is_empty() { None } else { self.log_section_idx }
     }
 
     pub fn selected_workflow(&self) -> Option<&Workflow> {
@@ -510,11 +519,10 @@ pub fn parse_log_groups(lines: &[String]) -> Vec<LogGroup> {
             depth += 1;
         } else if is_endgroup {
             depth = depth.saturating_sub(1);
-            if depth == 0 {
-                if let Some(start) = current_start.take() {
+            if depth == 0
+                && let Some(start) = current_start.take() {
                     groups.push(LogGroup { header_line: start, end_line: i });
                 }
-            }
         }
     }
     if let Some(start) = current_start.take() {

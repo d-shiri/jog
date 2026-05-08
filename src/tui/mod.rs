@@ -22,7 +22,7 @@ use crate::config::KeymapConfig;
 use crate::config::Config;
 use crate::history::History;
 use crate::provider::github::{GitHubProvider, current_branch};
-use crate::provider::{Provider, Run, RunDetail, Status, Workflow};
+use crate::provider::{Provider, Run, RunDetail, Status, Step, Workflow};
 
 mod views;
 
@@ -61,15 +61,14 @@ pub async fn run(
         history,
     );
 
-    if let Some(file) = opts.focus_workflow.as_deref() {
-        if let Some(idx) = state
+    if let Some(file) = opts.focus_workflow.as_deref()
+        && let Some(idx) = state
             .workflows
             .iter()
             .position(|w| w.file_name == file || w.name.eq_ignore_ascii_case(file))
         {
             state.workflow_cursor = idx;
         }
-    }
     state.view = opts.initial_view;
 
     let mut terminal = setup_terminal()?;
@@ -145,14 +144,8 @@ async fn event_loop(
             maybe_evt = events.next() => {
                 if let Some(Ok(Event::Key(key))) = maybe_evt
                     && key.kind == KeyEventKind::Press
-                {
-                    if let Some(action) = handle_key(state, key, &provider, &tx, &km).await {
-                        match action {
-                            AppEvent::Quit => return Ok(()),
-                            _ => {}
-                        }
-                    }
-                }
+                    && let Some(action) = handle_key(state, key, &provider, &tx, &km).await
+                    && let AppEvent::Quit = action { return Ok(()) }
             }
             Some(app_evt) = rx.recv() => {
                 match app_evt {
@@ -160,14 +153,12 @@ async fn event_loop(
                     AppEvent::RepoStatuses(runs) => {
                         let mut seen = std::collections::HashSet::new();
                         for r in runs {
-                            if let Some(file) = &r.workflow_file {
-                                if seen.insert(file.clone()) {
-                                    if let Some(w) = state.workflows.iter_mut().find(|w| &w.file_name == file) {
+                            if let Some(file) = &r.workflow_file
+                                && seen.insert(file.clone())
+                                    && let Some(w) = state.workflows.iter_mut().find(|w| &w.file_name == file) {
                                         w.last_status = Some(r.status);
                                         w.last_run_at = Some(r.updated_at);
                                     }
-                                }
-                            }
                         }
                     }
                     AppEvent::WorkflowRunsPreviewLoaded(file, runs) => {
@@ -216,33 +207,54 @@ async fn event_loop(
                     }
                     AppEvent::LogsLoaded(lines) => {
                         state.clear_log_search();
+                        let job_steps: Vec<Step> = state.log_job_idx
+                            .and_then(|ji| state.run_detail.as_ref()?.jobs.get(ji))
+                            .map(|j| j.steps.clone())
+                            .unwrap_or_default();
                         state.log_sections = parse_log_sections(&lines);
+                        let (step_line_starts, step_names) =
+                            compute_step_line_starts(&lines, &job_steps);
+                        state.log_step_line_starts = step_line_starts;
+                        state.log_step_names = step_names;
                         state.log_raw = lines.clone();
                         if let Some((step_name, started_hms, _completed_hms)) = state.log_pending_section.take() {
-                            // Primary: find the top-level ##[group] that starts at or after
-                            // the step's started_at time, then use extract_log_section which
-                            // naturally stops at the NEXT top-level group. This correctly
-                            // handles the case where multiple steps share the same second
-                            // (extract_step_by_time used inclusive time bounds and would
-                            // include lines from the next step that started in the same second).
-                            let idx = started_hms.as_deref()
-                                .and_then(|start| find_section_by_time(&lines, start))
-                                // Fallback: case-insensitive name match.
-                                .or_else(|| {
-                                    let needle = step_name.trim().to_lowercase();
-                                    state.log_sections.iter()
-                                        .position(|s| s.trim().to_lowercase() == needle)
-                                        .or_else(|| state.log_sections.iter()
-                                            .position(|s| {
-                                                let sl = s.trim().to_lowercase();
-                                                sl.contains(&needle) || needle.contains(sl.as_str())
-                                            }))
-                                });
-
-                            state.log_section_idx = idx;
-                            state.log_lines = idx
-                                .map(|i| extract_log_section(&lines, i))
-                                .unwrap_or(lines);
+                            if !state.log_step_names.is_empty() {
+                                // Find the API step by name, then extract all lines for it.
+                                let needle = step_name.trim().to_lowercase();
+                                let step_idx = state.log_step_names.iter()
+                                    .position(|s| s.trim().to_lowercase() == needle)
+                                    .or_else(|| {
+                                        started_hms.as_deref().map(|hms| {
+                                            let target = find_raw_line_for_time(&lines, hms);
+                                            state.log_step_line_starts.iter()
+                                                .enumerate()
+                                                .filter(|&(_, &l)| l <= target)
+                                                .map(|(i, _)| i)
+                                                .next_back()
+                                                .unwrap_or(0)
+                                        })
+                                    })
+                                    .unwrap_or(0);
+                                let extracted = extract_step_by_line_range(&lines, step_idx, &state.log_step_line_starts);
+                                state.log_section_idx = Some(step_idx);
+                                state.log_lines = extracted;
+                            } else {
+                                // Fallback: section-based approach.
+                                let idx = started_hms.as_deref()
+                                    .and_then(|start| find_section_by_time(&lines, start))
+                                    .or_else(|| {
+                                        let needle = step_name.trim().to_lowercase();
+                                        state.log_sections.iter()
+                                            .position(|s| s.trim().to_lowercase() == needle)
+                                            .or_else(|| state.log_sections.iter()
+                                                .position(|s| {
+                                                    let sl = s.trim().to_lowercase();
+                                                    sl.contains(&needle) || needle.contains(sl.as_str())
+                                                }))
+                                    });
+                                state.log_section_idx = idx;
+                                state.log_lines = idx.map(|i| extract_log_section(&lines, i)).unwrap_or(lines);
+                            }
                         } else {
                             state.log_section_idx = None;
                             state.log_lines = lines;
@@ -356,7 +368,7 @@ async fn handle_key(
             .or_else(|| state.runs.get(state.run_cursor).map(|r| r.url.clone()))
         {
             let _ = open::that(&url);
-            state.set_status(format!("opened in browser"));
+            state.set_status("opened in browser".to_string());
         } else if let Some(w) = state.selected_workflow().cloned() {
             // Workflows view: no run loaded yet, fetch the latest one.
             let p = provider.clone();
@@ -388,14 +400,13 @@ async fn handle_key(
                 }
             } else if key_is(&key, km.trigger) {
                 trigger_workflow_at_cursor(state, provider, tx);
-            } else if key_is(&key, km.watch) {
-                if let Some(w) = state.selected_workflow().cloned() {
+            } else if key_is(&key, km.watch)
+                && let Some(w) = state.selected_workflow().cloned() {
                     state.switch_view(View::Watch);
                     state.workflow_for_runs = Some(w.file_name.clone());
                     state.runs.clear();
                     spawn_fetch_runs(provider.clone(), w.file_name, tx.clone(), state);
                 }
-            }
         }
         View::Runs => {
             if key_is(&key, km.down) || key.code == KeyCode::Down {
@@ -412,11 +423,10 @@ async fn handle_key(
             } else if key_is(&key, km.watch) {
                 state.switch_view(View::Watch);
             } else if key_is(&key, km.trigger) {
-                if let Some(file) = state.workflow_for_runs.clone() {
-                    if let Some(w) = state.workflows.iter().find(|w| w.file_name == file).cloned() {
+                if let Some(file) = state.workflow_for_runs.clone()
+                    && let Some(w) = state.workflows.iter().find(|w| w.file_name == file).cloned() {
                         trigger_workflow(state, &w, provider, tx);
                     }
-                }
             } else if key_is(&key, km.cancel_run) {
                 if let Some(r) = state.selected_run().cloned() {
                     let p = provider.clone();
@@ -441,8 +451,8 @@ async fn handle_key(
                         let _ = tx2.send(AppEvent::Status(msg));
                     });
                 }
-            } else if key_is(&key, km.rerun_failed) {
-                if let Some(r) = state.selected_run().cloned() {
+            } else if key_is(&key, km.rerun_failed)
+                && let Some(r) = state.selected_run().cloned() {
                     let p = provider.clone();
                     let tx2 = tx.clone();
                     tokio::spawn(async move {
@@ -453,7 +463,6 @@ async fn handle_key(
                         let _ = tx2.send(AppEvent::Status(msg));
                     });
                 }
-            }
         }
         View::RunDetail => {
             if key_is(&key, km.down) || key.code == KeyCode::Down {
@@ -464,13 +473,14 @@ async fn handle_key(
                 move_cursor(&mut state.detail_cursor, max, -1);
             } else if key_is(&key, km.diff) {
                 state.switch_view(View::Diff);
-            } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter || key_is(&key, km.open_logs) {
-                if let Some(detail) = &state.run_detail {
+            } else if (key_is(&key, km.confirm) || key.code == KeyCode::Enter || key_is(&key, km.open_logs))
+                && let Some(detail) = &state.run_detail {
                     let items = build_detail_items(detail);
                     match items.get(state.detail_cursor).copied() {
                         Some(DetailItem::Job(ji)) => {
                             if let Some(job) = detail.jobs.get(ji).cloned() {
                                 state.log_pending_section = None;
+                                state.log_job_idx = Some(ji);
                                 state.switch_view(View::Logs);
                                 state.log_lines = vec!["loading...".into()];
                                 spawn_fetch_logs(provider.clone(), job.id, tx.clone(), state);
@@ -489,6 +499,7 @@ async fn handle_key(
                                     step.started_at.map(&hms),
                                     step.completed_at.map(&hms),
                                 ));
+                                state.log_job_idx = Some(ji);
                                 state.switch_view(View::Logs);
                                 state.log_lines = vec!["loading...".into()];
                                 spawn_fetch_logs(provider.clone(), job.id, tx.clone(), state);
@@ -497,7 +508,6 @@ async fn handle_key(
                         None => {}
                     }
                 }
-            }
         }
         View::Logs => {
             let total_rendered = state.log_rendered.len() as u16;
@@ -562,6 +572,16 @@ async fn handle_key(
                 if state.log_search_query.is_some() {
                     jump_log_match(state, 1);
                     state.recompute_log_rendered();
+                } else if !state.log_step_line_starts.is_empty() {
+                    let n = state.log_step_line_starts.len();
+                    let next = if let Some(cur) = state.log_section_idx { (cur + 1).min(n - 1) } else { 0 };
+                    let extracted = extract_step_by_line_range(&state.log_raw, next, &state.log_step_line_starts);
+                    state.log_section_idx = Some(next);
+                    state.log_lines = extracted;
+                    state.log_scroll = 0;
+                    state.clear_log_search();
+                    state.init_log_groups();
+                    state.recompute_log_rendered();
                 } else {
                     let n = state.log_sections.len();
                     if n > 0 {
@@ -578,6 +598,28 @@ async fn handle_key(
                 if state.log_search_query.is_some() {
                     jump_log_match(state, -1);
                     state.recompute_log_rendered();
+                } else if !state.log_step_line_starts.is_empty() {
+                    match state.log_section_idx {
+                        None => {}
+                        Some(0) => {
+                            state.log_section_idx = None;
+                            state.log_lines = state.log_raw.clone();
+                            state.log_scroll = 0;
+                            state.clear_log_search();
+                            state.init_log_groups();
+                            state.recompute_log_rendered();
+                        }
+                        Some(current) => {
+                            let prev = current - 1;
+                            let extracted = extract_step_by_line_range(&state.log_raw, prev, &state.log_step_line_starts);
+                            state.log_section_idx = Some(prev);
+                            state.log_lines = extracted;
+                            state.log_scroll = 0;
+                            state.clear_log_search();
+                            state.init_log_groups();
+                            state.recompute_log_rendered();
+                        }
+                    }
                 } else {
                     match state.log_section_idx {
                         None => {}
@@ -625,27 +667,22 @@ async fn handle_key(
                     p.cycle_option();
                 }
             } else if key_is(&key, km.tp_yes) {
-                if let Some(p) = state.trigger_prompt.as_mut() {
-                    if let Some(f) = p.current_field_mut() {
-                        if f.options.as_deref().map_or(false, |o| o.iter().any(|x| x == "yes")) {
+                if let Some(p) = state.trigger_prompt.as_mut()
+                    && let Some(f) = p.current_field_mut()
+                        && f.options.as_deref().is_some_and(|o| o.iter().any(|x| x == "yes")) {
                             f.value = "yes".to_string();
                         }
-                    }
-                }
             } else if key_is(&key, km.tp_no) {
-                if let Some(p) = state.trigger_prompt.as_mut() {
-                    if let Some(f) = p.current_field_mut() {
-                        if f.options.as_deref().map_or(false, |o| o.iter().any(|x| x == "no")) {
+                if let Some(p) = state.trigger_prompt.as_mut()
+                    && let Some(f) = p.current_field_mut()
+                        && f.options.as_deref().is_some_and(|o| o.iter().any(|x| x == "no")) {
                             f.value = "no".to_string();
                         }
-                    }
-                }
             } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter || key_is(&key, km.tp_edit) {
-                if let Some(p) = state.trigger_prompt.as_mut() {
-                    if p.current_field().is_some() {
+                if let Some(p) = state.trigger_prompt.as_mut()
+                    && p.current_field().is_some() {
                         p.editing = true;
                     }
-                }
             } else if key_is(&key, km.tp_submit) {
                 submit_trigger_prompt(state, provider, tx);
             }
@@ -897,6 +934,116 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+
+fn compute_step_line_starts(raw: &[String], steps: &[Step]) -> (Vec<usize>, Vec<String>) {
+    if steps.is_empty() || raw.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    // All depth-0 ##[group] positions: (line_idx, "HH:MM:SS", group_name).
+    // Group names that start with "Run " are step-entry markers (used: or run: steps).
+    // Sub-operation groups (Getting Git version info, Installed versions, etc.) never
+    // start with "Run " and should not be treated as step boundaries.
+    let group_positions: Vec<(usize, String, String)> = {
+        let mut result = Vec::new();
+        let mut depth = 0usize;
+        for (i, line) in raw.iter().enumerate() {
+            let content = strip_time_prefix(line);
+            let is_group = content.starts_with("##[group]") || content.starts_with("##[section]");
+            let is_end = content.starts_with("##[endgroup]");
+            if is_group {
+                if depth == 0 {
+                    let gname = strip_ansi(
+                        content.strip_prefix("##[group]")
+                            .or_else(|| content.strip_prefix("##[section]"))
+                            .unwrap_or(""),
+                    );
+                    result.push((i, line.get(..8).unwrap_or("").to_string(), gname));
+                }
+                depth += 1;
+            } else if is_end {
+                depth = depth.saturating_sub(1);
+            }
+        }
+        result
+    };
+
+    let mut starts = Vec::with_capacity(steps.len());
+    let mut names = Vec::with_capacity(steps.len());
+    // Monotonic cursor: groups assigned to earlier steps are never reused.
+    let mut group_cursor = 0usize;
+
+    for (si, step) in steps.iter().enumerate() {
+        let step_hms = step.started_at.map(|dt|
+            format!("{:02}:{:02}:{:02}", dt.hour(), dt.minute(), dt.second())
+        );
+
+        if si == 0 {
+            // First step (Set up job) always starts at line 0 — it owns the preamble before
+            // the first group and the setup sub-groups.
+            starts.push(0);
+            names.push(step.name.clone());
+            continue;
+        }
+
+        // Primary: find the first "Run …"-prefixed group at or after group_cursor with
+        // timestamp >= this step's start.  "Run " groups are the canonical step-entry
+        // markers emitted by the runner for every uses:/run: step.
+        let found = step_hms.as_deref().and_then(|hms| {
+            group_positions.iter()
+                .enumerate()
+                .skip(group_cursor)
+                .find(|(_, (_, t, n))| t.as_str() >= hms && n.starts_with("Run "))
+                .map(|(gi, &(line_idx, _, _))| (gi, line_idx))
+        });
+        // Fallback: any group with timestamp >= step start (handles steps without "Run " headers).
+        let found = found.or_else(|| {
+            step_hms.as_deref().and_then(|hms| {
+                group_positions.iter()
+                    .enumerate()
+                    .skip(group_cursor)
+                    .find(|(_, (_, t, _))| t.as_str() >= hms)
+                    .map(|(gi, &(line_idx, _, _))| (gi, line_idx))
+            })
+        });
+
+        if let Some((gi, line_idx)) = found {
+            group_cursor = gi + 1;
+            starts.push(line_idx);
+        } else {
+            // No group found (post-steps, Complete job): fall back to raw timestamp line.
+            let line_idx = step_hms.as_deref()
+                .map(|hms| find_raw_line_for_time(raw, hms))
+                .unwrap_or_else(|| starts.last().copied().unwrap_or(0));
+            starts.push(line_idx.min(raw.len().saturating_sub(1)));
+        }
+        names.push(step.name.clone());
+    }
+
+    let any_matched = starts.iter().any(|&l| l > 0)
+        || steps.first().and_then(|s| s.started_at).is_some();
+    if any_matched { (starts, names) } else { (Vec::new(), Vec::new()) }
+}
+
+fn find_raw_line_for_time(raw: &[String], hms: &str) -> usize {
+    for (i, line) in raw.iter().enumerate() {
+        if let Some(t) = line.get(..8)
+            && t.as_bytes().get(2) == Some(&b':')
+            && t.as_bytes().get(5) == Some(&b':')
+            && t >= hms
+        {
+            return i;
+        }
+    }
+    raw.len()
+}
+
+fn extract_step_by_line_range(raw: &[String], step_idx: usize, line_starts: &[usize]) -> Vec<String> {
+    let start = line_starts.get(step_idx).copied().unwrap_or(0);
+    let end = line_starts.get(step_idx + 1).copied().unwrap_or(raw.len());
+    raw[start.min(raw.len())..end.min(raw.len())].to_vec()
+}
+
 fn parse_log_sections(raw: &[String]) -> Vec<String> {
     let mut depth: usize = 0;
     let mut result = Vec::new();
@@ -979,11 +1126,10 @@ fn find_section_by_time(raw: &[String], start_hms: &str) -> Option<usize> {
         let is_endgroup = content.starts_with("##[endgroup]");
         if is_group {
             if depth == 0 {
-                if let Some(t) = line.get(..8) {
-                    if t.as_bytes().get(2) == Some(&b':') && t.as_bytes().get(5) == Some(&b':') && t >= start_hms {
+                if let Some(t) = line.get(..8)
+                    && t.as_bytes().get(2) == Some(&b':') && t.as_bytes().get(5) == Some(&b':') && t >= start_hms {
                         return Some(section_count);
                     }
-                }
                 section_count += 1;
             }
             depth += 1;
@@ -1023,11 +1169,10 @@ fn maybe_fetch_workflow_preview(
     provider: &Arc<GitHubProvider>,
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
-    if let Some(w) = state.selected_workflow().cloned() {
-        if state.workflow_preview_file.as_deref() != Some(w.file_name.as_str()) {
+    if let Some(w) = state.selected_workflow().cloned()
+        && state.workflow_preview_file.as_deref() != Some(w.file_name.as_str()) {
             spawn_fetch_workflow_preview(provider.clone(), w.file_name, tx.clone(), state);
         }
-    }
 }
 
 fn spawn_fetch_workflow_preview(
@@ -1050,11 +1195,10 @@ fn maybe_fetch_preview(
     provider: &Arc<GitHubProvider>,
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
-    if let Some(r) = state.selected_run().cloned() {
-        if state.runs_preview_id != Some(r.id) {
+    if let Some(r) = state.selected_run().cloned()
+        && state.runs_preview_id != Some(r.id) {
             spawn_fetch_run_preview(provider.clone(), r.id, tx.clone(), state);
         }
-    }
 }
 
 fn spawn_fetch_run_preview(

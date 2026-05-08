@@ -71,8 +71,9 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
             ]
         }
         View::Logs => {
-            let step = state.log_section_idx
-                .and_then(|i| state.log_sections.get(i))
+            let step = state.current_step_idx()
+                .and_then(|i| state.log_step_names.get(i))
+                .or_else(|| state.log_section_idx.and_then(|i| state.log_sections.get(i)))
                 .map(|s| s.as_str())
                 .unwrap_or("all steps");
             vec![
@@ -580,15 +581,14 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
     if let Some(detail) = &state.runs_preview {
         let mut lines: Vec<Line> = Vec::new();
 
-        if let Some(run) = selected {
-            if !run.commit_msg.is_empty() {
+        if let Some(run) = selected
+            && !run.commit_msg.is_empty() {
                 lines.push(Line::from(vec![
                     Span::styled("󰊢 ", Style::default().fg(Color::Rgb(120, 120, 145))),
                     Span::styled(run.commit_msg.clone(), Style::default().fg(Color::Rgb(180, 180, 210)).italic()),
                 ]));
                 lines.push(Line::default());
             }
-        }
 
         for job in &detail.jobs {
             lines.push(Line::from(vec![
@@ -666,8 +666,8 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
                     // the job.steps list but still assigns numbers to.
                     Span::styled(format!("{}. {}", si + 1, step.name), name_style),
                 ];
-                if let Some((failed, total)) = stats.get(&step.name).copied() {
-                    if failed > 0 {
+                if let Some((failed, total)) = stats.get(&step.name).copied()
+                    && failed > 0 {
                         let badge_style = if failed * 2 >= total {
                             Style::default().fg(Color::Red).bold()
                         } else {
@@ -678,7 +678,6 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
                             badge_style,
                         ));
                     }
-                }
                 lines.push(Line::from(spans));
             }
         }
@@ -724,10 +723,18 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
     let viewport = area.height.saturating_sub(2);
     state.last_logs_viewport_height.set(viewport);
 
-    let mut log_title = if let Some(idx) = state.log_section_idx {
-        let name = state.log_sections.get(idx).map(|s| s.as_str()).unwrap_or("?");
-        let total = state.log_sections.len();
-        format!("Logs — {name}  [{}/{}]", idx + 1, total)
+    let mut log_title = if state.log_section_idx.is_some() {
+        if let Some(step_idx) = state.current_step_idx() {
+            let name = state.log_step_names.get(step_idx).map(|s| s.as_str()).unwrap_or("?");
+            let total = state.log_step_names.len();
+            format!("Logs — {name}  [{}/{}]", step_idx + 1, total)
+        } else if let Some(idx) = state.log_section_idx {
+            let name = state.log_sections.get(idx).map(|s| s.as_str()).unwrap_or("?");
+            let total = state.log_sections.len();
+            format!("Logs — {name}  [{}/{}]", idx + 1, total)
+        } else {
+            "Logs".to_string()
+        }
     } else {
         "Logs".to_string()
     };
