@@ -169,7 +169,8 @@ fn map_step(s: gh_workflows::Step) -> Step {
     Step {
         name: s.name,
         status: map_job_status(&s.status, s.conclusion.as_ref()),
-        number: s.number,
+        started_at: s.started_at,
+        completed_at: s.completed_at,
     }
 }
 

@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use ratatui::text::{Line, Span};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 
@@ -12,6 +12,12 @@ use crate::provider::{Run, RunDetail, Workflow};
 pub enum DetailItem {
     Job(usize),
     Step { job: usize, step: usize },
+}
+
+#[derive(Debug, Clone)]
+pub struct LogGroup {
+    pub header_line: usize,
+    pub end_line: usize,
 }
 
 pub fn build_detail_items(detail: &RunDetail) -> Vec<DetailItem> {
@@ -155,9 +161,14 @@ pub struct AppState {
     pub log_raw: Vec<String>,
     pub log_sections: Vec<String>,
     pub log_section_idx: Option<usize>,
-    /// (step_name, step_number) stored when navigating into logs from a specific step.
-    /// step_number is the GitHub API number (1-based, may have gaps for internal sub-steps).
-    pub log_pending_section: Option<(String, i64)>,
+    pub log_groups: Vec<LogGroup>,
+    pub log_collapsed: HashSet<usize>,
+    pub log_line_cursor: u16,
+    pub log_group_header_rows: Vec<u16>,
+    pub log_rendered_group_map: HashMap<u16, usize>,
+    /// (step_name, started_hms, completed_hms) stored when navigating into logs from a specific step.
+    /// started/completed are "HH:MM:SS" strings derived from the GitHub API step timestamps.
+    pub log_pending_section: Option<(String, Option<String>, Option<String>)>,
     pub log_scroll: u16,
     /// Inner viewport height of the Logs pane, captured at last render.
     /// Used to clamp `log_scroll` so users can't scroll past the bottom.
@@ -220,6 +231,11 @@ impl AppState {
             log_raw: Vec::new(),
             log_sections: Vec::new(),
             log_section_idx: None,
+            log_groups: Vec::new(),
+            log_collapsed: HashSet::new(),
+            log_line_cursor: 0,
+            log_group_header_rows: Vec::new(),
+            log_rendered_group_map: HashMap::new(),
             log_pending_section: None,
             log_scroll: 0,
             last_logs_viewport_height: Cell::new(0),
@@ -268,6 +284,26 @@ impl AppState {
         self.runs.get(self.run_cursor)
     }
 
+    pub fn init_log_groups(&mut self) {
+        self.log_groups = parse_log_groups(&self.log_lines);
+        self.log_collapsed = (0..self.log_groups.len()).collect();
+        self.log_line_cursor = 0;
+        self.log_group_header_rows = vec![0u16; self.log_groups.len()];
+        self.log_rendered_group_map = HashMap::new();
+    }
+
+    pub fn compute_hidden_lines(&self) -> HashSet<usize> {
+        let mut hidden = HashSet::new();
+        for (gi, group) in self.log_groups.iter().enumerate() {
+            if self.log_collapsed.contains(&gi) {
+                for li in (group.header_line + 1)..=group.end_line {
+                    hidden.insert(li);
+                }
+            }
+        }
+        hidden
+    }
+
     /// Drop in-progress and committed search state. Called whenever
     /// `log_lines` is replaced (section change, fresh fetch).
     pub fn clear_log_search(&mut self) {
@@ -311,123 +347,128 @@ impl AppState {
             .and_then(|i| self.log_search_matches.get(i).copied());
 
         let time_style = Style::default().fg(Color::Rgb(80, 80, 80));
-        let sep_style = Style::default().fg(Color::DarkGray);
 
-        self.log_rendered = self
-            .log_lines
-            .iter()
-            .enumerate()
-            .flat_map(|(src_idx, l)| {
-                let (time, content) = split_time_prefix(l.as_str());
-                let mk_time = || time.map(|t| Span::styled(format!("{t} "), time_style));
-
-                let lines: Vec<Line> = if let Some(title) = content
-                    .strip_prefix("##[group]")
-                    .or_else(|| content.strip_prefix("##[section]"))
-                {
-                    let title_style = Style::default().fg(Color::Cyan).bold();
-                    let mut header = vec![];
-                    if let Some(ts) = mk_time() {
-                        header.push(ts);
-                    }
-                    header.push(Span::styled("▸ ", title_style));
-                    header.extend(ansi_line_to_spans(title, title_style));
-                    vec![
-                        Line::from(Span::styled("────────────────────────────────────────────────────────────────────────", sep_style)),
-                        Line::from(header),
-                        Line::default(),
-                    ]
-                } else if content.starts_with("##[endgroup]") {
-                    vec![Line::default()]
-                } else if let Some(cmd) = content.strip_prefix("##[command]") {
-                    let mut spans = vec![];
-                    if let Some(ts) = mk_time() {
-                        spans.push(ts);
-                    }
-                    spans.push(Span::styled("$ ", Style::default().fg(Color::Green).bold()));
-                    spans.extend(ansi_line_to_spans(cmd, Style::default().fg(Color::White)));
-                    vec![Line::from(spans)]
-                } else if let Some(msg) = content.strip_prefix("##[error]") {
-                    let s = Style::default().fg(Color::Red).bold();
-                    let mut spans = vec![];
-                    if let Some(ts) = mk_time() {
-                        spans.push(ts);
-                    }
-                    spans.push(Span::styled("✗ ", s));
-                    spans.extend(ansi_line_to_spans(msg, s));
-                    vec![Line::from(spans)]
-                } else if let Some(msg) = content.strip_prefix("##[warning]") {
-                    let s = Style::default().fg(Color::Yellow);
-                    let mut spans = vec![];
-                    if let Some(ts) = mk_time() {
-                        spans.push(ts);
-                    }
-                    spans.push(Span::styled("⚠ ", s.bold()));
-                    spans.extend(ansi_line_to_spans(msg, s));
-                    vec![Line::from(spans)]
-                } else if let Some(msg) = content.strip_prefix("##[debug]") {
-                    let s = Style::default().fg(Color::DarkGray);
-                    let mut spans = vec![];
-                    if let Some(ts) = mk_time() {
-                        spans.push(ts);
-                    }
-                    spans.push(Span::styled("# ", s));
-                    spans.extend(ansi_line_to_spans(msg, s));
-                    vec![Line::from(spans)]
-                } else if let Some(msg) = content.strip_prefix("##[notice]") {
-                    let s = Style::default().fg(Color::Cyan);
-                    let mut spans = vec![];
-                    if let Some(ts) = mk_time() {
-                        spans.push(ts);
-                    }
-                    spans.push(Span::styled("ℹ ", s));
-                    spans.extend(ansi_line_to_spans(msg, s));
-                    vec![Line::from(spans)]
-                } else {
-                    // Keyword detection runs on plain text regardless of ANSI presence.
-                    // For ANSI lines the detected style becomes the default that ANSI
-                    // resets (`\x1b[0m`) fall back to, so "FAILED" lines stay red even
-                    // after the escape sequence ends.
-                    let plain = if content.contains('\x1b') {
-                        strip_ansi(content)
-                    } else {
-                        content.to_string()
-                    };
-                    let trimmed_lower = plain.trim_start().to_lowercase();
-                    let base = if trimmed_lower.starts_with("error") || trimmed_lower.starts_with("failed") {
-                        Style::default().fg(Color::Red)
-                    } else if trimmed_lower.starts_with("warn") {
-                        Style::default().fg(Color::Yellow)
-                    } else if trimmed_lower.starts_with('=') && trimmed_lower.len() > 3
-                        && trimmed_lower[..4].chars().all(|c| c == '=')
-                    {
-                        Style::default().fg(Color::Yellow).bold()
-                    } else if trimmed_lower.starts_with('-') && trimmed_lower.len() > 3
-                        && trimmed_lower[..4].chars().all(|c| c == '-')
-                    {
-                        Style::default().fg(Color::Rgb(100, 100, 100))
-                    } else {
-                        Style::default().fg(Color::Rgb(200, 200, 200))
-                    };
-                    let mut spans = vec![];
-                    if let Some(ts) = mk_time() {
-                        spans.push(ts);
-                    }
-                    spans.extend(ansi_line_to_spans(content, base));
-                    vec![Line::from(spans)]
-                };
-
-                if let Some(needle) = needle_lower.as_deref() {
-                    let is_current = current_match_line == Some(src_idx);
-                    lines
-                        .into_iter()
-                        .map(|line| highlight_line(line, needle, is_current))
-                        .collect::<Vec<Line>>()
-                } else {
-                    lines
-                }
-            })
+        let header_to_group: HashMap<usize, usize> = self.log_groups.iter().enumerate()
+            .map(|(gi, g)| (g.header_line, gi))
             .collect();
+
+        let hidden = self.compute_hidden_lines();
+        let cursor = self.log_line_cursor;
+        let cursor_bg = Style::default().bg(Color::Rgb(35, 42, 58));
+
+        let mut rendered: Vec<Line<'static>> = Vec::new();
+        let mut group_header_rows = vec![0u16; self.log_groups.len()];
+        let mut group_map: HashMap<u16, usize> = HashMap::new();
+        let mut rendered_row: u16 = 0;
+
+        for (src_idx, l) in self.log_lines.iter().enumerate() {
+            if hidden.contains(&src_idx) {
+                continue;
+            }
+
+            let (time, content) = split_time_prefix(l.as_str());
+            let mk_time = || time.map(|t| Span::styled(format!("{t} "), time_style));
+
+            if content.starts_with("##[endgroup]") {
+                continue;
+            }
+
+            let mut line: Line = if let Some(&gi) = header_to_group.get(&src_idx) {
+                group_header_rows[gi] = rendered_row;
+                group_map.insert(rendered_row, gi);
+                let is_collapsed = self.log_collapsed.contains(&gi);
+                let title = content.strip_prefix("##[group]")
+                    .or_else(|| content.strip_prefix("##[section]"))
+                    .unwrap_or(content);
+                let title_style = Style::default().fg(Color::Cyan).bold();
+                let arrow = if is_collapsed { "▶ " } else { "▾ " };
+                let mut spans = vec![];
+                if let Some(ts) = mk_time() { spans.push(ts); }
+                spans.push(Span::styled(arrow, title_style));
+                spans.extend(ansi_line_to_spans(title, title_style));
+                Line::from(spans)
+            } else if let Some(cmd) = content.strip_prefix("##[command]") {
+                let mut spans = vec![];
+                if let Some(ts) = mk_time() { spans.push(ts); }
+                spans.push(Span::styled("▶ ", Style::default().fg(Color::Green).bold()));
+                spans.extend(ansi_line_to_spans(cmd, Style::default().fg(Color::White)));
+                Line::from(spans)
+            } else if let Some(msg) = content.strip_prefix("##[error]") {
+                let s = Style::default().fg(Color::Red).bold();
+                let mut spans = vec![];
+                if let Some(ts) = mk_time() { spans.push(ts); }
+                spans.push(Span::styled("✗ ", s));
+                spans.extend(ansi_line_to_spans(msg, s));
+                Line::from(spans)
+            } else if let Some(msg) = content.strip_prefix("##[warning]") {
+                let s = Style::default().fg(Color::Yellow);
+                let mut spans = vec![];
+                if let Some(ts) = mk_time() { spans.push(ts); }
+                spans.push(Span::styled("⚠ ", s.bold()));
+                spans.extend(ansi_line_to_spans(msg, s));
+                Line::from(spans)
+            } else if let Some(msg) = content.strip_prefix("##[debug]") {
+                let s = Style::default().fg(Color::DarkGray);
+                let mut spans = vec![];
+                if let Some(ts) = mk_time() { spans.push(ts); }
+                spans.push(Span::styled("# ", s));
+                spans.extend(ansi_line_to_spans(msg, s));
+                Line::from(spans)
+            } else if let Some(msg) = content.strip_prefix("##[notice]") {
+                let s = Style::default().fg(Color::Cyan);
+                let mut spans = vec![];
+                if let Some(ts) = mk_time() { spans.push(ts); }
+                spans.push(Span::styled("ℹ ", s));
+                spans.extend(ansi_line_to_spans(msg, s));
+                Line::from(spans)
+            } else {
+                // Keyword detection runs on plain text regardless of ANSI presence.
+                // For ANSI lines the detected style becomes the default that ANSI
+                // resets (`\x1b[0m`) fall back to, so "FAILED" lines stay red even
+                // after the escape sequence ends.
+                let plain = if content.contains('\x1b') {
+                    strip_ansi(content)
+                } else {
+                    content.to_string()
+                };
+                let trimmed_lower = plain.trim_start().to_lowercase();
+                let base = if trimmed_lower.starts_with("error") || trimmed_lower.starts_with("failed") {
+                    Style::default().fg(Color::Red)
+                } else if trimmed_lower.starts_with("warn") {
+                    Style::default().fg(Color::Yellow)
+                } else if trimmed_lower.starts_with('=') && trimmed_lower.len() > 3
+                    && trimmed_lower[..4].chars().all(|c| c == '=')
+                {
+                    Style::default().fg(Color::Yellow).bold()
+                } else if trimmed_lower.starts_with('-') && trimmed_lower.len() > 3
+                    && trimmed_lower[..4].chars().all(|c| c == '-')
+                {
+                    Style::default().fg(Color::Rgb(100, 100, 100))
+                } else {
+                    Style::default().fg(Color::Rgb(200, 200, 200))
+                };
+                let mut spans = vec![];
+                if let Some(ts) = mk_time() { spans.push(ts); }
+                spans.extend(ansi_line_to_spans(content, base));
+                Line::from(spans)
+            };
+
+            if rendered_row == cursor {
+                line = line.style(cursor_bg);
+            }
+
+            if let Some(needle) = needle_lower.as_deref() {
+                let is_current = current_match_line == Some(src_idx);
+                rendered.push(highlight_line(line, needle, is_current));
+            } else {
+                rendered.push(line);
+            }
+            rendered_row += 1;
+        }
+
+        self.log_rendered = rendered;
+        self.log_group_header_rows = group_header_rows;
+        self.log_rendered_group_map = group_map;
     }
 }
 
@@ -452,6 +493,34 @@ pub fn visible_text(s: &str) -> String {
         }
     }
     no_time
+}
+
+pub fn parse_log_groups(lines: &[String]) -> Vec<LogGroup> {
+    let mut groups = Vec::new();
+    let mut depth = 0usize;
+    let mut current_start: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let content = split_time_prefix(line.as_str()).1;
+        let is_group = content.starts_with("##[group]") || content.starts_with("##[section]");
+        let is_endgroup = content.starts_with("##[endgroup]");
+        if is_group {
+            if depth == 0 {
+                current_start = Some(i);
+            }
+            depth += 1;
+        } else if is_endgroup {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                if let Some(start) = current_start.take() {
+                    groups.push(LogGroup { header_line: start, end_line: i });
+                }
+            }
+        }
+    }
+    if let Some(start) = current_start.take() {
+        groups.push(LogGroup { header_line: start, end_line: lines.len().saturating_sub(1) });
+    }
+    groups
 }
 
 pub fn split_time_prefix(s: &str) -> (Option<&str>, &str) {

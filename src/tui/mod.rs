@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use chrono::Timelike;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
@@ -217,20 +218,27 @@ async fn event_loop(
                         state.clear_log_search();
                         state.log_sections = parse_log_sections(&lines);
                         state.log_raw = lines.clone();
-                        if let Some((step_name, step_number)) = state.log_pending_section.take() {
-                            let n = state.log_sections.len();
-                            // Try exact name match first, then substring, then fall back to
-                            // step_number-1 as the section index (GitHub's log has one ##[group]
-                            // per step including hidden internal sub-steps, so step_number is a
-                            // reliable 1-based index into the full section list).
-                            let idx = state.log_sections.iter()
-                                .position(|s| s.trim() == step_name.trim())
-                                .or_else(|| state.log_sections.iter()
-                                    .position(|s| s.contains(step_name.as_str()) || step_name.contains(s.as_str())))
+                        if let Some((step_name, started_hms, _completed_hms)) = state.log_pending_section.take() {
+                            // Primary: find the top-level ##[group] that starts at or after
+                            // the step's started_at time, then use extract_log_section which
+                            // naturally stops at the NEXT top-level group. This correctly
+                            // handles the case where multiple steps share the same second
+                            // (extract_step_by_time used inclusive time bounds and would
+                            // include lines from the next step that started in the same second).
+                            let idx = started_hms.as_deref()
+                                .and_then(|start| find_section_by_time(&lines, start))
+                                // Fallback: case-insensitive name match.
                                 .or_else(|| {
-                                    let by_number = (step_number - 1) as usize;
-                                    if by_number < n { Some(by_number) } else { None }
+                                    let needle = step_name.trim().to_lowercase();
+                                    state.log_sections.iter()
+                                        .position(|s| s.trim().to_lowercase() == needle)
+                                        .or_else(|| state.log_sections.iter()
+                                            .position(|s| {
+                                                let sl = s.trim().to_lowercase();
+                                                sl.contains(&needle) || needle.contains(sl.as_str())
+                                            }))
                                 });
+
                             state.log_section_idx = idx;
                             state.log_lines = idx
                                 .map(|i| extract_log_section(&lines, i))
@@ -240,6 +248,7 @@ async fn event_loop(
                             state.log_lines = lines;
                         }
                         state.log_scroll = 0;
+                        state.init_log_groups();
                         state.recompute_log_rendered();
                         state.pending = state.pending.saturating_sub(1);
                     }
@@ -472,7 +481,14 @@ async fn handle_key(
                                 detail.jobs.get(ji).cloned(),
                                 detail.jobs.get(ji).and_then(|j| j.steps.get(si)).cloned(),
                             ) {
-                                state.log_pending_section = Some((step.name.clone(), step.number));
+                                let hms = |dt: chrono::DateTime<chrono::Utc>| {
+                                    format!("{:02}:{:02}:{:02}", dt.hour(), dt.minute(), dt.second())
+                                };
+                                state.log_pending_section = Some((
+                                    step.name.clone(),
+                                    step.started_at.map(&hms),
+                                    step.completed_at.map(&hms),
+                                ));
                                 state.switch_view(View::Logs);
                                 state.log_lines = vec!["loading...".into()];
                                 spawn_fetch_logs(provider.clone(), job.id, tx.clone(), state);
@@ -484,24 +500,62 @@ async fn handle_key(
             }
         }
         View::Logs => {
-            // Approx max scroll: line count - viewport height. This is a lower
-            // bound on the true wrapped-line count, so the user can still
-            // scroll a little past the perfect bottom on long wrapped lines,
-            // but no longer scrolls forever into blank space.
-            let max_scroll = (state.log_rendered.len() as u16)
-                .saturating_sub(state.last_logs_viewport_height.get());
+            let total_rendered = state.log_rendered.len() as u16;
+            let viewport = state.last_logs_viewport_height.get().max(1);
+            let max_cursor = total_rendered.saturating_sub(1);
+            let max_scroll = total_rendered.saturating_sub(viewport);
+
+            let keep_cursor_visible = |cursor: u16, scroll: &mut u16| {
+                if cursor < *scroll {
+                    *scroll = cursor;
+                } else if cursor >= *scroll + viewport {
+                    *scroll = cursor.saturating_sub(viewport - 1).min(max_scroll);
+                }
+            };
+
             if key_is(&key, km.down) || key.code == KeyCode::Down {
-                state.log_scroll = state.log_scroll.saturating_add(1).min(max_scroll);
+                state.log_line_cursor = state.log_line_cursor.saturating_add(1).min(max_cursor);
+                keep_cursor_visible(state.log_line_cursor, &mut state.log_scroll);
+                state.recompute_log_rendered();
             } else if key_is(&key, km.up) || key.code == KeyCode::Up {
-                state.log_scroll = state.log_scroll.saturating_sub(1);
+                state.log_line_cursor = state.log_line_cursor.saturating_sub(1);
+                keep_cursor_visible(state.log_line_cursor, &mut state.log_scroll);
+                state.recompute_log_rendered();
             } else if key_is(&key, km.page_down) || key.code == KeyCode::PageDown {
-                state.log_scroll = state.log_scroll.saturating_add(20).min(max_scroll);
+                state.log_line_cursor = state.log_line_cursor.saturating_add(viewport).min(max_cursor);
+                keep_cursor_visible(state.log_line_cursor, &mut state.log_scroll);
+                state.recompute_log_rendered();
             } else if key_is(&key, km.page_up) || key.code == KeyCode::PageUp {
-                state.log_scroll = state.log_scroll.saturating_sub(20);
+                state.log_line_cursor = state.log_line_cursor.saturating_sub(viewport);
+                keep_cursor_visible(state.log_line_cursor, &mut state.log_scroll);
+                state.recompute_log_rendered();
             } else if key_is(&key, km.scroll_top) {
+                state.log_line_cursor = 0;
                 state.log_scroll = 0;
+                state.recompute_log_rendered();
             } else if key_is(&key, km.scroll_bottom) {
+                state.log_line_cursor = max_cursor;
                 state.log_scroll = max_scroll;
+                state.recompute_log_rendered();
+            } else if key.code == KeyCode::Enter {
+                let cursor = state.log_line_cursor;
+                if let Some(&gi) = state.log_rendered_group_map.get(&cursor) {
+                    if state.log_collapsed.contains(&gi) {
+                        state.log_collapsed.remove(&gi);
+                    } else {
+                        state.log_collapsed.insert(gi);
+                    }
+                    state.recompute_log_rendered();
+                    // After toggle, re-read where the group header landed and keep cursor there
+                    if let Some(&new_row) = state.log_group_header_rows.get(gi) {
+                        state.log_line_cursor = new_row;
+                        let new_max_scroll = (state.log_rendered.len() as u16).saturating_sub(viewport);
+                        if new_row < state.log_scroll || new_row >= state.log_scroll + viewport {
+                            state.log_scroll = new_row.saturating_sub(2).min(new_max_scroll);
+                        }
+                        state.recompute_log_rendered();
+                    }
+                }
             } else if key_is(&key, km.search) {
                 state.log_search_input = Some(String::new());
             } else if key_is(&key, km.next_step) {
@@ -516,6 +570,7 @@ async fn handle_key(
                         state.log_lines = extract_log_section(&state.log_raw, next);
                         state.log_scroll = 0;
                         state.clear_log_search();
+                        state.init_log_groups();
                         state.recompute_log_rendered();
                     }
                 }
@@ -531,6 +586,7 @@ async fn handle_key(
                             state.log_lines = state.log_raw.clone();
                             state.log_scroll = 0;
                             state.clear_log_search();
+                            state.init_log_groups();
                             state.recompute_log_rendered();
                         }
                         Some(i) => {
@@ -539,6 +595,7 @@ async fn handle_key(
                             state.log_lines = extract_log_section(&state.log_raw, prev);
                             state.log_scroll = 0;
                             state.clear_log_search();
+                            state.init_log_groups();
                             state.recompute_log_rendered();
                         }
                     }
@@ -548,6 +605,7 @@ async fn handle_key(
                 state.log_lines = state.log_raw.clone();
                 state.log_scroll = 0;
                 state.clear_log_search();
+                state.init_log_groups();
                 state.recompute_log_rendered();
             }
         }
@@ -647,19 +705,14 @@ fn scroll_to_current_match(state: &mut AppState) {
     let Some(&src_line) = state.log_search_matches.get(idx) else { return };
     let viewport = state.last_logs_viewport_height.get().max(1);
 
-    // Mirror render expansion: each `##[group]`/`##[section]` source line
-    // becomes 3 rendered lines (separator, header, blank). All other prefixes
-    // are 1:1. Without this correction the scroll target lands above the
-    // actual match by 2 rows per preceding group.
+    let hidden = state.compute_hidden_lines();
     let render_offset_through = |upto: usize| -> u32 {
         let mut total: u32 = 0;
-        for line in state.log_lines.iter().take(upto) {
+        for (i, line) in state.log_lines.iter().enumerate().take(upto) {
+            if hidden.contains(&i) { continue; }
             let content = strip_time_prefix(line);
-            if content.starts_with("##[group]") || content.starts_with("##[section]") {
-                total += 3;
-            } else {
-                total += 1;
-            }
+            if content.starts_with("##[endgroup]") { continue; }
+            total += 1;
         }
         total
     };
@@ -898,7 +951,12 @@ fn extract_log_section(raw: &[String], section_idx: usize) -> Vec<String> {
             if capturing {
                 result.push(line.clone());
                 if depth <= 1 {
-                    break;
+                    // After closing the top-level group, keep capturing lines
+                    // that appear before the next top-level group — these are
+                    // output lines that belong to this section (e.g. pytest
+                    // errors that appear after ##[endgroup] in the job log).
+                    depth = 0;
+                    continue;
                 }
             }
             depth = depth.saturating_sub(1);
@@ -907,6 +965,33 @@ fn extract_log_section(raw: &[String], section_idx: usize) -> Vec<String> {
         }
     }
     result
+}
+
+/// Find the index of the first top-level ##[group] whose timestamp is >= start_hms.
+/// Because extract_log_section stops at the NEXT top-level group, using this index
+/// correctly bounds the step's content even when the next step starts in the same second.
+fn find_section_by_time(raw: &[String], start_hms: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut section_count = 0usize;
+    for line in raw {
+        let content = strip_time_prefix(line);
+        let is_group = content.starts_with("##[group]") || content.starts_with("##[section]");
+        let is_endgroup = content.starts_with("##[endgroup]");
+        if is_group {
+            if depth == 0 {
+                if let Some(t) = line.get(..8) {
+                    if t.as_bytes().get(2) == Some(&b':') && t.as_bytes().get(5) == Some(&b':') && t >= start_hms {
+                        return Some(section_count);
+                    }
+                }
+                section_count += 1;
+            }
+            depth += 1;
+        } else if is_endgroup {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    None
 }
 
 fn spawn_repo_status_fetch(

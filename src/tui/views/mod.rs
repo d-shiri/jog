@@ -146,17 +146,20 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         ],
         View::Logs => {
             let np_label = if state.log_search_query.is_some() { "match" } else { "step" };
-            vec![
-                (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "scroll"),
+            let mut hints = vec![
+                (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "move"),
                 (format!("{}/{}", display_key(&km.page_down), display_key(&km.page_up)), "page"),
-                (format!("{}/{}", display_key(&km.scroll_top), display_key(&km.scroll_bottom)), "top/bot"),
                 (format!("{}/{}", display_key(&km.next_step), display_key(&km.prev_step)), np_label),
                 (display_key(&km.all_steps).into(), "all"),
                 (display_key(&km.search).into(), "search"),
-                (display_key(&km.open_browser).into(), "open"),
-                (display_key(&km.back).into(), "back"),
-                (display_key(&km.quit).into(), "quit"),
-            ]
+            ];
+            if !state.log_groups.is_empty() {
+                hints.push(("↵".into(), "expand/collapse"));
+            }
+            hints.push((display_key(&km.open_browser).into(), "open"));
+            hints.push((display_key(&km.back).into(), "back"));
+            hints.push((display_key(&km.quit).into(), "quit"));
+            hints
         },
         View::Watch => vec![
             (display_key(&km.open_browser).into(), "open"),

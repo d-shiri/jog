@@ -104,7 +104,8 @@ pub struct Job {
 pub struct Step {
     pub name: String,
     pub status: Status,
-    pub number: i64,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
