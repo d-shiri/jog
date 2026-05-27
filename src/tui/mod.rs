@@ -281,12 +281,38 @@ async fn event_loop(
                 let now = tokio::time::Instant::now();
                 if now.duration_since(last_poll) >= poll_interval {
                     last_poll = now;
-                    if state.view == View::Watch && state.pending == 0 {
-                        if let Some(file) = state.workflow_for_runs.clone() {
-                            spawn_fetch_runs(provider.clone(), file, tx.clone(), state);
-                        }
-                        if let Some(run) = state.runs.first().cloned() {
-                            spawn_fetch_run_detail(provider.clone(), run.id, tx.clone(), state);
+                    if state.pending == 0 {
+                        match state.view {
+                            View::Watch => {
+                                if let Some(file) = state.workflow_for_runs.clone() {
+                                    spawn_fetch_runs(provider.clone(), file, tx.clone(), state);
+                                }
+                                if let Some(run) = state.runs.first().cloned() {
+                                    spawn_fetch_run_detail(provider.clone(), run.id, tx.clone(), state);
+                                }
+                            }
+                            View::Runs => {
+                                let has_active = state.runs.iter().any(|r| !r.status.is_terminal());
+                                if has_active {
+                                    if let Some(file) = state.workflow_for_runs.clone() {
+                                        spawn_fetch_runs(provider.clone(), file, tx.clone(), state);
+                                    }
+                                }
+                            }
+                            View::RunDetail => {
+                                let run_active = state
+                                    .run_detail
+                                    .as_ref()
+                                    .map(|d| !d.run.status.is_terminal())
+                                    .or_else(|| state.selected_run().map(|r| !r.status.is_terminal()))
+                                    .unwrap_or(false);
+                                if run_active {
+                                    if let Some(run) = state.selected_run().cloned() {
+                                        spawn_fetch_run_detail(provider.clone(), run.id, tx.clone(), state);
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -379,6 +405,42 @@ async fn handle_key(
                     let _ = tx2.send(AppEvent::Status(format!("opened run {}", run.id)));
                 }
             });
+        }
+        return None;
+    }
+
+    if key_is(&key, km.yank) {
+        let text: Option<String> = match state.view {
+            View::Workflows => state.selected_workflow().map(|w| w.file_name.clone()),
+            View::Runs | View::Watch => state
+                .run_detail.as_ref().map(|d| d.run.url.clone())
+                .or_else(|| state.selected_run().map(|r| r.url.clone())),
+            View::RunDetail => state.run_detail.as_ref().and_then(|detail| {
+                let items = build_detail_items(detail);
+                match items.get(state.detail_cursor) {
+                    Some(DetailItem::Job(ji)) => detail.jobs.get(*ji).map(|j| j.name.clone()),
+                    Some(DetailItem::Step { job: ji, step: si }) => detail.jobs
+                        .get(*ji)
+                        .and_then(|j| j.steps.get(*si))
+                        .map(|s| s.name.clone()),
+                    None => None,
+                }
+            }),
+            View::Logs => state.log_rendered
+                .get(state.log_line_cursor as usize)
+                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect()),
+            View::Diff => state.run_detail.as_ref().map(|d| d.run.url.clone()),
+            View::TriggerPrompt => None,
+        };
+        if let Some(text) = text {
+            match yank_to_clipboard(&text) {
+                Ok(()) => {
+                    let preview: String = text.chars().take(50).collect();
+                    let ellipsis = if text.chars().count() > 50 { "…" } else { "" };
+                    state.set_status(format!("yanked: {preview}{ellipsis}"));
+                }
+                Err(e) => state.set_status(format!("yank failed: {e}")),
+            }
         }
         return None;
     }
@@ -783,6 +845,12 @@ fn handle_trigger_prompt_edit(state: &mut AppState, key: KeyEvent) {
     }
 }
 
+fn yank_to_clipboard(text: &str) -> Result<(), String> {
+    arboard::Clipboard::new()
+        .and_then(|mut cb| cb.set_text(text))
+        .map_err(|e| e.to_string())
+}
+
 fn move_cursor(cursor: &mut usize, len: usize, delta: i32) {
     if len == 0 {
         *cursor = 0;
@@ -815,6 +883,7 @@ struct Keymap {
     rerun: (KeyCode, KeyModifiers),
     rerun_failed: (KeyCode, KeyModifiers),
     diff: (KeyCode, KeyModifiers),
+    yank: (KeyCode, KeyModifiers),
     tp_edit: (KeyCode, KeyModifiers),
     tp_submit: (KeyCode, KeyModifiers),
     tp_yes: (KeyCode, KeyModifiers),
@@ -885,6 +954,7 @@ fn resolve_keymap(cfg: &KeymapConfig) -> Result<Keymap> {
         rerun:         parse_key(&cfg.rerun)?,
         rerun_failed:  parse_key(&cfg.rerun_failed)?,
         diff:          parse_key(&cfg.diff)?,
+        yank:          parse_key(&cfg.yank)?,
         tp_edit:       parse_key(&cfg.tp_edit)?,
         tp_submit:     parse_key(&cfg.tp_submit)?,
         tp_yes:        parse_key(&cfg.tp_yes)?,

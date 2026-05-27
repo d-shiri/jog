@@ -92,6 +92,7 @@ pub struct KeymapConfig {
     pub rerun: String,
     pub rerun_failed: String,
     pub diff: String,
+    pub yank: String,
     // trigger-prompt (normal mode)
     pub tp_edit: String,
     pub tp_submit: String,
@@ -124,6 +125,7 @@ impl Default for KeymapConfig {
             rerun: "r".into(),
             rerun_failed: "R".into(),
             diff: "D".into(),
+            yank: "y".into(),
             tp_edit: "i".into(),
             tp_submit: "t".into(),
             tp_yes: "y".into(),
