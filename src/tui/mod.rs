@@ -169,6 +169,22 @@ async fn event_loop(
                     }
                     AppEvent::RunsLoaded(file, runs) => {
                         if state.workflow_for_runs.as_deref() == Some(file.as_str()) {
+                            // Sound notification: play when a run we saw as Running
+                            // finishes, even if we're only viewing the runs list.
+                            // Shares `watch_seen_running` with RunDetailLoaded, so the
+                            // `remove` dedupes and avoids a double-ding in Watch view.
+                            for r in &runs {
+                                let id = r.id;
+                                if r.status.is_terminal() {
+                                    if state.watch_seen_running.remove(&id)
+                                        && !config.ui.complete_sound.is_empty()
+                                    {
+                                        play_sound(&config.ui.complete_sound);
+                                    }
+                                } else {
+                                    state.watch_seen_running.insert(id);
+                                }
+                            }
                             state.runs = runs;
                             state.run_cursor = 0;
                             if let Some(r) = state.runs.first().cloned() {
