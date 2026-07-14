@@ -26,6 +26,11 @@ impl Status {
             Status::Success | Status::Failure | Status::Cancelled | Status::Skipped
         )
     }
+
+    /// Terminal states that indicate the run did not succeed.
+    pub fn is_failure(self) -> bool {
+        matches!(self, Status::Failure | Status::Cancelled)
+    }
 }
 
 #[derive(Debug, Clone)]

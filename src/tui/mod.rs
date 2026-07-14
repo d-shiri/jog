@@ -176,10 +176,8 @@ async fn event_loop(
                             for r in &runs {
                                 let id = r.id;
                                 if r.status.is_terminal() {
-                                    if state.watch_seen_running.remove(&id)
-                                        && !config.ui.complete_sound.is_empty()
-                                    {
-                                        play_sound(&config.ui.complete_sound);
+                                    if state.watch_seen_running.remove(&id) {
+                                        play_terminal_sound(r.status, &config);
                                     }
                                 } else {
                                     state.watch_seen_running.insert(id);
@@ -200,10 +198,8 @@ async fn event_loop(
                         // Sound notification: play when a run we saw as Running finishes.
                         let id = detail.run.id;
                         if detail.run.status.is_terminal() {
-                            if state.watch_seen_running.remove(&id)
-                                && !config.ui.complete_sound.is_empty()
-                            {
-                                play_sound(&config.ui.complete_sound);
+                            if state.watch_seen_running.remove(&id) {
+                                play_terminal_sound(detail.run.status, &config);
                             }
                         } else {
                             state.watch_seen_running.insert(id);
@@ -1468,6 +1464,38 @@ fn play_sound(path: &str) {
     });
 }
 
+const FINISHED_SOUND: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/finished.mp3"));
+const FAIL_SOUND: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fail.mp3"));
+
+/// Play the appropriate notification sound for a finished run: the fail sound
+/// on failure/cancellation, otherwise the completion sound.
+fn play_terminal_sound(status: Status, config: &Config) {
+    let (configured, bundled, name) = if status.is_failure() {
+        (&config.ui.fail_sound, FAIL_SOUND, "fail.mp3")
+    } else {
+        (&config.ui.complete_sound, FINISHED_SOUND, "finished.mp3")
+    };
+    if let Some(path) = sound_path(configured, bundled, name) {
+        play_sound(&path);
+    }
+}
+
+/// Resolve a notification sound path: the configured file if set, otherwise the
+/// bundled bytes extracted into the user's cache dir on first use.
+fn sound_path(configured: &str, bundled: &'static [u8], name: &str) -> Option<String> {
+    if !configured.is_empty() {
+        return Some(configured.to_string());
+    }
+    let dir = dirs::cache_dir()?.join("jog");
+    let path = dir.join(name);
+    if !path.exists() {
+        std::fs::create_dir_all(&dir).ok()?;
+        std::fs::write(&path, bundled).ok()?;
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
 pub fn animated_glyph(s: Status, tick: u64) -> &'static str {
     if s == Status::Running {
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1486,6 +1514,25 @@ mod tests {
         assert_eq!(strip_ansi("\x1b[36;1mhello\x1b[0m"), "hello");
         assert_eq!(strip_ansi("plain text"), "plain text");
         assert_eq!(strip_ansi(""), "");
+    }
+
+    #[test]
+    fn bundled_sound_extracts_to_cache() {
+        let path = sound_path("", FAIL_SOUND, "fail.mp3").expect("fail sound path");
+        let data = std::fs::read(&path).expect("extracted fail sound");
+        assert_eq!(data.as_slice(), FAIL_SOUND);
+
+        let path = sound_path("", FINISHED_SOUND, "finished.mp3").expect("finished sound path");
+        let data = std::fs::read(&path).expect("extracted finished sound");
+        assert_eq!(data.as_slice(), FINISHED_SOUND);
+    }
+
+    #[test]
+    fn configured_sound_takes_precedence() {
+        assert_eq!(
+            sound_path("/custom/boom.wav", FAIL_SOUND, "fail.mp3").as_deref(),
+            Some("/custom/boom.wav")
+        );
     }
 
     #[test]
