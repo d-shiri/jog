@@ -28,6 +28,7 @@ pub fn render(f: &mut Frame, state: &AppState) {
     match state.view {
         View::Repos => render_repos(f, chunks[1], state),
         View::GitStatus => render_git_status(f, chunks[1], state),
+        View::GitDiff => render_git_diff(f, chunks[1], state),
         View::Workflows => render_workflows(f, chunks[1], state),
         View::Runs => render_runs(f, chunks[1], state),
         View::RunDetail => render_run_detail(f, chunks[1], state),
@@ -68,6 +69,29 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
             ),
             sep(),
             Span::styled("Changes", Style::default().fg(theme.primary).bold()),
+        ],
+        View::GitDiff => vec![
+            Span::styled("Repos", Style::default().fg(theme.secondary)),
+            sep(),
+            Span::styled(
+                state
+                    .git_diff
+                    .as_ref()
+                    .map(|d| d.spec.clone())
+                    .unwrap_or_else(|| "?".into()),
+                Style::default().fg(theme.secondary),
+            ),
+            sep(),
+            Span::styled("Changes", Style::default().fg(theme.secondary)),
+            sep(),
+            Span::styled(
+                state
+                    .git_diff
+                    .as_ref()
+                    .map(|d| d.file.clone())
+                    .unwrap_or_else(|| "?".into()),
+                Style::default().fg(theme.primary).bold(),
+            ),
         ],
         View::Workflows => vec![
             Span::styled("Workflows", Style::default().fg(theme.primary).bold()),
@@ -125,7 +149,7 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     // On the workspace dashboard there is no single active repo yet — naming one
     // (and its branch) would be arbitrary. Show where we're scanning instead.
     match (&state.workspace_root, state.view) {
-        (Some(root), View::Repos | View::GitStatus) => spans.push(Span::styled(
+        (Some(root), View::Repos | View::GitStatus | View::GitDiff) => spans.push(Span::styled(
             format!("{}", root.display()),
             Style::default().fg(Color::White),
         )),
@@ -223,6 +247,16 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             hints.push((display_key(&km.back).into(), "back"));
             hints
         }
+        View::GitDiff => vec![
+            (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "scroll"),
+            (format!("{}/{}", display_key(&km.page_down), display_key(&km.page_up)), "page"),
+            (
+                format!("{}/{}", display_key(&km.next_step), display_key(&km.prev_step)),
+                "next/prev file",
+            ),
+            (display_key(&km.git_stage).into(), "stage/unstage"),
+            (display_key(&km.back).into(), "back"),
+        ],
         View::Workflows => vec![
             ("↵".into(), "runs"),
             (display_key(&km.trigger).into(), "trigger"),
@@ -268,7 +302,9 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                     if state.log_focus { "focus ✓" } else { "focus" },
                 ),
             ];
-            if !state.log_groups.is_empty() {
+            if state.log_focus && !state.log_fold_rows.is_empty() {
+                hints.push(("↵".into(), "show hidden"));
+            } else if !state.log_groups.is_empty() {
                 hints.push(("↵".into(), "expand/collapse"));
             }
             hints.push((display_key(&km.open_browser).into(), "open"));
@@ -643,6 +679,19 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
                 (k(&km.git_push), "push — sets upstream on first push"),
                 (k(&km.trigger), "open this repo's workflows to run CI"),
                 (k(&km.git_refresh), "re-read the working tree"),
+                (format!("{}/↵", k(&km.git_diff)), "diff the selected file"),
+            ],
+        ),
+        (
+            "Diff — file changes",
+            vec![
+                (pair(&km.down, &km.up), "scroll"),
+                (pair(&km.page_down, &km.page_up), "page"),
+                (pair(&km.scroll_top, &km.scroll_bottom), "top / bottom"),
+                (pair(&km.next_step, &km.prev_step), "next / previous changed file"),
+                (k(&km.git_stage), "stage / unstage this file"),
+                (k(&km.git_refresh), "re-read the diff"),
+                (k(&km.back), "back to the file list"),
             ],
         ),
         (
@@ -680,8 +729,8 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
                 (k(&km.all_steps), "show all steps"),
                 (k(&km.search), "search (then n/p cycle matches)"),
                 (pair(&km.next_error, &km.prev_error), "next / previous error"),
-                (k(&km.log_focus), "focus mode — errors and warnings only"),
-                ("↵".into(), "expand / collapse a group"),
+                (k(&km.log_focus), "focus mode — fold everything but errors"),
+                ("↵".into(), "expand a fold, or collapse a group"),
             ],
         ),
         (
@@ -701,6 +750,7 @@ fn help_section_for(view: View) -> &'static str {
     match view {
         View::Repos => "Repos — dashboard",
         View::GitStatus => "Changes — working tree",
+        View::GitDiff => "Diff — file changes",
         View::Workflows => "Workflows",
         View::Runs | View::Watch => "Runs",
         View::RunDetail | View::Diff => "Run detail",
@@ -961,6 +1011,109 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
     let mut ts = TableState::default();
     ts.select(Some(gv.cursor));
     f.render_stateful_widget(table, chunks[1], &mut ts);
+}
+
+/// Style one line of diff text.
+///
+/// Split out so the classification is testable, and because the `+++`/`---`
+/// file headers are the easy thing to get wrong: they start with the same
+/// characters as content but are not additions or deletions.
+fn diff_line_style(text: &str, theme: &Theme) -> Style {
+    let meta = Style::default().fg(Color::Rgb(110, 110, 140));
+    if text.starts_with("+++") || text.starts_with("---") {
+        return meta;
+    }
+    match text.chars().next() {
+        Some('+') => Style::default().fg(theme.success),
+        Some('-') => Style::default().fg(theme.failure),
+        Some('@') if text.starts_with("@@") => Style::default().fg(theme.accent).bold(),
+        // `diff --git`, `index abc..def`, `new file mode …`, `Binary files …`
+        _ if text.starts_with("diff ")
+            || text.starts_with("index ")
+            || text.starts_with("new file")
+            || text.starts_with("deleted file")
+            || text.starts_with("old mode")
+            || text.starts_with("new mode")
+            || text.starts_with("similarity index")
+            || text.starts_with("rename ")
+            || text.starts_with("Binary files") =>
+        {
+            meta
+        }
+        _ => Style::default().fg(Color::Rgb(190, 190, 210)),
+    }
+}
+
+/// The diff for one file from the working-tree view.
+fn render_git_diff(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
+    // Inner area = area minus the rounded border (1 row/col on each side).
+    let viewport = area.height.saturating_sub(2);
+    state.last_diff_viewport_height.set(viewport);
+
+    let Some(dv) = state.git_diff.as_ref() else {
+        f.render_widget(
+            Paragraph::new("(no file selected)").block(styled_block("Diff", theme)),
+            area,
+        );
+        return;
+    };
+
+    let (add, del) = dv.stats();
+    let mut title = format!("{}  ", dv.file);
+    if dv.loading {
+        title.push_str("loading…");
+    } else {
+        title.push_str(&format!("+{add} −{del}"));
+    }
+
+    // Position, so a long diff says how much of it is off-screen.
+    let total = dv.lines.len();
+    if total > viewport as usize {
+        let last = (dv.scroll + viewport as usize).min(total);
+        title.push_str(&format!("   [{}–{} of {}]", dv.scroll + 1, last, total));
+    }
+
+    if dv.lines.is_empty() {
+        let msg = if dv.loading {
+            "reading diff…"
+        } else {
+            // Mode changes and pure renames are real status entries with no
+            // textual diff at all — say so rather than showing a blank pane.
+            "no textual changes (mode change, rename, or an empty file)"
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray).italic()))
+                .block(styled_block(&title, theme)),
+            area,
+        );
+        return;
+    }
+
+    // Slicing to the viewport keeps the per-frame clone bounded rather than
+    // copying a 10k-line diff on every redraw.
+    let first = dv.scroll.min(total);
+    let lines: Vec<Line> = dv.lines[first..]
+        .iter()
+        .take(viewport as usize)
+        .map(|l| match l {
+            crate::app::state::DiffLine::Section(label) => Line::from(Span::styled(
+                format!("── {label} "),
+                Style::default().fg(theme.accent).bold(),
+            )),
+            crate::app::state::DiffLine::Text(t) => {
+                Line::from(Span::styled(t.clone(), diff_line_style(t, theme)))
+            }
+        })
+        .collect();
+
+    // Deliberately not wrapped: a wrapped hunk reflows every line below it, so
+    // a long line would push the rest of the diff out of alignment with the
+    // scroll offset — the same reason the log view slices instead of wrapping.
+    f.render_widget(
+        Paragraph::new(lines).block(styled_block(&title, theme)),
+        area,
+    );
 }
 
 /// Commit message prompt, drawn over the working-tree view.
@@ -1658,13 +1811,25 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
         // In focus mode the raw line count is a lie — report what's on screen.
         log_title.push_str(&format!(
             "   focus  ({} of {} lines · {}✗ {}⚠)",
-            state.log_rendered.len(),
+            // Fold markers are not log lines; counting them would overstate how
+            // much of the log survived the filter.
+            state.log_rendered.len() - state.log_fold_rows.len(),
             state.log_lines.len(),
             state.log_error_lines.len(),
             state.log_warn_lines.len(),
         ));
     } else {
-        log_title.push_str(&format!("  ({} lines)", state.log_lines.len()));
+        // The error count belongs in the title, not just behind an `e` press:
+        // "is there anything wrong in here" is the first question a log has to
+        // answer, and scrolling to find out is the slow way to ask it.
+        log_title.push_str(&format!("  ({} lines", state.log_lines.len()));
+        if !state.log_error_lines.is_empty() {
+            log_title.push_str(&format!(" · {}✗", state.log_error_lines.len()));
+        }
+        if !state.log_warn_lines.is_empty() {
+            log_title.push_str(&format!(" · {}⚠", state.log_warn_lines.len()));
+        }
+        log_title.push(')');
     }
 
     // `log_scroll` is an index into `log_rendered`, not a visual row offset:
@@ -2174,6 +2339,97 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    /// Draw the Logs pane into an off-screen terminal and return it as text,
+    /// so the assertions below are about what a user actually sees rather than
+    /// about the state that feeds it.
+    fn draw_logs(state: &AppState, w: u16, h: u16) -> String {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_logs(f, f.area(), state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn noisy_log_state(focus: bool) -> AppState {
+        let mut st = AppState::new(
+            "o/r".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        let mut lines: Vec<String> = (0..400).map(|i| format!("compiling crate {i}")).collect();
+        lines.push("##[error]test tui::foo failed".into());
+        lines.extend((0..30).map(|i| format!("trailing {i}")));
+        st.log_lines = lines;
+        st.log_focus_context = 1;
+        st.init_log_groups();
+        st.log_focus = focus;
+        st.last_logs_viewport_height.set(10);
+        st.last_logs_viewport_width.set(80);
+        st.recompute_log_rendered();
+        st
+    }
+
+    #[test]
+    #[ignore = "visual check: cargo test show_logs -- --ignored --nocapture"]
+    fn show_logs() {
+        println!("─── unfocused ───\n{}", draw_logs(&noisy_log_state(false), 80, 12));
+        println!("─── focus (F) ───\n{}", draw_logs(&noisy_log_state(true), 80, 12));
+    }
+
+    #[test]
+    fn unfocused_title_advertises_the_error_count() {
+        let out = draw_logs(&noisy_log_state(false), 80, 12);
+        let title = out.lines().next().unwrap().to_string();
+        // Whether the log contains anything wrong is the first thing to answer,
+        // and scrolling 431 lines is the slow way to ask.
+        assert!(title.contains("431 lines"), "got {title:?}");
+        assert!(title.contains("1✗"), "got {title:?}");
+    }
+
+    #[test]
+    fn focus_mode_draws_the_error_between_two_folds() {
+        let out = draw_logs(&noisy_log_state(true), 80, 12);
+        assert!(out.contains("399 lines hidden"), "got:\n{out}");
+        assert!(out.contains("test tui::foo failed"), "got:\n{out}");
+        assert!(out.contains("29 lines hidden"), "got:\n{out}");
+        // 431 lines reduced to a screen that fits: 2 folds + 3 kept lines.
+        let body: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with('│') && !l.trim_matches(['│', ' ']).is_empty())
+            .collect();
+        assert_eq!(body.len(), 5, "got {body:?}");
+    }
+
+    #[test]
+    fn diff_headers_are_not_mistaken_for_content() {
+        let theme = Theme::default();
+        let fg = |s: &str| diff_line_style(s, &theme).fg.unwrap();
+        // `+++`/`---` open with the same characters as an added/removed line but
+        // are file headers; colouring them green/red fakes a change per file.
+        let meta = Color::Rgb(110, 110, 140);
+        assert_eq!(fg("+++ b/src/main.rs"), meta);
+        assert_eq!(fg("--- a/src/main.rs"), meta);
+        assert_eq!(fg("diff --git a/x b/x"), meta);
+        assert_eq!(fg("Binary files a/q.png and b/q.png differ"), meta);
+
+        assert_eq!(fg("+let x = 1;"), theme.success);
+        assert_eq!(fg("-let x = 0;"), theme.failure);
+        assert_eq!(fg("@@ -1,4 +1,4 @@"), theme.accent);
+        // A context line keeps the neutral body colour, blank lines included.
+        assert_eq!(fg(" unchanged"), Color::Rgb(190, 190, 210));
+        assert_eq!(fg(""), Color::Rgb(190, 190, 210));
+    }
 
     #[test]
     fn every_view_maps_to_a_real_help_section() {
@@ -2183,6 +2439,7 @@ mod tests {
         for view in [
             View::Repos,
             View::GitStatus,
+            View::GitDiff,
             View::Workflows,
             View::Runs,
             View::Watch,

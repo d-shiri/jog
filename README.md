@@ -136,15 +136,26 @@ that hasn't been pushed won't be the code CI builds. Commit → push → trigger
 runs, or the jobs and steps of a run. Type to filter, `Enter` to jump the cursor
 there. Matching is subsequence-based, so `dtp` finds `deploy_to_prod.yml`.
 
-## Log focus mode
+## Finding the error in a long log
 
-In the log viewer:
+Opening a log **lands on its first error**, not on line 1 — the error is usually
+why you opened it, and on a 3,000-line step it is nowhere near the top. Logs with
+no errors open at the top as usual, and `g` always goes back there. The title bar
+carries the counts (`1,240 lines · 4✗ · 2⚠`) so you can see there is something
+wrong without going looking for it.
 
-- `F` — **focus mode**: hide everything except errors and warnings, plus a couple
-  of lines of context around each. A 40k-line log collapses to the handful of
-  lines that explain the failure. The title bar reports how much is hidden.
+From there:
+
+- `F` — **focus mode**: fold away everything except errors and warnings plus a
+  couple of lines of context around each. What was folded stays visible as a
+  marker — `⋯ 399 lines hidden — ↵ to show ⋯` — so you can see where the gaps are
+  and how big they are.
+- `Enter` on a fold marker opens that stretch back up, for when two lines of
+  context aren't enough to understand the failure. Everything else stays folded.
 - `e` / `E` — jump to the next / previous error, wrapping at the ends. Errors
   buried inside a collapsed group expand it on the way.
+- `log_focus_context` in the config sets how many lines are kept around each
+  error (default 2).
 
 Both use the same signals the viewer already colours on: GitHub Actions
 `##[error]` / `##[warning]` markup, and lines that start with `error`/`failed`/`warn`.
@@ -175,11 +186,12 @@ view you're in floats to the top.
 |-----------|------|
 | Global    | `?` help · `q` quit · `Esc` back · `j`/`k` move · `Enter` open · `Ctrl-P` find · `H` repos · `y` yank |
 | Repos     | `Enter` open repo · `c` review changes · `o` open in browser |
-| Changes   | `Space` stage/unstage · `a` stage all · `c` commit · `P` push · `t` run CI · `r` refresh |
+| Changes   | `d`/`Enter` diff the file · `Space` stage/unstage · `a` stage all · `c` commit · `P` push · `t` run CI · `r` refresh |
+| Diff      | `j`/`k` scroll · `d`/`u` page · `g`/`G` top/bottom · `n`/`p` next/prev file · `Space` stage/unstage |
 | Workflows | `t` trigger · `w` watch · `o` open in browser |
 | Runs      | `t` trigger · `r` rerun · `R` rerun-failed · `x` cancel · `w` watch |
 | Run detail| `Enter`/`l` open logs · `D` diff vs last success |
-| Logs      | `j`/`k` scroll · `d`/`u` page · `g`/`G` top/bottom · `n`/`p` next/prev step · `a` all steps · `/` search · `e`/`E` next/prev error · `F` focus |
+| Logs      | `j`/`k` scroll · `d`/`u` page · `g`/`G` top/bottom · `n`/`p` next/prev step · `a` all steps · `/` search · `e`/`E` next/prev error · `F` focus · `Enter` expand a fold |
 | Trigger   | `i`/`Enter` edit field · `Space` cycle choice · `t` submit |
 
 All keys are remappable in `config.toml` (see [Config](#config)).
@@ -219,6 +231,7 @@ git_stage = "Space"
 git_stage_all = "a"
 git_commit = "c"
 git_push = "P"
+git_diff = "d"
 log_focus = "F"
 next_error = "e"
 prev_error = "E"

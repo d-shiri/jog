@@ -167,6 +167,28 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// Run a diff-producing git command in `dir`.
+///
+/// Separate from `git` because a diff exits 1 to mean "there were differences"
+/// rather than to report an error — `--no-index` does this on every non-empty
+/// diff — so exit 1 has to count as success here and only here.
+fn git_diff_cmd(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .with_context(|| format!("run git {}", args.join(" ")))?;
+    match out.status.code() {
+        Some(0) | Some(1) => Ok(String::from_utf8_lossy(&out.stdout).to_string()),
+        _ => {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Err(anyhow!("git {}: {}", args.join(" "), first_line(&err)))
+        }
+    }
+}
+
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("failed").to_string()
 }
@@ -287,6 +309,55 @@ pub fn push(dir: &Path, branch: &str, has_upstream: bool) -> Result<String> {
     })
 }
 
+/// One `git diff` invocation's output, labelled with what it compared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffSection {
+    pub label: &'static str,
+    pub text: String,
+}
+
+/// Flags shared by every diff we run: no colour codes to strip back out, and no
+/// user-configured external differ, whose output would be anything at all.
+const DIFF_FLAGS: [&str; 3] = ["diff", "--no-color", "--no-ext-diff"];
+
+/// The diff for one working-tree entry, split into the parts that actually
+/// exist: what is staged, what is not, or — for a file git has never seen — its
+/// whole content.
+///
+/// A file that is staged *and* further modified yields both sections, because
+/// "what am I about to commit" and "what would I still be leaving behind" are
+/// different questions and the status view shows the file only once.
+pub fn file_diff(dir: &Path, entry: &StatusEntry) -> Result<Vec<DiffSection>> {
+    let mut out = Vec::new();
+    let mut section = |label: &'static str, args: &[&str]| -> Result<()> {
+        let mut argv: Vec<&str> = DIFF_FLAGS.to_vec();
+        argv.extend_from_slice(args);
+        let text = git_diff_cmd(dir, &argv)?;
+        if !text.trim().is_empty() {
+            out.push(DiffSection { label, text });
+        }
+        Ok(())
+    };
+
+    if entry.is_untracked() {
+        // Plain `git diff` cannot see an untracked file at all. Diffing it
+        // against /dev/null renders it as one big addition — and still prints
+        // "Binary files differ" rather than dumping bytes into the terminal.
+        section(
+            "untracked — entire file",
+            &["--no-index", "--", "/dev/null", &entry.path],
+        )?;
+        return Ok(out);
+    }
+    if entry.is_staged() {
+        section("staged — index vs HEAD", &["--cached", "--", &entry.path])?;
+    }
+    if entry.worktree != ' ' {
+        section("unstaged — working tree vs index", &["--", &entry.path])?;
+    }
+    Ok(out)
+}
+
 /// Short SHA of HEAD, for reporting what was just committed.
 pub fn head_sha(dir: &Path) -> Result<String> {
     Ok(git(dir, &["rev-parse", "--short", "HEAD"])?
@@ -388,6 +459,83 @@ mod tests {
         assert!(!parse_status("## feature/x\0").detached);
     }
 
+    /// A throwaway repo with an identity of its own, so the test does not
+    /// depend on (or touch) whatever git config the machine has.
+    fn scratch_repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("jog-diff-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "jog test"],
+        ] {
+            git(&dir, &args).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn diff_separates_what_is_staged_from_what_is_not() {
+        let dir = scratch_repo("split");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&dir, &["add", "a.txt"]).unwrap();
+        git(&dir, &["commit", "-qm", "init"]).unwrap();
+
+        // Stage one edit, then make a second one on top of it: the file is a
+        // single status row but two genuinely different diffs.
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        git(&dir, &["add", "a.txt"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "three\n").unwrap();
+
+        let status = status(&dir).unwrap();
+        let entry = status.entries.iter().find(|e| e.path == "a.txt").unwrap();
+        let sections = file_diff(&dir, entry).unwrap();
+        assert_eq!(sections.len(), 2);
+        assert!(sections[0].label.starts_with("staged"));
+        assert!(sections[0].text.contains("+two"));
+        assert!(sections[1].label.starts_with("unstaged"));
+        assert!(sections[1].text.contains("+three"));
+        assert!(sections[1].text.contains("-two"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn untracked_file_diffs_as_all_additions() {
+        let dir = scratch_repo("untracked");
+        std::fs::write(dir.join("new.txt"), "hello\n").unwrap();
+        let status = status(&dir).unwrap();
+        let entry = &status.entries[0];
+        assert!(entry.is_untracked());
+
+        // Plain `git diff` shows nothing for an untracked file, and the
+        // `--no-index` call it needs instead exits 1 — which must not read as
+        // a failure.
+        let sections = file_diff(&dir, entry).unwrap();
+        assert_eq!(sections.len(), 1);
+        assert!(sections[0].text.contains("+hello"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binary_file_reports_rather_than_dumps() {
+        let dir = scratch_repo("binary");
+        std::fs::write(dir.join("q.png"), [0u8, 159, 146, 150, 0, 1, 2]).unwrap();
+        git(&dir, &["add", "q.png"]).unwrap();
+        git(&dir, &["commit", "-qm", "init"]).unwrap();
+        std::fs::write(dir.join("q.png"), [0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+
+        let status = status(&dir).unwrap();
+        let sections = file_diff(&dir, &status.entries[0]).unwrap();
+        // Raw bytes in the terminal would wreck the alternate screen.
+        assert!(sections[0].text.contains("Binary files"));
+        assert!(!sections[0].text.contains('\u{9f}'));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn discover_skips_nested_and_noise() {
         let tmp = std::env::temp_dir().join(format!("jog-ws-test-{}", std::process::id()));
@@ -403,11 +551,17 @@ mod tests {
             std::fs::create_dir_all(tmp.join(p)).unwrap();
         }
         let found = discover_workspace(&tmp);
-        let names: Vec<String> = found
+        // Compared as paths, not strings: the separator is `\` on Windows, so a
+        // hardcoded "group/beta" fails there for a reason that has nothing to do
+        // with what this test is checking.
+        let names: Vec<PathBuf> = found
             .iter()
-            .map(|p| p.strip_prefix(&tmp).unwrap().to_string_lossy().into_owned())
+            .map(|p| p.strip_prefix(&tmp).unwrap().to_path_buf())
             .collect();
-        assert_eq!(names, vec!["alpha".to_string(), "group/beta".to_string()]);
+        assert_eq!(
+            names,
+            vec![PathBuf::from("alpha"), ["group", "beta"].iter().collect::<PathBuf>()]
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

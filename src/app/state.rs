@@ -39,6 +39,7 @@ pub fn build_detail_items(detail: &RunDetail) -> Vec<DetailItem> {
 pub enum View {
     Repos,
     GitStatus,
+    GitDiff,
     Workflows,
     Runs,
     RunDetail,
@@ -89,6 +90,85 @@ impl GitView {
 
     pub fn staged_count(&self) -> usize {
         self.status.as_ref().map(|s| s.staged_count()).unwrap_or(0)
+    }
+}
+
+/// One line of a file diff. Section banners are kept apart from the diff text so
+/// styling never has to guess which is which from the characters alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffLine {
+    Section(String),
+    Text(String),
+}
+
+/// The diff for a single file, opened from the working-tree view.
+#[derive(Debug, Clone)]
+pub struct GitDiffView {
+    /// Repo the diff was requested for. A response that arrives after the user
+    /// has moved on to another repo is dropped rather than shown under the
+    /// wrong heading.
+    pub spec: String,
+    pub file: String,
+    pub lines: Vec<DiffLine>,
+    pub scroll: usize,
+    pub loading: bool,
+}
+
+impl GitDiffView {
+    pub fn new(spec: String, file: String) -> Self {
+        Self {
+            spec,
+            file,
+            lines: Vec::new(),
+            scroll: 0,
+            loading: true,
+        }
+    }
+
+    /// Flatten git's output into display lines, banner-per-section.
+    ///
+    /// The banner is dropped when there is only one section: with nothing to
+    /// tell apart, it is a row of screen space that says nothing.
+    pub fn set_sections(&mut self, sections: Vec<crate::git::DiffSection>) {
+        self.loading = false;
+        self.scroll = 0;
+        self.lines.clear();
+        let labelled = sections.len() > 1;
+        for (i, s) in sections.iter().enumerate() {
+            if labelled {
+                if i > 0 {
+                    self.lines.push(DiffLine::Text(String::new()));
+                }
+                self.lines.push(DiffLine::Section(s.label.to_string()));
+            }
+            for line in s.text.lines() {
+                self.lines.push(DiffLine::Text(line.to_string()));
+            }
+        }
+    }
+
+    /// Added and removed line counts, for the title.
+    ///
+    /// `+++`/`---` are file headers, not content, and would otherwise add a
+    /// phantom insertion and deletion to every file.
+    pub fn stats(&self) -> (usize, usize) {
+        self.lines.iter().fold((0, 0), |(add, del), l| match l {
+            DiffLine::Text(t) if t.starts_with("+++") || t.starts_with("---") => (add, del),
+            DiffLine::Text(t) if t.starts_with('+') => (add + 1, del),
+            DiffLine::Text(t) if t.starts_with('-') => (add, del + 1),
+            _ => (add, del),
+        })
+    }
+
+    /// Largest useful scroll offset: stop when the last line reaches the top of
+    /// the viewport, so scrolling never runs off into empty space.
+    pub fn max_scroll(&self, viewport: usize) -> usize {
+        self.lines.len().saturating_sub(viewport.max(1))
+    }
+
+    pub fn scroll_by(&mut self, delta: isize, viewport: usize) {
+        let next = self.scroll as isize + delta;
+        self.scroll = next.clamp(0, self.max_scroll(viewport) as isize) as usize;
     }
 }
 
@@ -401,6 +481,13 @@ pub struct AppState {
     /// of surrounding context, ignoring group collapse state.
     pub log_focus: bool,
     pub log_focus_context: usize,
+    /// Fold markers standing in for skipped lines while focused: rendered row ->
+    /// how many source lines it hides.
+    pub log_fold_rows: HashMap<u16, usize>,
+    /// Source line each fold starts at, for folds the user has opened back up.
+    /// Two lines of context is enough to spot an error and never enough to
+    /// understand it, so the surrounding block has to be one keypress away.
+    pub log_focus_expanded: HashSet<usize>,
     /// Indices into `log_lines` that look like errors — the jump targets for
     /// next/prev-error and the seeds for focus mode.
     pub log_error_lines: Vec<usize>,
@@ -462,6 +549,11 @@ pub struct AppState {
     pub finder: Option<Finder>,
     /// Working-tree view for the repo we drilled into from the dashboard.
     pub git_view: Option<GitView>,
+    /// Diff for the file drilled into from the working-tree view.
+    pub git_diff: Option<GitDiffView>,
+    /// Rows the diff pane last drew, so paging and clamping match what is
+    /// actually on screen rather than a guess.
+    pub last_diff_viewport_height: Cell<u16>,
     /// Keybinding reference overlay.
     pub show_help: bool,
     pub help_scroll: u16,
@@ -499,6 +591,8 @@ impl AppState {
             log_rendered_group_map: HashMap::new(),
             log_focus: false,
             log_focus_context: 2,
+            log_fold_rows: HashMap::new(),
+            log_focus_expanded: HashSet::new(),
             log_error_lines: Vec::new(),
             log_warn_lines: Vec::new(),
             log_rendered_src: Vec::new(),
@@ -532,6 +626,8 @@ impl AppState {
             repo_cursor: 0,
             finder: None,
             git_view: None,
+            git_diff: None,
+            last_diff_viewport_height: Cell::new(0),
             show_help: false,
             help_scroll: 0,
             workspace_root: None,
@@ -574,6 +670,10 @@ impl AppState {
         let (errors, warnings) = classify_log_severity(&self.log_lines);
         self.log_error_lines = errors;
         self.log_warn_lines = warnings;
+        // Folds are opened by source line, which means nothing once the source
+        // is a different step's log.
+        self.log_focus_expanded.clear();
+        self.log_fold_rows.clear();
         // Focus mode survives a step change, but with nothing to focus on it
         // would hide every line and leave a blank pane with no explanation.
         if self.log_error_lines.is_empty() && self.log_warn_lines.is_empty() {
@@ -610,9 +710,53 @@ impl AppState {
                 keep.insert(l);
             }
         }
-        (0..self.log_lines.len())
+        let mut hidden: HashSet<usize> = (0..self.log_lines.len())
             .filter(|i| !keep.contains(i))
-            .collect()
+            .collect();
+        // A fold the user opened stays open: walk each contiguous hidden run and
+        // release the whole run if its first line is one they asked for.
+        if !self.log_focus_expanded.is_empty() {
+            for run in self.hidden_runs(&hidden) {
+                if self.log_focus_expanded.contains(&run.0) {
+                    for l in run.0..=run.1 {
+                        hidden.remove(&l);
+                    }
+                }
+            }
+        }
+        hidden
+    }
+
+    /// Contiguous `(first, last)` spans of hidden source lines, in order.
+    fn hidden_runs(&self, hidden: &HashSet<usize>) -> Vec<(usize, usize)> {
+        let mut runs = Vec::new();
+        let mut start: Option<usize> = None;
+        for i in 0..self.log_lines.len() {
+            match (hidden.contains(&i), start) {
+                (true, None) => start = Some(i),
+                (false, Some(s)) => {
+                    runs.push((s, i - 1));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            runs.push((s, self.log_lines.len() - 1));
+        }
+        runs
+    }
+
+    /// Open the fold under `row`, if that row is one. Returns whether anything
+    /// changed, so the caller knows whether to re-render.
+    pub fn expand_fold_at(&mut self, row: u16) -> bool {
+        if !self.log_fold_rows.contains_key(&row) {
+            return false;
+        }
+        match self.log_rendered_src.get(row as usize).copied() {
+            Some(anchor) => self.log_focus_expanded.insert(anchor),
+            None => false,
+        }
     }
 
     /// How many screen rows rendered line `row` occupies once wrapped.
@@ -837,13 +981,34 @@ impl AppState {
         let mut rendered_src: Vec<usize> = Vec::with_capacity(self.log_lines.len());
         let mut group_header_rows = vec![0u16; self.log_groups.len()];
         let mut group_map: HashMap<u16, usize> = HashMap::new();
+        let mut fold_rows: HashMap<u16, usize> = HashMap::new();
         let mut rendered_row: u16 = 0;
+        // Run of consecutive dropped lines, tracked only while focused, which
+        // becomes one "N lines hidden" row. Without it the filtered log is a
+        // stack of fragments with no sign of the distance between them.
+        //
+        // Only *hidden* lines count and only a hidden line can anchor the fold:
+        // an `##[endgroup]` is dropped in every mode, so it is neither something
+        // the user is missing nor something opening the fold would bring back.
+        let mut skipped: Option<(usize, usize)> = None;
         for (src_idx, l) in self.log_lines.iter().enumerate() {
-            if hidden.contains(&src_idx) {
+            let is_endgroup = split_time_prefix(l.as_str()).1.starts_with("##[endgroup]");
+            if hidden.contains(&src_idx) || is_endgroup {
+                if self.log_focus && hidden.contains(&src_idx) {
+                    skipped = match skipped {
+                        Some((first, n)) => Some((first, n + 1)),
+                        None => Some((src_idx, 1)),
+                    };
+                }
                 continue;
             }
-            if split_time_prefix(l.as_str()).1.starts_with("##[endgroup]") {
-                continue;
+            if let Some((first, n)) = skipped.take() {
+                fold_rows.insert(rendered_row, n);
+                // The fold points at the first line it swallowed, so opening it
+                // has an anchor and a jump into hidden text lands on the fold
+                // that contains it rather than nowhere.
+                rendered_src.push(first);
+                rendered_row += 1;
             }
             if let Some(&gi) = header_to_group.get(&src_idx) {
                 group_header_rows[gi] = rendered_row;
@@ -852,15 +1017,30 @@ impl AppState {
             rendered_src.push(src_idx);
             rendered_row += 1;
         }
+        // A log that ends in skipped lines still has to say so, or focus mode
+        // looks like it stopped early.
+        if let Some((first, n)) = skipped.take() {
+            fold_rows.insert(rendered_row, n);
+            rendered_src.push(first);
+        }
 
         // Pass 2 (parallel): the expensive part — ANSI parsing and span
         // splitting per line, which is independent for every row. `par_iter`
         // preserves order, so row indices stay aligned with pass 1.
         let collapsed = &self.log_collapsed;
         let lines = &self.log_lines;
+        let folds = &fold_rows;
         let rendered: Vec<Line<'static>> = rendered_src
             .par_iter()
-            .map(|&src_idx| {
+            .enumerate()
+            .map(|(row, &src_idx)| {
+                if let Some(&n) = folds.get(&(row as u16)) {
+                    let plural = if n == 1 { "line" } else { "lines" };
+                    return Line::from(Span::styled(
+                        format!("  ⋯ {n} {plural} hidden — ↵ to show ⋯"),
+                        Style::default().fg(Color::Rgb(105, 105, 135)).italic(),
+                    ));
+                }
                 let l = &lines[src_idx];
                 let (time, content) = split_time_prefix(l.as_str());
                 let mk_time = || time.map(|t| Span::styled(format!("{t} "), time_style));
@@ -954,6 +1134,7 @@ impl AppState {
         self.log_rendered_src = rendered_src;
         self.log_group_header_rows = group_header_rows;
         self.log_rendered_group_map = group_map;
+        self.log_fold_rows = fold_rows;
     }
 }
 
@@ -1024,6 +1205,30 @@ pub fn wrapped_rows(text: &str, width: usize) -> u16 {
 /// Actions `##[error]` / `##[warning]` markup, and plain lines that *start* with
 /// an error-ish word. Keeping the two in step means focus mode shows exactly the
 /// lines that are painted red or yellow — no more, no less.
+/// Lines a test harness prints when something fails, which the leading-keyword
+/// rule misses entirely.
+///
+/// Without these, a failing `cargo test` step registers exactly one error — the
+/// `error: test failed, to rerun pass …` line the tail — so jumping to "the
+/// error" lands *below* the panic message and focus mode folds the assertion
+/// away. The diagnosis is the part worth landing on.
+fn is_test_failure(trimmed: &str) -> bool {
+    // `test result: FAILED.`, `test some::case ... FAILED`, and pytest's
+    // `FAILED tests/x.py::y` (already caught by the `failed` prefix rule).
+    if trimmed.ends_with("FAILED") || trimmed.starts_with("test result: FAILED") {
+        return true;
+    }
+    // Rust's panic header and the assertion line under it.
+    if trimmed.contains("panicked at") {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    // `failures:` — the header over the list of what broke. Not caught by the
+    // `failed` prefix: the word is "failures".
+    lower.starts_with("failures:")
+        || (lower.starts_with("assertion") && lower.contains("failed"))
+}
+
 pub fn classify_log_severity(lines: &[String]) -> (Vec<usize>, Vec<usize>) {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
@@ -1048,8 +1253,9 @@ pub fn classify_log_severity(lines: &[String]) -> (Vec<usize>, Vec<usize>) {
         } else {
             content.to_string()
         };
-        let lower = plain.trim_start().to_lowercase();
-        if lower.starts_with("error") || lower.starts_with("failed") {
+        let trimmed = plain.trim();
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("error") || lower.starts_with("failed") || is_test_failure(trimmed) {
             errors.push(i);
         } else if lower.starts_with("warn") {
             warnings.push(i);
@@ -1302,6 +1508,77 @@ mod tests {
 
     fn lines(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn section(label: &'static str, text: &str) -> crate::git::DiffSection {
+        crate::git::DiffSection { label, text: text.to_string() }
+    }
+
+    #[test]
+    fn a_single_diff_section_is_not_labelled() {
+        let mut dv = GitDiffView::new("acme/api".into(), "src/a.rs".into());
+        dv.set_sections(vec![section("unstaged", "@@ -1 +1 @@\n-a\n+b\n")]);
+        assert!(!dv.loading);
+        // With nothing to tell it apart from, a banner is a wasted row.
+        assert!(!dv.lines.iter().any(|l| matches!(l, DiffLine::Section(_))));
+        assert_eq!(dv.lines.len(), 3);
+    }
+
+    #[test]
+    fn staged_and_unstaged_halves_are_kept_apart() {
+        let mut dv = GitDiffView::new("acme/api".into(), "src/a.rs".into());
+        dv.set_sections(vec![
+            section("staged", "+one\n"),
+            section("unstaged", "+two\n"),
+        ]);
+        let banners: Vec<&String> = dv
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                DiffLine::Section(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(banners, vec!["staged", "unstaged"]);
+        assert_eq!(dv.stats(), (2, 0));
+    }
+
+    #[test]
+    fn stats_ignore_the_file_headers() {
+        let mut dv = GitDiffView::new("acme/api".into(), "src/a.rs".into());
+        dv.set_sections(vec![section(
+            "unstaged",
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n more\n",
+        )]);
+        // `---`/`+++` name the files; counting them would add a phantom +1/-1
+        // to every single file's summary.
+        assert_eq!(dv.stats(), (1, 1));
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_last_line() {
+        let mut dv = GitDiffView::new("acme/api".into(), "src/a.rs".into());
+        dv.set_sections(vec![section(
+            "unstaged",
+            &(0..50).map(|i| format!("+{i}\n")).collect::<String>(),
+        )]);
+        dv.scroll_by(1000, 10);
+        assert_eq!(dv.scroll, 40);
+        dv.scroll_by(-1000, 10);
+        assert_eq!(dv.scroll, 0);
+        // A diff shorter than the viewport cannot scroll at all.
+        assert_eq!(dv.max_scroll(100), 0);
+    }
+
+    #[test]
+    fn reloading_resets_the_offset() {
+        let mut dv = GitDiffView::new("acme/api".into(), "src/a.rs".into());
+        dv.set_sections(vec![section("unstaged", "+a\n+b\n+c\n+d\n")]);
+        dv.scroll = 3;
+        // Stepping to another file must start at its top, not wherever the
+        // previous file happened to be scrolled to.
+        dv.set_sections(vec![section("unstaged", "+z\n")]);
+        assert_eq!(dv.scroll, 0);
     }
 
 
@@ -1660,6 +1937,29 @@ mod tests {
     }
 
     #[test]
+    fn severity_catches_a_failing_cargo_test_run() {
+        // Verbatim from a real failing `cargo test` step. Only the last two
+        // lines match the leading-keyword rule, which puts every jump target
+        // below the panic — the one part that says what actually went wrong.
+        let ls = lines(&[
+            "test git::tests::discover_skips_nested_and_noise ... FAILED",
+            "test tui::tests::notify_modes_parse ... ok",
+            "failures:",
+            "---- git::tests::discover_skips_nested_and_noise stdout ----",
+            "thread 'git::tests::discover_skips_nested_and_noise' (6124) panicked at src\\git.rs:410:9:",
+            "assertion `left == right` failed",
+            "  left: [\"alpha\", \"group\\\\beta\"]",
+            "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+            "test result: FAILED. 75 passed; 1 failed; 1 ignored",
+            "error: test failed, to rerun pass `--bin jog`",
+        ]);
+        let (errors, _) = classify_log_severity(&ls);
+        assert_eq!(errors, vec![0, 2, 4, 5, 8, 9], "got {errors:?}");
+        // The passing test above all of it stays quiet.
+        assert!(!errors.contains(&1));
+    }
+
+    #[test]
     fn severity_requires_leading_keyword() {
         // Mirrors the renderer, which only paints a line red when the keyword
         // leads. A mention mid-sentence is prose, not a failure.
@@ -1698,6 +1998,123 @@ mod tests {
         let hidden = st.compute_hidden_lines();
         // Error at 3 keeps 2..=4; everything else is hidden.
         assert_eq!(hidden, [0usize, 1, 5, 6].into_iter().collect());
+    }
+
+    /// A log with a single error buried in the middle of a lot of noise — the
+    /// shape focus mode exists for.
+    fn buried_error(before: usize, after: usize) -> AppState {
+        let mut st = AppState::new(
+            "o/r".into(),
+            "main".into(),
+            Vec::new(),
+            KeymapConfig::default(),
+            History::default(),
+        );
+        let mut ls: Vec<String> = (0..before).map(|i| format!("noise {i}")).collect();
+        ls.push("##[error]boom".into());
+        ls.extend((0..after).map(|i| format!("tail {i}")));
+        st.log_lines = ls;
+        st.log_focus_context = 1;
+        st.init_log_groups();
+        st.log_focus = true;
+        st.recompute_log_rendered();
+        st
+    }
+
+    fn fold_counts(st: &AppState) -> Vec<usize> {
+        let mut rows: Vec<(u16, usize)> = st.log_fold_rows.iter().map(|(&r, &n)| (r, n)).collect();
+        rows.sort();
+        rows.into_iter().map(|(_, n)| n).collect()
+    }
+
+    #[test]
+    fn focus_folds_report_what_they_swallowed() {
+        let st = buried_error(100, 50);
+        // Context 1 keeps lines 99..=101, so 99 lines fold above and 49 below.
+        assert_eq!(fold_counts(&st), vec![99, 49]);
+        // Three kept lines plus the two fold markers.
+        assert_eq!(st.log_rendered.len(), 5);
+        let first = line_text(&st.log_rendered[0]);
+        assert!(first.contains("99 lines hidden"), "got {first:?}");
+    }
+
+    #[test]
+    fn folds_appear_only_while_focused() {
+        let mut st = buried_error(10, 10);
+        st.log_focus = false;
+        st.recompute_log_rendered();
+        // Unfocused, nothing is elided, so a marker would be a lie.
+        assert!(st.log_fold_rows.is_empty());
+        assert_eq!(st.log_rendered.len(), 21);
+    }
+
+    #[test]
+    fn opening_a_fold_reveals_exactly_that_run() {
+        let mut st = buried_error(20, 20);
+        // Row 0 is the fold above the error; row 2 (after fold + context) is
+        // where the error sits, and the trailing fold is last.
+        assert!(st.expand_fold_at(0));
+        st.recompute_log_rendered();
+        assert_eq!(fold_counts(&st), vec![19], "only the trailing fold is left");
+        // The 19 lines above came back; the 19 below did not.
+        assert_eq!(st.log_rendered.len(), 19 + 3 + 1);
+    }
+
+    #[test]
+    fn a_fold_next_to_group_markup_still_opens() {
+        let mut st = AppState::new(
+            "o/r".into(),
+            "main".into(),
+            Vec::new(),
+            KeymapConfig::default(),
+            History::default(),
+        );
+        // `##[endgroup]` is dropped in every mode, so it must not become the
+        // fold's anchor — anchored there, opening the fold would unhide nothing
+        // and `↵` would look broken.
+        let mut ls = vec!["##[group]build".to_string(), "##[error]boom".into()];
+        ls.push("##[endgroup]".into());
+        ls.extend((0..10).map(|i| format!("tail {i}")));
+        st.log_lines = ls;
+        st.log_focus_context = 1;
+        st.init_log_groups();
+        st.log_focus = true;
+        st.recompute_log_rendered();
+
+        let fold_row = *st.log_fold_rows.keys().next().expect("a fold exists");
+        assert!(st.expand_fold_at(fold_row));
+        st.recompute_log_rendered();
+        assert!(st.log_fold_rows.is_empty(), "the fold opened");
+    }
+
+    #[test]
+    fn a_normal_row_is_not_a_fold() {
+        let mut st = buried_error(20, 20);
+        // The error line itself: expanding it must not silently unhide a run.
+        let err_row = st.rendered_row_for_src(20).unwrap();
+        assert!(!st.expand_fold_at(err_row));
+    }
+
+    #[test]
+    fn opened_folds_do_not_survive_a_new_log() {
+        let mut st = buried_error(20, 20);
+        st.expand_fold_at(0);
+        st.log_lines = lines(&["##[error]other", "x"]);
+        st.init_log_groups();
+        // Fold anchors are source line numbers; against another step's log they
+        // would unhide arbitrary lines.
+        assert!(st.log_focus_expanded.is_empty());
+        assert!(st.log_fold_rows.is_empty());
+    }
+
+    #[test]
+    fn a_log_ending_in_noise_still_says_how_much() {
+        // The trailing run has no following visible line to trigger the flush,
+        // so without an explicit end-of-loop flush focus mode just stops.
+        let st = buried_error(1, 40);
+        assert_eq!(fold_counts(&st), vec![39]);
+        let last = line_text(st.log_rendered.last().unwrap());
+        assert!(last.contains("39 lines hidden"), "got {last:?}");
     }
 
     #[test]

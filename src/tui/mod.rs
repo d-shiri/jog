@@ -43,6 +43,8 @@ pub enum AppEvent {
     RepoCardFailed(String, String),
     /// Working-tree state for a local checkout.
     GitStatusLoaded(String, crate::git::RepoStatus),
+    /// The diff for one file: repo spec, path, and one section per comparison.
+    GitDiffLoaded(String, String, Vec<crate::git::DiffSection>),
     /// A git command finished. `Some(msg)` reports success, `Err` the failure;
     /// either way the status is refreshed afterwards.
     GitOpDone(String, Result<String, String>),
@@ -388,6 +390,7 @@ async fn event_loop(
                         state.log_scroll = 0;
                         state.init_log_groups();
                         state.recompute_log_rendered();
+                        land_on_first_error(state);
                         state.pending = state.pending.saturating_sub(1);
                     }
                     AppEvent::RepoCardLoaded(spec, runs) => {
@@ -425,6 +428,18 @@ async fn event_loop(
                         }
                         state.pending = state.pending.saturating_sub(1);
                     }
+                    AppEvent::GitDiffLoaded(spec, file, sections) => {
+                        // Only fold in a diff that still matches what the view
+                        // is asking for: cycling files quickly can land two
+                        // responses out of order.
+                        if let Some(dv) = state.git_diff.as_mut()
+                            && dv.spec == spec
+                            && dv.file == file
+                        {
+                            dv.set_sections(sections);
+                        }
+                        state.pending = state.pending.saturating_sub(1);
+                    }
                     AppEvent::GitOpDone(spec, result) => {
                         if let Some(gv) = state.git_view.as_mut()
                             && gv.spec == spec
@@ -440,6 +455,12 @@ async fn event_loop(
                         if let Some(gv) = state.git_view.as_ref() {
                             let (spec, path) = (gv.spec.clone(), gv.path.clone());
                             spawn_git_status(spec, path, tx.clone(), state);
+                        }
+                        // Staging splits a file's changes differently between
+                        // index and working tree, so an open diff of it is now
+                        // describing the old arrangement.
+                        if state.git_diff.is_some() {
+                            open_git_diff(state, &tx);
                         }
                     }
                     AppEvent::RepoSwitched { label, branch, workflows } => {
@@ -637,7 +658,14 @@ async fn handle_key(
             View::Repos => return Some(AppEvent::Quit),
             View::GitStatus => {
                 state.git_view = None;
+                // Leaving the repo entirely also drops any diff of its files,
+                // so re-entering never opens on the previous repo's contents.
+                state.git_diff = None;
                 state.switch_view(View::Repos);
+            }
+            View::GitDiff => {
+                state.git_diff = None;
+                state.switch_view(View::GitStatus);
             }
             // The dashboard is "above" the workflow list, so back steps up to it
             // when there is one to step up to.
@@ -710,6 +738,7 @@ async fn handle_key(
                 .as_ref()
                 .and_then(|g| g.selected())
                 .map(|e| e.path.clone()),
+            View::GitDiff => state.git_diff.as_ref().map(|d| d.file.clone()),
             View::Workflows => state.selected_workflow().map(|w| w.file_name.clone()),
             View::Runs | View::Watch => state
                 .run_detail.as_ref().map(|d| d.run.url.clone())
@@ -766,6 +795,11 @@ async fn handle_key(
                 if let Some(g) = state.git_view.as_mut() {
                     move_cursor(&mut g.cursor, len, -1);
                 }
+            } else if key_is(&key, km.git_diff)
+                || key_is(&key, km.confirm)
+                || key.code == KeyCode::Enter
+            {
+                open_git_diff(state, tx);
             } else if key_is(&key, km.git_stage) {
                 toggle_stage_at_cursor(state, tx);
             } else if key_is(&key, km.git_stage_all) {
@@ -785,6 +819,45 @@ async fn handle_key(
                 // Hand off to CI: switch the app to this repo and show its
                 // workflows, where `t` triggers as usual.
                 switch_to_selected_repo(state, provider, tx);
+            }
+        }
+        View::GitDiff => {
+            let page = state.last_diff_viewport_height.get().max(1) as isize;
+            let viewport = state.last_diff_viewport_height.get() as usize;
+            if key_is(&key, km.down) || key.code == KeyCode::Down {
+                if let Some(d) = state.git_diff.as_mut() {
+                    d.scroll_by(1, viewport);
+                }
+            } else if key_is(&key, km.up) || key.code == KeyCode::Up {
+                if let Some(d) = state.git_diff.as_mut() {
+                    d.scroll_by(-1, viewport);
+                }
+            } else if key_is(&key, km.page_down) || key.code == KeyCode::PageDown {
+                if let Some(d) = state.git_diff.as_mut() {
+                    d.scroll_by(page, viewport);
+                }
+            } else if key_is(&key, km.page_up) || key.code == KeyCode::PageUp {
+                if let Some(d) = state.git_diff.as_mut() {
+                    d.scroll_by(-page, viewport);
+                }
+            } else if key_is(&key, km.scroll_top) {
+                if let Some(d) = state.git_diff.as_mut() {
+                    d.scroll = 0;
+                }
+            } else if key_is(&key, km.scroll_bottom) {
+                if let Some(d) = state.git_diff.as_mut() {
+                    d.scroll = d.max_scroll(viewport);
+                }
+            } else if key_is(&key, km.next_step) {
+                step_diff_file(state, tx, 1);
+            } else if key_is(&key, km.prev_step) {
+                step_diff_file(state, tx, -1);
+            } else if key_is(&key, km.git_stage) {
+                // Staging from here is the whole point of reading the diff:
+                // decide, act, move on without a round trip through the list.
+                toggle_stage_at_cursor(state, tx);
+            } else if key_is(&key, km.git_refresh) {
+                open_git_diff(state, tx);
             }
         }
         View::Workflows => {
@@ -937,7 +1010,18 @@ async fn handle_key(
                 state.log_scroll = state.max_log_scroll();
             } else if key.code == KeyCode::Enter {
                 let cursor = state.log_line_cursor;
-                if let Some(&gi) = state.log_rendered_group_map.get(&cursor) {
+                if state.expand_fold_at(cursor) {
+                    // Keep the eye where it was: the revealed lines push
+                    // everything below down, so hold the line that was under
+                    // the cursor rather than the row number.
+                    let anchor = state.log_rendered_src.get(cursor as usize).copied();
+                    state.recompute_log_rendered();
+                    if let Some(row) = anchor.and_then(|s| state.rendered_row_for_src(s)) {
+                        state.log_line_cursor = row;
+                        state.keep_cursor_visible();
+                        state.recompute_log_rendered();
+                    }
+                } else if let Some(&gi) = state.log_rendered_group_map.get(&cursor) {
                     if state.log_collapsed.contains(&gi) {
                         state.log_collapsed.remove(&gi);
                     } else {
@@ -966,22 +1050,13 @@ async fn handle_key(
                     let n = state.log_step_line_starts.len();
                     let next = if let Some(cur) = state.log_section_idx { (cur + 1).min(n - 1) } else { 0 };
                     let extracted = extract_step_by_line_range(&state.log_raw, next, &state.log_step_line_starts);
-                    state.log_section_idx = Some(next);
-                    state.log_lines = extracted;
-                    state.log_scroll = 0;
-                    state.clear_log_search();
-                    state.init_log_groups();
-                    state.recompute_log_rendered();
+                    set_log_section(state, extracted, Some(next));
                 } else {
                     let n = state.log_sections.len();
                     if n > 0 {
                         let next = state.log_section_idx.map(|i| (i + 1).min(n - 1)).unwrap_or(0);
-                        state.log_section_idx = Some(next);
-                        state.log_lines = extract_log_section(&state.log_raw, next);
-                        state.log_scroll = 0;
-                        state.clear_log_search();
-                        state.init_log_groups();
-                        state.recompute_log_rendered();
+                        let extracted = extract_log_section(&state.log_raw, next);
+                        set_log_section(state, extracted, Some(next));
                     }
                 }
             } else if key_is(&key, km.prev_step) {
@@ -991,53 +1066,32 @@ async fn handle_key(
                     match state.log_section_idx {
                         None => {}
                         Some(0) => {
-                            state.log_section_idx = None;
-                            state.log_lines = state.log_raw.clone();
-                            state.log_scroll = 0;
-                            state.clear_log_search();
-                            state.init_log_groups();
-                            state.recompute_log_rendered();
+                            let all = state.log_raw.clone();
+                            set_log_section(state, all, None);
                         }
                         Some(current) => {
                             let prev = current - 1;
                             let extracted = extract_step_by_line_range(&state.log_raw, prev, &state.log_step_line_starts);
-                            state.log_section_idx = Some(prev);
-                            state.log_lines = extracted;
-                            state.log_scroll = 0;
-                            state.clear_log_search();
-                            state.init_log_groups();
-                            state.recompute_log_rendered();
+                            set_log_section(state, extracted, Some(prev));
                         }
                     }
                 } else {
                     match state.log_section_idx {
                         None => {}
                         Some(0) => {
-                            state.log_section_idx = None;
-                            state.log_lines = state.log_raw.clone();
-                            state.log_scroll = 0;
-                            state.clear_log_search();
-                            state.init_log_groups();
-                            state.recompute_log_rendered();
+                            let all = state.log_raw.clone();
+                            set_log_section(state, all, None);
                         }
                         Some(i) => {
                             let prev = i - 1;
-                            state.log_section_idx = Some(prev);
-                            state.log_lines = extract_log_section(&state.log_raw, prev);
-                            state.log_scroll = 0;
-                            state.clear_log_search();
-                            state.init_log_groups();
-                            state.recompute_log_rendered();
+                            let extracted = extract_log_section(&state.log_raw, prev);
+                            set_log_section(state, extracted, Some(prev));
                         }
                     }
                 }
             } else if key_is(&key, km.all_steps) {
-                state.log_section_idx = None;
-                state.log_lines = state.log_raw.clone();
-                state.log_scroll = 0;
-                state.clear_log_search();
-                state.init_log_groups();
-                state.recompute_log_rendered();
+                let all = state.log_raw.clone();
+                set_log_section(state, all, None);
             }
         }
         View::TriggerPrompt => {
@@ -1152,6 +1206,47 @@ fn toggle_log_focus(state: &mut AppState) {
         "focus off".into()
     };
     state.set_status(msg);
+}
+
+/// Swap the visible log for another step's lines and rebuild every index that
+/// hangs off them. Every step-navigation key funnels through here so they all
+/// land the same way.
+fn set_log_section(state: &mut AppState, lines: Vec<String>, section: Option<usize>) {
+    state.log_section_idx = section;
+    state.log_lines = lines;
+    state.log_scroll = 0;
+    state.clear_log_search();
+    state.init_log_groups();
+    state.recompute_log_rendered();
+    land_on_first_error(state);
+}
+
+/// Open a freshly loaded log at its first error rather than at line 1.
+///
+/// The error is the reason the log was opened, and on a several-thousand-line
+/// step it is nowhere near the top — landing there and making the user hunt for
+/// it is the slow path. A log with no errors is left at the top, where reading
+/// from the beginning is the point.
+fn land_on_first_error(state: &mut AppState) {
+    let Some(&first) = state.log_error_lines.first() else {
+        return;
+    };
+    if let Some(gi) = state.group_containing(first) {
+        state.log_collapsed.remove(&gi);
+        state.recompute_log_rendered();
+    }
+    if let Some(row) = state.rendered_row_for_src(first) {
+        state.log_line_cursor = row;
+        state.center_cursor();
+        state.recompute_log_rendered();
+    }
+    let n = state.log_error_lines.len();
+    state.set_status(format!(
+        "{n} error{} — opened at the first ({}/{} of the log) · e/E cycle · F fold the rest · g top",
+        if n == 1 { "" } else { "s" },
+        first + 1,
+        state.log_lines.len(),
+    ));
 }
 
 /// Move the cursor to the next (`dir > 0`) or previous error line, wrapping at
@@ -1301,7 +1396,7 @@ fn open_finder(state: &mut AppState) {
                 .collect();
             Finder::new(FinderKind::GitEntries, items)
         }),
-        View::Logs | View::Diff | View::TriggerPrompt => None,
+        View::GitDiff | View::Logs | View::Diff | View::TriggerPrompt => None,
     };
     match finder {
         Some(f) if !f.items.is_empty() => state.finder = Some(f),
@@ -1599,6 +1694,7 @@ struct Keymap {
     git_commit: (KeyCode, KeyModifiers),
     git_push: (KeyCode, KeyModifiers),
     git_refresh: (KeyCode, KeyModifiers),
+    git_diff: (KeyCode, KeyModifiers),
     trigger: (KeyCode, KeyModifiers),
     watch: (KeyCode, KeyModifiers),
     open_browser: (KeyCode, KeyModifiers),
@@ -1694,6 +1790,7 @@ fn resolve_keymap(cfg: &KeymapConfig) -> Result<Keymap> {
         git_commit:    parse_key(&cfg.git_commit)?,
         git_push:      parse_key(&cfg.git_push)?,
         git_refresh:   parse_key(&cfg.git_refresh)?,
+        git_diff:      parse_key(&cfg.git_diff)?,
         trigger:       parse_key(&cfg.trigger)?,
         watch:         parse_key(&cfg.watch)?,
         open_browser:  parse_key(&cfg.open_browser)?,
@@ -1803,6 +1900,16 @@ fn compute_step_line_starts(raw: &[String], steps: &[Step]) -> (Vec<usize>, Vec<
             continue;
         }
 
+        // A skipped step ran nothing and printed nothing, so it must not consume
+        // a group header — the next step that really ran emitted that header,
+        // and letting the skipped one claim it leaves the real step with an
+        // empty log. Resolved to the following step's start below.
+        if step.status == Status::Skipped {
+            starts.push(SKIPPED_START);
+            names.push(step.name.clone());
+            continue;
+        }
+
         // Primary: find the first "Run …"-prefixed group at or after group_cursor with
         // timestamp >= this step's start.  "Run " groups are the canonical step-entry
         // markers emitted by the runner for every uses:/run: step.
@@ -1837,9 +1944,79 @@ fn compute_step_line_starts(raw: &[String], steps: &[Step]) -> (Vec<usize>, Vec<
         names.push(step.name.clone());
     }
 
+    resolve_skipped_starts(&mut starts, raw.len());
+    honour_end_of_step_markers(raw, &mut starts);
+
     let any_matched = starts.iter().any(|&l| l > 0)
         || steps.first().and_then(|s| s.started_at).is_some();
     if any_matched { (starts, names) } else { (Vec::new(), Vec::new()) }
+}
+
+/// Placeholder for a skipped step, replaced by the following step's start so
+/// the range comes out empty.
+const SKIPPED_START: usize = usize::MAX;
+
+/// Give every skipped step the start of the next step that actually ran, which
+/// makes its slice empty without shifting anything around it.
+fn resolve_skipped_starts(starts: &mut [usize], total_lines: usize) {
+    let mut next = total_lines;
+    for s in starts.iter_mut().rev() {
+        if *s == SKIPPED_START {
+            *s = next;
+        } else {
+            next = *s;
+        }
+    }
+}
+
+/// Push step boundaries past the runner's own "this step is over" line.
+///
+/// The API reports step times to the second, while a whole step's output can
+/// land inside one second — a `cargo test` run finishing at 09:59:58.388 and the
+/// next step starting at 09:59:58 are indistinguishable by timestamp. The
+/// timestamp fallback then hands the tail of a step to whatever came next
+/// (usually a *skipped* step, which owns no output at all), and the failure the
+/// user came to read disappears from the step that failed.
+///
+/// `##[error]Process completed with exit code N.` is the runner stating where
+/// the step actually ended, so no boundary may fall before it.
+fn honour_end_of_step_markers(raw: &[String], starts: &mut [usize]) {
+    for i in 0..starts.len() {
+        let from = starts[i];
+        // A step that already owns no lines has no output and therefore no
+        // marker of its own; scanning from here would find the *next* step's
+        // marker and drag every boundary past it.
+        if starts.get(i + 1).is_some_and(|&next| next <= from) {
+            continue;
+        }
+        // Stop at the next step's own `Run …` header: past that, any marker
+        // belongs to a later step and is not ours to claim.
+        let limit = starts[i + 1..]
+            .iter()
+            .copied()
+            .find(|&s| s > from && is_step_header(raw, s))
+            .unwrap_or(raw.len());
+        let Some(end) = (from..limit.min(raw.len()))
+            .find(|&j| strip_time_prefix(&raw[j]).contains("Process completed with exit code"))
+        else {
+            continue;
+        };
+        // Everything that was placed inside this step's output moves to just
+        // after the marker. Steps that owned nothing to begin with stay empty,
+        // they just collapse at the new boundary instead of the old one.
+        for s in starts[i + 1..].iter_mut() {
+            if *s <= end {
+                *s = (end + 1).min(raw.len());
+            }
+        }
+    }
+}
+
+fn is_step_header(raw: &[String], line: usize) -> bool {
+    raw.get(line).is_some_and(|l| {
+        let c = strip_ansi(strip_time_prefix(l));
+        c.starts_with("##[group]Run ") || c.starts_with("##[section]Run ")
+    })
 }
 
 fn find_raw_line_for_time(raw: &[String], hms: &str) -> usize {
@@ -2016,6 +2193,60 @@ fn spawn_git_status(
         };
         let _ = tx.send(evt);
     });
+}
+
+/// Show the diff for the file under the working-tree cursor.
+///
+/// Re-entrant on purpose: called again to move to another file, and after a
+/// stage/unstage to redraw what actually changed.
+fn open_git_diff(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
+    let Some(gv) = state.git_view.as_ref() else {
+        return;
+    };
+    let Some(entry) = gv.selected().cloned() else {
+        state.set_status("nothing to diff — the working tree is clean".into());
+        return;
+    };
+    let (spec, path) = (gv.spec.clone(), gv.path.clone());
+    // Keep the old text on screen while the new one loads: swapping to an empty
+    // pane and back makes fast `n`/`p` stepping flicker.
+    match state.git_diff.as_mut() {
+        Some(dv) if dv.spec == spec => {
+            dv.file = entry.path.clone();
+            dv.loading = true;
+        }
+        _ => {
+            state.git_diff = Some(crate::app::state::GitDiffView::new(
+                spec.clone(),
+                entry.path.clone(),
+            ))
+        }
+    }
+    state.switch_view(View::GitDiff);
+
+    let tx = tx.clone();
+    let file = entry.path.clone();
+    state.pending += 1;
+    tokio::task::spawn_blocking(move || {
+        let evt = match crate::git::file_diff(&path, &entry) {
+            Ok(sections) => AppEvent::GitDiffLoaded(spec, file, sections),
+            Err(e) => AppEvent::TaskError(format!("git diff: {e:#}")),
+        };
+        let _ = tx.send(evt);
+    });
+}
+
+/// Move to the next/previous changed file without leaving the diff.
+fn step_diff_file(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>, delta: i32) {
+    let Some(gv) = state.git_view.as_mut() else {
+        return;
+    };
+    let len = gv.entries().len();
+    if len == 0 {
+        return;
+    }
+    move_cursor(&mut gv.cursor, len, delta);
+    open_git_diff(state, tx);
 }
 
 /// Run one git mutation off-thread; the result refreshes the status view.
@@ -2781,6 +3012,117 @@ mod tests {
         );
     }
 
+    fn step(name: &str, status: Status, hms: &str) -> Step {
+        let (h, m, s) = (
+            hms[0..2].parse().unwrap(),
+            hms[3..5].parse().unwrap(),
+            hms[6..8].parse().unwrap(),
+        );
+        Step {
+            name: name.into(),
+            status,
+            started_at: {
+                use chrono::TimeZone;
+                chrono::Utc.with_ymd_and_hms(2026, 8, 3, h, m, s).single()
+            },
+            completed_at: None,
+        }
+    }
+
+    /// The shape of a real failing Windows `cargo test` job: the step's whole
+    /// tail — test results, panic, `##[error]Process completed` — lands inside
+    /// the same wall-clock second in which the next steps are reported to start.
+    fn failing_test_job() -> (Vec<String>, Vec<Step>) {
+        let mut raw = vec![
+            "09:57:21 Current runner version: '2.331.0'".to_string(),
+            "09:57:22 ##[group]Run actions/checkout@v4".to_string(),
+            "09:57:29 ##[endgroup]".to_string(),
+            "09:57:32 ##[group]Run cargo test --verbose".to_string(),
+        ];
+        raw.extend((0..20).map(|i| format!("09:57:5{} Downloaded crate {i}", i % 10)));
+        // Everything from here shares one second with the next step's start.
+        raw.push("09:59:58    Finished `test` profile in 2m 22s".into());
+        raw.push("09:59:58 test git::tests::x ... FAILED".into());
+        raw.push("09:59:58 failures:".into());
+        raw.push("09:59:58 assertion `left == right` failed".into());
+        raw.push("09:59:58 test result: FAILED. 75 passed; 1 failed".into());
+        raw.push("09:59:58 error: test failed, to rerun pass `--bin jog`".into());
+        raw.push("09:59:58 ##[error]Process completed with exit code 1.".into());
+        raw.push("09:59:58 Post job cleanup.".into());
+        raw.push("10:00:00 Cleaning up orphan processes".into());
+        let steps = vec![
+            step("Set up job", Status::Success, "09:57:21"),
+            step("Run actions/checkout@v4", Status::Success, "09:57:22"),
+            step("Run tests", Status::Failure, "09:57:32"),
+            // Skipped because the tests failed — it produced no output at all.
+            step("Build release", Status::Skipped, "09:59:58"),
+            step("Post Run actions/checkout@v4", Status::Success, "09:59:58"),
+            step("Complete job", Status::Success, "10:00:00"),
+        ];
+        (raw, steps)
+    }
+
+    #[test]
+    fn a_failing_step_keeps_its_own_failure_output() {
+        let (raw, steps) = failing_test_job();
+        let (starts, names) = compute_step_line_starts(&raw, &steps);
+        let idx = names.iter().position(|n| n == "Run tests").unwrap();
+        let slice = extract_step_by_line_range(&raw, idx, &starts);
+        let text = slice.join("\n");
+        // Second-granularity timestamps used to hand this tail to the *skipped*
+        // step that followed, truncating the failing step right before the part
+        // that says what failed.
+        assert!(text.contains("test result: FAILED"), "got:\n{text}");
+        assert!(text.contains("assertion"), "got:\n{text}");
+        assert!(text.contains("Process completed with exit code"), "got:\n{text}");
+        // And not the next step's business.
+        assert!(!text.contains("Post job cleanup"), "got:\n{text}");
+    }
+
+    #[test]
+    fn a_skipped_step_claims_no_output() {
+        let (raw, steps) = failing_test_job();
+        let (starts, names) = compute_step_line_starts(&raw, &steps);
+        let idx = names.iter().position(|n| n == "Build release").unwrap();
+        assert!(extract_step_by_line_range(&raw, idx, &starts).is_empty());
+    }
+
+    #[test]
+    fn a_skipped_step_does_not_steal_the_next_step_s_header() {
+        // `Install musl tools` is skipped on Windows, and its start time equals
+        // the *next* step's. Matching by timestamp alone hands it the
+        // `##[group]Run rustup target add …` header that belongs to `Add Rust
+        // target`, which is then left with nothing to show.
+        let raw = vec![
+            "09:57:21 Current runner version: '2.331.0'".to_string(),
+            "09:57:29 ##[group]Run rustup target add x86_64-pc-windows-msvc".to_string(),
+            "09:57:30   info: downloading component".to_string(),
+            "09:57:32 ##[endgroup]".to_string(),
+        ];
+        let steps = vec![
+            step("Set up job", Status::Success, "09:57:21"),
+            step("Install musl tools", Status::Skipped, "09:57:29"),
+            step("Add Rust target", Status::Success, "09:57:29"),
+        ];
+        let (starts, names) = compute_step_line_starts(&raw, &steps);
+        let idx = |n: &str| names.iter().position(|x| x == n).unwrap();
+        assert!(extract_step_by_line_range(&raw, idx("Install musl tools"), &starts).is_empty());
+        let added = extract_step_by_line_range(&raw, idx("Add Rust target"), &starts).join("\n");
+        assert!(added.contains("rustup target add"), "got:\n{added}");
+        assert!(added.contains("downloading component"), "got:\n{added}");
+    }
+
+    #[test]
+    fn steps_after_the_marker_still_get_their_lines() {
+        let (raw, steps) = failing_test_job();
+        let (starts, names) = compute_step_line_starts(&raw, &steps);
+        let post = names.iter().position(|n| n.starts_with("Post Run")).unwrap();
+        let text = extract_step_by_line_range(&raw, post, &starts).join("\n");
+        // Pushing boundaries past the end-of-step marker must not swallow what
+        // legitimately comes after it.
+        assert!(text.contains("Post job cleanup"), "got:\n{text}");
+    }
+
     #[test]
     fn parse_log_sections_strips_ansi_from_titles() {
         let raw = vec![
@@ -2838,3 +3180,4 @@ mod tests {
         assert!(!s1.iter().any(|l| l.contains("Outer A")));
     }
 }
+

@@ -151,6 +151,7 @@ pub struct KeymapConfig {
     pub git_commit: String,
     pub git_push: String,
     pub git_refresh: String,
+    pub git_diff: String,
     // workflow actions
     pub trigger: String,
     pub watch: String,
@@ -198,6 +199,7 @@ impl Default for KeymapConfig {
             git_commit: "c".into(),
             git_push: "P".into(),
             git_refresh: "r".into(),
+            git_diff: "d".into(),
             trigger: "t".into(),
             watch: "w".into(),
             open_browser: "o".into(),
