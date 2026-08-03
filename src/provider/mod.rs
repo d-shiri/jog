@@ -139,6 +139,10 @@ pub type LogStream = BoxStream<'static, Result<LogChunk>>;
 
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Workflows as the remote knows them. Used for repos we have no local
+    /// checkout of (the multi-repo dashboard); the local repo prefers
+    /// `discovery::discover_workflows`, which is a filesystem read.
+    async fn list_workflows(&self) -> Result<Vec<Workflow>>;
     async fn list_runs(&self, workflow_file: &str, limit: u8) -> Result<Vec<Run>>;
     async fn list_repo_runs(&self, limit: u8) -> Result<Vec<Run>>;
     async fn get_latest_run(&self, workflow_file: &str) -> Result<Option<Run>>;

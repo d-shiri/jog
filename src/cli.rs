@@ -34,4 +34,6 @@ pub enum Command {
         /// Workflow file name or fuzzy match on workflow name
         workflow: String,
     },
+    /// Multi-repo dashboard for every repo in `[provider] repos`
+    Repos,
 }

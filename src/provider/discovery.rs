@@ -57,19 +57,25 @@ struct WorkflowYaml {
 fn parse_workflow(path: &Path) -> Result<Workflow> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let parsed: WorkflowYaml = serde_yml::from_str(&raw)
-        .with_context(|| format!("parse YAML {}", path.display()))?;
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string();
-    let name = parsed.name.unwrap_or_else(|| file_name.clone());
+    parse_workflow_str(&raw, &file_name)
+}
+
+/// Parse workflow YAML that is already in memory. Used both for files on disk
+/// and for workflow contents fetched from the API for repos we have no checkout of.
+pub fn parse_workflow_str(raw: &str, file_name: &str) -> Result<Workflow> {
+    let parsed: WorkflowYaml =
+        serde_yml::from_str(raw).with_context(|| format!("parse YAML {file_name}"))?;
+    let name = parsed.name.unwrap_or_else(|| file_name.to_string());
     let triggerable = has_workflow_dispatch(parsed.on.as_ref());
     let inputs = parse_inputs(parsed.on.as_ref());
     Ok(Workflow {
         name,
-        file_name,
+        file_name: file_name.to_string(),
         triggerable,
         last_status: None,
         last_run_at: None,

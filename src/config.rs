@@ -17,6 +17,10 @@ pub struct ProviderConfig {
     #[serde(default = "default_provider_kind")]
     pub kind: String,
     pub repo: Option<String>,
+    /// Extra repos (`owner/name`) shown side by side in the multi-repo dashboard.
+    /// The active repo is always included, so listing it here is optional.
+    #[serde(default)]
+    pub repos: Vec<String>,
 }
 
 fn default_provider_kind() -> String {
@@ -39,6 +43,18 @@ pub struct UiConfig {
     /// Empty means use the bundled fail sound.
     #[serde(default)]
     pub fail_sound: String,
+    /// Which finished runs to announce: `always`, `failure`, or `never`.
+    #[serde(default = "default_notify")]
+    pub notify: String,
+    /// Play a sound when a run is announced.
+    #[serde(default = "default_true")]
+    pub notify_sound: bool,
+    /// Raise an OS desktop notification when a run is announced.
+    #[serde(default = "default_true")]
+    pub notify_desktop: bool,
+    /// Lines of surrounding context kept around each error/warning in log focus mode.
+    #[serde(default = "default_focus_context")]
+    pub log_focus_context: usize,
 }
 
 impl Default for UiConfig {
@@ -49,6 +65,30 @@ impl Default for UiConfig {
             favorites: Vec::new(),
             complete_sound: String::new(),
             fail_sound: String::new(),
+            notify: default_notify(),
+            notify_sound: true,
+            notify_desktop: true,
+            log_focus_context: default_focus_context(),
+        }
+    }
+}
+
+/// When a finished run should be announced (sound + desktop notification).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyMode {
+    Always,
+    Failure,
+    Never,
+}
+
+impl UiConfig {
+    /// Parse `ui.notify`. Unknown values fall back to `Always` rather than
+    /// failing the whole config — a typo shouldn't stop `jog` from starting.
+    pub fn notify_mode(&self) -> NotifyMode {
+        match self.notify.trim().to_lowercase().as_str() {
+            "never" | "off" | "none" => NotifyMode::Never,
+            "failure" | "failures" | "fail" => NotifyMode::Failure,
+            _ => NotifyMode::Always,
         }
     }
 }
@@ -58,6 +98,15 @@ fn default_theme() -> String {
 }
 fn default_poll_ms() -> u64 {
     5000
+}
+fn default_notify() -> String {
+    "always".into()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_focus_context() -> usize {
+    2
 }
 
 /// Key name strings exactly as they appear in config.toml [keys].
@@ -69,6 +118,7 @@ pub struct KeymapConfig {
     // global
     pub quit: String,
     pub back: String,
+    pub help: String,
     // navigation (shared across list views and scroll)
     pub down: String,
     pub up: String,
@@ -86,6 +136,21 @@ pub struct KeymapConfig {
     pub all_steps: String,
     // log search (`n`/`p` reused for next/prev match while a query is active)
     pub search: String,
+    // log focus mode + error jumping
+    pub log_focus: String,
+    pub next_error: String,
+    pub prev_error: String,
+    // fuzzy finder over the current list
+    pub finder: String,
+    // multi-repo dashboard
+    pub repos_view: String,
+    // working tree (stage / commit / push) for a local checkout
+    pub git_view: String,
+    pub git_stage: String,
+    pub git_stage_all: String,
+    pub git_commit: String,
+    pub git_push: String,
+    pub git_refresh: String,
     // workflow actions
     pub trigger: String,
     pub watch: String,
@@ -109,6 +174,7 @@ impl Default for KeymapConfig {
         Self {
             quit: "q".into(),
             back: "Esc".into(),
+            help: "?".into(),
             down: "j".into(),
             up: "k".into(),
             confirm: "Enter".into(),
@@ -121,6 +187,17 @@ impl Default for KeymapConfig {
             prev_step: "p".into(),
             all_steps: "a".into(),
             search: "/".into(),
+            log_focus: "F".into(),
+            next_error: "e".into(),
+            prev_error: "E".into(),
+            finder: "ctrl+p".into(),
+            repos_view: "H".into(),
+            git_view: "c".into(),
+            git_stage: "Space".into(),
+            git_stage_all: "a".into(),
+            git_commit: "c".into(),
+            git_push: "P".into(),
+            git_refresh: "r".into(),
             trigger: "t".into(),
             watch: "w".into(),
             open_browser: "o".into(),

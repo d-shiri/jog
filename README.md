@@ -60,19 +60,126 @@ jog --repo owner/name
 jog run <workflow> [ref] [-i KEY=VAL ...]   # fire-and-forget trigger
 jog watch <workflow>                        # live status view
 jog open <workflow>                         # open latest run in browser
+jog repos                                   # multi-repo dashboard
 ```
 
 `<workflow>` is the workflow file name (e.g. `ci.yml`) or a fuzzy match on its display name.
 
+Run from inside a checkout, or from a directory whose subfolders are checkouts —
+see [Multi-repo dashboard](#multi-repo-dashboard).
+
+## Multi-repo dashboard
+
+Two ways to get rows on the dashboard.
+
+**Run `jog` in a directory that isn't a repo but whose subfolders are.** It scans
+for checkouts (two levels deep, skipping `node_modules`, `target` and friends),
+resolves each one's `origin`, and lists them:
+
+```
+~/work $ jog
+
+ ⚡ jog · ~/work · Repos
+ ╭ Repos (10  ✓8  ✗1 ) ─────────────────────────────────────────────────────────╮
+ │     Repo         Local branch   Latest run          Ran on         Updated   │
+ │ ▶ ✓ acme/api     main ●5        🚧 Deploy to Stage    main         2h ago    │
+ │   ✓ acme/web     main ✓ ↑2      Build & Test          main         15m ago   │
+ │   ✗ acme/infra   fix/db ●1      Deploy to QA        ≠ main         1d ago    │
+ ╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+Two different branches, deliberately kept apart:
+
+- **Local branch** — your checkout: the branch you're on, `●n` uncommitted
+  files or `✓` clean, and `↑`/`↓` commits ahead of / behind upstream.
+- **Ran on** — the branch the *latest CI run* used. A `≠` marks it as a
+  different branch from the one you're standing on, which is the usual reason a
+  dashboard row looks unfamiliar (a dependabot PR ran more recently than your
+  own branch).
+
+**Or list them in config**, for repos you don't have checked out:
+
+```toml
+[provider]
+repos = ["acme/api", "acme/web", "acme/infra"]
+```
+
+Open it any time with `jog repos`, or press `H`. `Enter` on a row switches the
+whole app to that repo — workflows come from the local checkout when there is
+one (so `workflow_dispatch` inputs and the branch are exact), otherwise from the
+API. Repos without a GitHub remote still get a row; they just have no CI half.
+
+While the dashboard is open every listed repo is polled, so a run finishing in
+any of them notifies you, not just the one you're sitting in.
+
+## Commit, then run CI
+
+Press `c` on a dashboard row with a local checkout to review its working tree
+(`?` shows this table in-app):
+
+| Key | Action |
+|-----|--------|
+| `Space` | stage / unstage the selected file |
+| `a` | stage everything |
+| `c` | commit (opens a message prompt) |
+| `P` | push — sets upstream on first push |
+| `t` | open this repo's workflows, where `t` triggers CI |
+| `r` | refresh |
+
+The order matters: `workflow_dispatch` runs against the **remote**, so a commit
+that hasn't been pushed won't be the code CI builds. Commit → push → trigger.
+`jog` never pushes on its own; `P` is always an explicit keystroke.
+
+## Fuzzy finder
+
+`Ctrl-P` opens a finder over whatever the current view lists — repos, workflows,
+runs, or the jobs and steps of a run. Type to filter, `Enter` to jump the cursor
+there. Matching is subsequence-based, so `dtp` finds `deploy_to_prod.yml`.
+
+## Log focus mode
+
+In the log viewer:
+
+- `F` — **focus mode**: hide everything except errors and warnings, plus a couple
+  of lines of context around each. A 40k-line log collapses to the handful of
+  lines that explain the failure. The title bar reports how much is hidden.
+- `e` / `E` — jump to the next / previous error, wrapping at the ends. Errors
+  buried inside a collapsed group expand it on the way.
+
+Both use the same signals the viewer already colours on: GitHub Actions
+`##[error]` / `##[warning]` markup, and lines that start with `error`/`failed`/`warn`.
+
+## Notifications
+
+When a run you were watching finishes, `jog` plays a sound and raises a desktop
+notification. Control it with:
+
+```toml
+[ui]
+notify = "failure"       # "always" (default) · "failure" · "never"
+notify_sound = true      # play a sound
+notify_desktop = true    # raise an OS notification
+```
+
+`notify = "failure"` is the "only tell me when something breaks" mode. A run is
+only announced if `jog` saw it in flight first, so starting up never fires a
+burst of notifications for runs that finished hours ago.
+
 ## Default keys (TUI)
+
+Press **`?`** anywhere in the TUI for the full reference. It reads your actual
+config, so remapped keys show their real bindings, and the section for whatever
+view you're in floats to the top.
 
 | View      | Keys |
 |-----------|------|
-| Global    | `q` quit · `Esc` back · `j`/`k` move · `Enter` open |
+| Global    | `?` help · `q` quit · `Esc` back · `j`/`k` move · `Enter` open · `Ctrl-P` find · `H` repos · `y` yank |
+| Repos     | `Enter` open repo · `c` review changes · `o` open in browser |
+| Changes   | `Space` stage/unstage · `a` stage all · `c` commit · `P` push · `t` run CI · `r` refresh |
 | Workflows | `t` trigger · `w` watch · `o` open in browser |
 | Runs      | `t` trigger · `r` rerun · `R` rerun-failed · `x` cancel · `w` watch |
-| Run detail| `Enter`/`l` open logs |
-| Logs      | `j`/`k` scroll · `d`/`u` page · `g` top · `n`/`p` next/prev step · `a` all steps |
+| Run detail| `Enter`/`l` open logs · `D` diff vs last success |
+| Logs      | `j`/`k` scroll · `d`/`u` page · `g`/`G` top/bottom · `n`/`p` next/prev step · `a` all steps · `/` search · `e`/`E` next/prev error · `F` focus |
 | Trigger   | `i`/`Enter` edit field · `Space` cycle choice · `t` submit |
 
 All keys are remappable in `config.toml` (see [Config](#config)).
@@ -87,17 +194,34 @@ theme = "dark"
 poll_interval_ms = 5000
 favorites = ["ci.yml", "deploy.yml"]   # pinned to the top of the list
 complete_sound = "/usr/share/sounds/freedesktop/stereo/complete.oga"  # set to "" to disable
+fail_sound = ""                        # empty uses the bundled sound
+notify = "always"                      # "always" · "failure" · "never"
+notify_sound = true
+notify_desktop = true
+log_focus_context = 2                  # context lines kept around each error in focus mode
 
 [provider]
 kind = "github"
-repo = "owner/name"  # optional; otherwise auto-detected from git remote
+repo = "owner/name"                    # optional; otherwise auto-detected from git remote
+repos = ["acme/api", "acme/web"]       # multi-repo dashboard rows
 
 [keys]
 quit = "q"
 back = "Esc"
+help = "?"
 down = "j"
 up = "k"
 trigger = "t"
+finder = "ctrl+p"
+repos_view = "H"
+git_view = "c"
+git_stage = "Space"
+git_stage_all = "a"
+git_commit = "c"
+git_push = "P"
+log_focus = "F"
+next_error = "e"
+prev_error = "E"
 # ... see src/config.rs for the full list
 ```
 

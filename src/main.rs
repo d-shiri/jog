@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 mod app;
 mod cli;
+mod git;
 mod config;
 mod history;
 mod provider;
@@ -23,16 +24,68 @@ async fn main() -> Result<()> {
     let config = Config::load().context("load config")?;
 
     let cwd = std::env::current_dir().context("cwd")?;
-    let repo_root = find_repo_root(&cwd).context("find repo root")?;
-    let workflows = discover_workflows(&repo_root)?;
 
-    let repo_spec = match cli.repo.clone().or(config.provider.repo.clone()) {
-        Some(s) => RepoSpec::parse(&s)?,
-        None => RepoSpec::from_git_remote()?,
+    // Sitting inside a checkout is the normal case. Outside one — a directory
+    // whose *children* are repos — fall back to scanning for them so the tool
+    // still has something to show.
+    let repo_root = find_repo_root(&cwd).ok();
+    let workspace = match &repo_root {
+        Some(_) => Vec::new(),
+        None => git::discover_workspace(&cwd),
     };
 
-    let token = resolve_token()?;
+    let workflows = match &repo_root {
+        Some(root) => discover_workflows(root)?,
+        None => Vec::new(),
+    };
+
+    let repo_spec = match cli.repo.clone().or(config.provider.repo.clone()) {
+        Some(s) => Some(RepoSpec::parse(&s)?),
+        None if repo_root.is_some() => Some(RepoSpec::from_git_remote()?),
+        // In workspace mode the "active" repo is just whichever discovered repo
+        // has a usable GitHub remote — the dashboard swaps it as you navigate.
+        None => workspace.iter().find_map(|p| {
+            let url = git::remote_url(p).ok()?;
+            crate::provider::github::parse_remote_url(&url).ok()
+        }),
+    };
+
+    // An explicit `--repo` (or `[provider] repo`) is the escape hatch the error
+    // below advertises, so it has to actually work: with one named repo there is
+    // nothing to discover and no reason to insist on a checkout.
+    if repo_root.is_none() && workspace.is_empty() && repo_spec.is_none() {
+        return Err(anyhow!(
+            "not inside a git repository, and no repositories found under {}\n  \
+             fix: cd into a checkout, pass --repo owner/name, or run from a directory whose subfolders are repos",
+            cwd.display()
+        ));
+    }
+
+    // A workspace whose repos have no GitHub remotes still has a working
+    // dashboard and commit flow — only the CI half is unavailable. Don't make
+    // that a hard failure, and don't demand credentials we'll never spend.
+    let has_remote = repo_spec.is_some();
+    let repo_spec = repo_spec.unwrap_or_else(|| RepoSpec {
+        owner: String::new(),
+        repo: String::new(),
+    });
+    let token = if has_remote {
+        resolve_token()?
+    } else {
+        resolve_token().unwrap_or_default()
+    };
     let provider = Arc::new(GitHubProvider::new(repo_spec, token)?);
+
+    // Outside a checkout there are no local workflows to list, so the dashboard
+    // is the only sensible landing view.
+    let default_view = if repo_root.is_some() {
+        View::Workflows
+    } else {
+        View::Repos
+    };
+    // Only a real workspace scan gets its root shown in the header; with an
+    // explicit `--repo` outside a checkout the cwd is meaningless.
+    let workspace_root = (!workspace.is_empty()).then(|| cwd.clone());
 
     match cli.command {
         None => {
@@ -41,8 +94,10 @@ async fn main() -> Result<()> {
                 workflows,
                 config,
                 TuiOpts {
-                    initial_view: View::Workflows,
+                    initial_view: default_view,
                     focus_workflow: None,
+                    workspace,
+                    workspace_root,
                 },
             )
             .await
@@ -88,6 +143,22 @@ async fn main() -> Result<()> {
                 TuiOpts {
                     initial_view: View::Watch,
                     focus_workflow: Some(resolved),
+                    workspace: Vec::new(),
+                    workspace_root: None,
+                },
+            )
+            .await
+        }
+        Some(Command::Repos) => {
+            tui::run(
+                provider,
+                workflows,
+                config,
+                TuiOpts {
+                    initial_view: View::Repos,
+                    focus_workflow: None,
+                    workspace,
+                    workspace_root,
                 },
             )
             .await

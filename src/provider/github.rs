@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Arc;
 
-use super::{Job, LogChunk, LogStream, Provider, Run, RunDetail, Status, Step};
+use super::{Job, LogChunk, LogStream, Provider, Run, RunDetail, Status, Step, Workflow};
 
 #[derive(Debug, Clone)]
 pub struct RepoSpec {
@@ -39,7 +39,7 @@ impl RepoSpec {
     }
 }
 
-fn parse_remote_url(url: &str) -> Result<RepoSpec> {
+pub fn parse_remote_url(url: &str) -> Result<RepoSpec> {
     let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
     let path = if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
         rest
@@ -94,22 +94,67 @@ pub fn current_branch() -> Result<String> {
 pub struct GitHubProvider {
     crab: Arc<Octocrab>,
     repo: RepoSpec,
+    /// Kept so we can mint a sibling provider for another repo without
+    /// re-resolving credentials (see `for_repo`).
+    token: String,
 }
 
 impl GitHubProvider {
     pub fn new(repo: RepoSpec, token: String) -> Result<Self> {
         let crab = Octocrab::builder()
-            .personal_token(token)
+            .personal_token(token.clone())
             .build()
             .context("build octocrab client")?;
         Ok(Self {
             crab: Arc::new(crab),
             repo,
+            token,
         })
     }
 
     pub fn repo(&self) -> &RepoSpec {
         &self.repo
+    }
+
+    /// A provider for a different repo on the same credentials. The HTTP client
+    /// is shared — only the repo coordinates differ.
+    pub fn for_repo(&self, repo: RepoSpec) -> Self {
+        Self {
+            crab: self.crab.clone(),
+            repo,
+            token: self.token.clone(),
+        }
+    }
+
+    /// The repo's default branch — the sane trigger ref for a repo we have no
+    /// local checkout of.
+    pub async fn default_branch(&self) -> Result<String> {
+        let repo = self
+            .crab
+            .repos(&self.repo.owner, &self.repo.repo)
+            .get()
+            .await
+            .context("get repo")?;
+        repo.default_branch
+            .ok_or_else(|| anyhow!("repo has no default branch"))
+    }
+
+    /// Raw text of a file in the repo's default branch.
+    async fn fetch_workflow_yaml(&self, path: &str) -> Result<String> {
+        let content = self
+            .crab
+            .repos(&self.repo.owner, &self.repo.repo)
+            .get_content()
+            .path(path)
+            .send()
+            .await
+            .with_context(|| format!("get contents of {path}"))?;
+        content
+            .items
+            .into_iter()
+            .next()
+            .and_then(|c| c.decoded_content())
+            .ok_or_else(|| anyhow!("no decodable content at {path}"))
     }
 }
 
@@ -185,6 +230,55 @@ fn map_job(j: gh_workflows::Job) -> Job {
 
 #[async_trait]
 impl Provider for GitHubProvider {
+    async fn list_workflows(&self) -> Result<Vec<Workflow>> {
+        let page = self
+            .crab
+            .workflows(&self.repo.owner, &self.repo.repo)
+            .list()
+            .per_page(100u8)
+            .send()
+            .await
+            .context("list workflows")?;
+
+        // The list endpoint gives us name + path but not the `on:` block, so it
+        // can't tell us whether a workflow is dispatchable or what inputs it
+        // takes. Fetch each file's contents concurrently and reuse the same YAML
+        // parser the local-checkout path uses. A workflow whose contents we
+        // can't read still shows up, just without trigger metadata.
+        let fetches = page
+            .items
+            .into_iter()
+            // GitHub lists legacy/removed workflows with an empty path. There is
+            // no file to read and no name to address them by, so they'd render
+            // as a blank row that can't be opened or triggered.
+            .filter(|wf| !wf.path.trim().is_empty())
+            .map(|wf| async move {
+            let file_name = wf
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or(wf.path.as_str())
+                .to_string();
+            let parsed = self
+                .fetch_workflow_yaml(&wf.path)
+                .await
+                .ok()
+                .and_then(|raw| super::discovery::parse_workflow_str(&raw, &file_name).ok());
+            parsed.unwrap_or(Workflow {
+                name: wf.name,
+                file_name,
+                triggerable: false,
+                last_status: None,
+                last_run_at: None,
+                inputs: Vec::new(),
+            })
+        });
+
+        let mut out = futures::future::join_all(fetches).await;
+        out.sort_by_key(|w| w.name.to_lowercase());
+        Ok(out)
+    }
+
     async fn list_runs(&self, workflow_file: &str, limit: u8) -> Result<Vec<Run>> {
         let page = self
             .crab

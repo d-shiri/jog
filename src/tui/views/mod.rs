@@ -26,6 +26,8 @@ pub fn render(f: &mut Frame, state: &AppState) {
         .split(area);
     render_header(f, chunks[0], state);
     match state.view {
+        View::Repos => render_repos(f, chunks[1], state),
+        View::GitStatus => render_git_status(f, chunks[1], state),
         View::Workflows => render_workflows(f, chunks[1], state),
         View::Runs => render_runs(f, chunks[1], state),
         View::RunDetail => render_run_detail(f, chunks[1], state),
@@ -38,12 +40,35 @@ pub fn render(f: &mut Frame, state: &AppState) {
     if state.view == View::Logs {
         render_search_overlay(f, area, state);
     }
+    if state.view == View::GitStatus {
+        render_commit_overlay(f, area, state);
+    }
+    render_finder_overlay(f, area, state);
+    // Drawn last so it sits above every other overlay.
+    render_help_overlay(f, area, state);
 }
 
 fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     let sep = || Span::styled("  ›  ", Style::default().fg(Color::Rgb(55, 55, 80)));
     let crumb: Vec<Span> = match state.view {
+        View::Repos => vec![
+            Span::styled("Repos", Style::default().fg(theme.primary).bold()),
+        ],
+        View::GitStatus => vec![
+            Span::styled("Repos", Style::default().fg(theme.secondary)),
+            sep(),
+            Span::styled(
+                state
+                    .git_view
+                    .as_ref()
+                    .map(|g| g.spec.clone())
+                    .unwrap_or_else(|| "?".into()),
+                Style::default().fg(theme.secondary),
+            ),
+            sep(),
+            Span::styled("Changes", Style::default().fg(theme.primary).bold()),
+        ],
         View::Workflows => vec![
             Span::styled("Workflows", Style::default().fg(theme.primary).bold()),
         ],
@@ -91,12 +116,32 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     let mut spans = vec![
         Span::styled(" ⚡ ", Style::default().fg(theme.accent)),
         Span::styled("jog", Style::default().fg(Color::White).bold()),
-        Span::styled("  ·  ", dot),
-        Span::styled(state.repo_label.as_str(), Style::default().fg(Color::White)),
-        Span::styled("  ⎇ ", Style::default().fg(Color::Rgb(90, 110, 150))),
-        Span::styled(state.current_branch.as_str(), Style::default().fg(theme.accent)),
+        Span::styled(
+            format!(" v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(Color::Rgb(95, 95, 120)),
+        ),
         Span::styled("  ·  ", dot),
     ];
+    // On the workspace dashboard there is no single active repo yet — naming one
+    // (and its branch) would be arbitrary. Show where we're scanning instead.
+    match (&state.workspace_root, state.view) {
+        (Some(root), View::Repos | View::GitStatus) => spans.push(Span::styled(
+            format!("{}", root.display()),
+            Style::default().fg(Color::White),
+        )),
+        _ => {
+            spans.push(Span::styled(
+                state.repo_label.as_str(),
+                Style::default().fg(Color::White),
+            ));
+            spans.push(Span::styled("  ⎇ ", Style::default().fg(Color::Rgb(90, 110, 150))));
+            spans.push(Span::styled(
+                state.current_branch.as_str(),
+                Style::default().fg(theme.accent),
+            ));
+        }
+    }
+    spans.push(Span::styled("  ·  ", dot));
     spans.extend(crumb);
     let line = Line::from(spans);
     f.render_widget(
@@ -119,11 +164,71 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
     let km = &state.keymap;
     let editing = state.trigger_prompt.as_ref().map(|p| p.editing).unwrap_or(false);
 
+    // The finder overlay owns the keyboard while it's up, so advertise its keys
+    // instead of the view's.
+    if state.finder.is_some() {
+        let spans = vec![
+            Span::raw(" "),
+            Span::styled("type", Style::default().fg(Color::White).bold()),
+            Span::raw(" "),
+            Span::styled("filter", Style::default().fg(theme.secondary)),
+            Span::raw("  "),
+            Span::styled("↑/↓", Style::default().fg(Color::White).bold()),
+            Span::raw(" "),
+            Span::styled("move", Style::default().fg(theme.secondary)),
+            Span::raw("  "),
+            Span::styled("↵", Style::default().fg(Color::White).bold()),
+            Span::raw(" "),
+            Span::styled("select", Style::default().fg(theme.secondary)),
+            Span::raw("  "),
+            Span::styled("Esc", Style::default().fg(Color::White).bold()),
+            Span::raw(" "),
+            Span::styled("cancel", Style::default().fg(theme.secondary)),
+        ];
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.footer_bg)),
+            area,
+        );
+        return;
+    }
+
     let hints: Vec<(String, &str)> = match state.view {
+        View::Repos => vec![
+            ("↵".into(), "open repo"),
+            (display_key(&km.git_view).into(), "changes"),
+            (display_key(&km.finder).into(), "find"),
+            (display_key(&km.open_browser).into(), "open"),
+            (display_key(&km.quit).into(), "quit"),
+        ],
+        View::GitStatus if state.git_view.as_ref().is_some_and(|g| g.commit_input.is_some()) => {
+            vec![
+                ("type".into(), "message"),
+                ("Bksp".into(), "delete"),
+                ("↵".into(), "commit"),
+                ("Esc".into(), "cancel"),
+            ]
+        }
+        View::GitStatus => {
+            let mut hints = vec![
+                (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "move"),
+                (display_key(&km.git_stage).into(), "stage/unstage"),
+                (display_key(&km.git_stage_all).into(), "stage all"),
+                (display_key(&km.git_commit).into(), "commit"),
+                (display_key(&km.git_push).into(), "push"),
+            ];
+            if state.git_view.as_ref().is_some_and(|g| g.has_ci) {
+                hints.push((display_key(&km.trigger).into(), "run CI"));
+            }
+            hints.push((display_key(&km.git_refresh).into(), "refresh"));
+            hints.push((display_key(&km.back).into(), "back"));
+            hints
+        }
         View::Workflows => vec![
             ("↵".into(), "runs"),
             (display_key(&km.trigger).into(), "trigger"),
             (display_key(&km.watch).into(), "watch"),
+            (display_key(&km.finder).into(), "find"),
+            (display_key(&km.repos_view).into(), "repos"),
             (display_key(&km.open_browser).into(), "open"),
             (display_key(&km.quit).into(), "quit"),
         ],
@@ -134,6 +239,7 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             (display_key(&km.rerun_failed).into(), "rerun-failed"),
             (display_key(&km.cancel_run).into(), "cancel"),
             (display_key(&km.watch).into(), "watch"),
+            (display_key(&km.finder).into(), "find"),
             (display_key(&km.open_browser).into(), "open"),
             (display_key(&km.back).into(), "back"),
         ],
@@ -153,6 +259,14 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                 (format!("{}/{}", display_key(&km.next_step), display_key(&km.prev_step)), np_label),
                 (display_key(&km.all_steps).into(), "all"),
                 (display_key(&km.search).into(), "search"),
+                (
+                    format!("{}/{}", display_key(&km.next_error), display_key(&km.prev_error)),
+                    "error",
+                ),
+                (
+                    display_key(&km.log_focus).into(),
+                    if state.log_focus { "focus ✓" } else { "focus" },
+                ),
             ];
             if !state.log_groups.is_empty() {
                 hints.push(("↵".into(), "expand/collapse"));
@@ -185,6 +299,10 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             (display_key(&km.back).into(), "cancel"),
         ],
     };
+
+    // `?` is the discovery entry point, so it belongs on every view's footer.
+    let mut hints = hints;
+    hints.push((display_key(&km.help).into(), "help"));
 
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for (i, (key, desc)) in hints.iter().enumerate() {
@@ -222,6 +340,762 @@ fn styled_block<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
             format!(" {title} "),
             Style::default().fg(theme.primary).bold(),
         ))
+}
+
+fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
+    let (ok, fail, busy, broken) =
+        state.repos.iter().fold((0u32, 0u32, 0u32, 0u32), |(o, f, r, b), c| {
+            if c.error.is_some() {
+                return (o, f, r, b + 1);
+            }
+            match c.latest_status() {
+                Some(Status::Success) => (o + 1, f, r, b),
+                Some(Status::Failure) => (o, f + 1, r, b),
+                Some(Status::Running) | Some(Status::Queued) => (o, f, r + 1, b),
+                _ => (o, f, r, b),
+            }
+        });
+    let title = Line::from(vec![
+        Span::styled(
+            format!(" Repos ({}", state.repos.len()),
+            Style::default().fg(theme.primary).bold(),
+        ),
+        Span::styled(format!("  ✓{ok}"), Style::default().fg(theme.success)),
+        Span::styled(format!("  ✗{fail}"), Style::default().fg(theme.failure)),
+        if busy > 0 {
+            Span::styled(format!("  ⏵{busy}"), Style::default().fg(theme.warning).bold())
+        } else {
+            Span::raw("")
+        },
+        if broken > 0 {
+            Span::styled(format!("  !{broken}"), Style::default().fg(theme.failure).bold())
+        } else {
+            Span::raw("")
+        },
+        Span::styled(" ) ", Style::default().fg(theme.primary).bold()),
+    ]);
+    let blk = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(55, 55, 80)))
+        .title(title);
+    let inner = blk.inner(area);
+    f.render_widget(blk, area);
+
+    if inner.height < 2 {
+        return;
+    }
+
+    if state.repos.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "no repos configured — add `repos = [\"owner/name\", …]` under [provider] in config.toml",
+                Style::default().fg(Color::DarkGray).italic(),
+            ))
+            .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
+
+    let hdr = Style::default().fg(theme.secondary);
+    let header = Row::new(vec![
+        Cell::from(""),
+        Cell::from(Span::styled("Repo", hdr)),
+        Cell::from(Span::styled("Local branch", hdr)),
+        Cell::from(Span::styled("Latest run", hdr)),
+        Cell::from(Span::styled("Ran on", hdr)),
+        Cell::from(Span::styled("Updated", hdr)),
+        Cell::from(Span::styled("Recent", hdr)),
+    ])
+    .height(1)
+    .bottom_margin(1);
+
+    // Working-tree summary: the branch you are actually on, how dirty it is, and
+    // how far it has drifted from upstream. Distinct from the "Ran on" column,
+    // which reports the branch the latest CI run used.
+    let local_cell = |card: &crate::app::state::RepoCard| -> Cell<'static> {
+        let Some(g) = card.git.as_ref() else {
+            return Cell::from("");
+        };
+        let mut spans: Vec<Span> = vec![Span::styled(
+            truncate(&g.branch, 20),
+            Style::default().fg(Color::Yellow),
+        )];
+        if g.is_clean() {
+            spans.push(Span::styled(" ✓", Style::default().fg(theme.success)));
+        } else {
+            spans.push(Span::styled(
+                format!(" ●{}", card.dirty_count()),
+                Style::default().fg(theme.warning).bold(),
+            ));
+        }
+        if g.ahead > 0 {
+            spans.push(Span::styled(
+                format!(" ↑{}", g.ahead),
+                Style::default().fg(theme.accent),
+            ));
+        }
+        if g.behind > 0 {
+            spans.push(Span::styled(
+                format!(" ↓{}", g.behind),
+                Style::default().fg(Color::Rgb(120, 120, 145)),
+            ));
+        }
+        Cell::from(Line::from(spans))
+    };
+
+    // The run's branch, flagged when it isn't the branch you're standing on —
+    // that mismatch is exactly the "why does this say dependabot?" confusion.
+    let ran_on_cell = |card: &crate::app::state::RepoCard, run_branch: &str| -> Cell<'static> {
+        // No runs yet means no branch to report — and nothing to diverge from.
+        if run_branch.is_empty() {
+            return Cell::from(Span::styled("—", Style::default().fg(theme.unknown)));
+        }
+        let local = card.git.as_ref().map(|g| g.branch.as_str());
+        let diverged = local.is_some_and(|b| b != run_branch);
+        let style = if diverged {
+            Style::default().fg(Color::Rgb(150, 130, 90))
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        // The marker leads rather than trails: a long branch name would clip a
+        // trailing one off the end of the column, and leading keeps the markers
+        // aligned so divergent rows are scannable down the list.
+        let marker = if diverged {
+            Span::styled("≠ ", Style::default().fg(Color::Rgb(190, 160, 90)).bold())
+        } else {
+            Span::raw("  ")
+        };
+        Cell::from(Line::from(vec![
+            marker,
+            Span::styled(truncate(run_branch, 18), style),
+        ]))
+    };
+
+    let rows: Vec<Row> = state
+        .repos
+        .iter()
+        .map(|card| {
+            let active = card.spec == state.repo_label;
+            let name_style = if active {
+                Style::default().fg(Color::White).bold()
+            } else {
+                Style::default().fg(Color::Rgb(200, 200, 220))
+            };
+            let name_cell = Cell::from(Line::from(vec![
+                Span::styled(card.spec.clone(), name_style),
+                if active {
+                    Span::styled("  ●", Style::default().fg(theme.accent))
+                } else {
+                    Span::raw("")
+                },
+            ]));
+
+            // A repo that failed to load says so instead of pretending to be idle.
+            if let Some(err) = &card.error {
+                return Row::new(vec![
+                    Cell::from(Span::styled("!", Style::default().fg(theme.failure).bold())),
+                    name_cell,
+                    local_cell(card),
+                    Cell::from(Span::styled(
+                        truncate(err, 46),
+                        Style::default().fg(theme.failure),
+                    )),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                ])
+                .style(Style::default().bg(row_bg_for_status(Status::Failure)));
+            }
+
+            // A checkout with no GitHub origin never fetches, so it must not sit
+            // at "loading…" forever — it just has no CI half to show.
+            if !card.has_ci() {
+                return Row::new(vec![
+                    Cell::from(""),
+                    name_cell,
+                    local_cell(card),
+                    Cell::from(Span::styled(
+                        "local only — no GitHub remote",
+                        Style::default().fg(Color::Rgb(90, 90, 115)).italic(),
+                    )),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                ]);
+            }
+
+            if !card.loaded {
+                return Row::new(vec![
+                    Cell::from(""),
+                    name_cell,
+                    local_cell(card),
+                    Cell::from(Span::styled("loading…", Style::default().fg(Color::DarkGray))),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                ]);
+            }
+
+            let latest = card.runs.first();
+            let status = card.latest_status().unwrap_or(Status::Unknown);
+            let (when_text, when_style) = latest
+                .map(|r| relative_styled(r.updated_at))
+                .unwrap_or_else(|| ("—".into(), Style::default().fg(theme.unknown)));
+            let workflow = latest
+                .map(|r| truncate(&r.display_title, 28))
+                .unwrap_or_else(|| "no runs".into());
+            let branch = latest.map(|r| r.head_branch.clone()).unwrap_or_default();
+
+            let (c_ok, c_fail, c_busy) = card.counts();
+            let sparkline = Line::from(vec![
+                Span::styled(format!("✓{c_ok} "), Style::default().fg(theme.success)),
+                Span::styled(format!("✗{c_fail} "), Style::default().fg(theme.failure)),
+                if c_busy > 0 {
+                    Span::styled(format!("⏵{c_busy}"), Style::default().fg(theme.warning).bold())
+                } else {
+                    Span::raw("")
+                },
+            ]);
+
+            Row::new(vec![
+                Cell::from(Span::styled(
+                    animated_glyph(status, state.tick_count),
+                    style_for_status(status, theme),
+                )),
+                name_cell,
+                local_cell(card),
+                Cell::from(Span::styled(workflow, Style::default().fg(Color::Rgb(180, 180, 210)))),
+                ran_on_cell(card, &branch),
+                Cell::from(Span::styled(when_text, when_style)),
+                Cell::from(sparkline),
+            ])
+            .style(Style::default().bg(row_bg_for_status(status)))
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(1),   // status glyph
+        Constraint::Fill(40),    // repo
+        Constraint::Fill(32),    // local branch + working tree
+        Constraint::Fill(35),    // latest workflow
+        Constraint::Fill(26),    // branch the run used
+        Constraint::Length(10),  // updated
+        Constraint::Length(14),  // counts
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(2)
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(35, 95, 120))
+                .fg(Color::Rgb(220, 240, 255))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    let mut ts = TableState::default();
+    ts.select(Some(state.repo_cursor));
+    f.render_stateful_widget(table, inner, &mut ts);
+}
+
+/// The full keybinding reference, built from the *configured* keys so remapped
+/// bindings show their real values rather than the defaults.
+///
+/// Section titles match `View` names so the overlay can highlight wherever the
+/// user currently is.
+fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(String, &'static str)>)> {
+    let k = |s: &str| display_key(s).to_string();
+    let pair = |a: &str, b: &str| format!("{}/{}", display_key(a), display_key(b));
+
+    vec![
+        (
+            "Global",
+            vec![
+                (pair(&km.down, &km.up), "move cursor"),
+                ("↵".into(), "open / drill in"),
+                (k(&km.back), "back one view"),
+                (k(&km.finder), "fuzzy find in the current list"),
+                (k(&km.repos_view), "multi-repo dashboard"),
+                (k(&km.open_browser), "open in browser"),
+                (k(&km.yank), "copy the selection to the clipboard"),
+                (k(&km.help), "this help"),
+                (k(&km.quit), "quit"),
+            ],
+        ),
+        (
+            "Repos — dashboard",
+            vec![
+                ("↵".into(), "switch to this repo"),
+                (k(&km.git_view), "review local changes"),
+                (k(&km.open_browser), "open the repo's Actions page"),
+            ],
+        ),
+        (
+            "Changes — working tree",
+            vec![
+                (k(&km.git_stage), "stage / unstage the selected file"),
+                (k(&km.git_stage_all), "stage all"),
+                (k(&km.git_commit), "commit (opens a message prompt)"),
+                (k(&km.git_push), "push — sets upstream on first push"),
+                (k(&km.trigger), "open this repo's workflows to run CI"),
+                (k(&km.git_refresh), "re-read the working tree"),
+            ],
+        ),
+        (
+            "Workflows",
+            vec![
+                ("↵".into(), "list runs"),
+                (k(&km.trigger), "trigger"),
+                (k(&km.watch), "watch the latest run"),
+            ],
+        ),
+        (
+            "Runs",
+            vec![
+                ("↵".into(), "run detail"),
+                (k(&km.trigger), "trigger"),
+                (k(&km.rerun), "rerun all jobs"),
+                (k(&km.rerun_failed), "rerun failed jobs"),
+                (k(&km.cancel_run), "cancel"),
+                (k(&km.watch), "watch"),
+            ],
+        ),
+        (
+            "Run detail",
+            vec![
+                (format!("↵/{}", display_key(&km.open_logs)), "open logs"),
+                (k(&km.diff), "diff against the last successful run"),
+            ],
+        ),
+        (
+            "Logs",
+            vec![
+                (pair(&km.page_down, &km.page_up), "page down / up"),
+                (pair(&km.scroll_top, &km.scroll_bottom), "top / bottom"),
+                (pair(&km.next_step, &km.prev_step), "next / previous step"),
+                (k(&km.all_steps), "show all steps"),
+                (k(&km.search), "search (then n/p cycle matches)"),
+                (pair(&km.next_error, &km.prev_error), "next / previous error"),
+                (k(&km.log_focus), "focus mode — errors and warnings only"),
+                ("↵".into(), "expand / collapse a group"),
+            ],
+        ),
+        (
+            "Trigger prompt",
+            vec![
+                (format!("↵/{}", display_key(&km.tp_edit)), "edit the field"),
+                (k(&km.tp_cycle), "cycle a choice field"),
+                (k(&km.tp_submit), "submit"),
+                (k(&km.back), "cancel"),
+            ],
+        ),
+    ]
+}
+
+/// Section title that corresponds to the view currently behind the overlay.
+fn help_section_for(view: View) -> &'static str {
+    match view {
+        View::Repos => "Repos — dashboard",
+        View::GitStatus => "Changes — working tree",
+        View::Workflows => "Workflows",
+        View::Runs | View::Watch => "Runs",
+        View::RunDetail | View::Diff => "Run detail",
+        View::Logs => "Logs",
+        View::TriggerPrompt => "Trigger prompt",
+    }
+}
+
+fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
+    if !state.show_help {
+        return;
+    }
+    let theme = &state.theme;
+    let current = help_section_for(state.view);
+    let mut sections = help_sections(&state.keymap);
+    // Float the current view's section to just below Global, so "what can I do
+    // here?" is answered without scrolling.
+    if let Some(i) = sections.iter().position(|(t, _)| *t == current)
+        && i > 1
+    {
+        let s = sections.remove(i);
+        sections.insert(1, s);
+    }
+
+    // Key column is sized to the widest binding so descriptions line up.
+    let key_w = sections
+        .iter()
+        .flat_map(|(_, rows)| rows.iter())
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (title, rows) in &sections {
+        let is_current = *title == current;
+        let title_style = if is_current {
+            Style::default().fg(theme.accent).bold()
+        } else {
+            Style::default().fg(theme.primary).bold()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {title}"), title_style),
+            if is_current {
+                Span::styled("  ← you are here", Style::default().fg(theme.accent))
+            } else {
+                Span::raw("")
+            },
+        ]));
+        for (key, desc) in rows {
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(
+                    format!("{key:>key_w$}"),
+                    Style::default().fg(Color::White).bold(),
+                ),
+                Span::raw("   "),
+                Span::styled(*desc, Style::default().fg(Color::Rgb(190, 190, 215))),
+            ]));
+        }
+        lines.push(Line::default());
+    }
+
+    let total = lines.len() as u16;
+    let dialog_w = (area.width * 78 / 100).max(46).min(area.width);
+    let dialog_h = (total + 3).min(area.height.saturating_sub(2)).max(6);
+    let x = area.x + area.width.saturating_sub(dialog_w) / 2;
+    let y = area.y + area.height.saturating_sub(dialog_h) / 2;
+    let popup = Rect { x, y, width: dialog_w, height: dialog_h };
+
+    let inner_h = dialog_h.saturating_sub(2);
+    let max_scroll = total.saturating_sub(inner_h);
+    let scroll = state.help_scroll.min(max_scroll);
+
+    let hint = if max_scroll > 0 {
+        format!(
+            " jog v{}  —  Keys  ({}–{} of {})  {}/{} scroll · any key closes ",
+            env!("CARGO_PKG_VERSION"),
+            scroll + 1,
+            (scroll + inner_h).min(total),
+            total,
+            display_key(&state.keymap.down),
+            display_key(&state.keymap.up),
+        )
+    } else {
+        format!(
+            " jog v{}  —  Keys  ·  any key closes ",
+            env!("CARGO_PKG_VERSION")
+        )
+    };
+
+    let block = Block::default()
+        .title(Span::styled(hint, Style::default().fg(theme.accent).bold()))
+        .title_alignment(ratatui::layout::Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent));
+
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines).block(block).scroll((scroll, 0)),
+        popup,
+    );
+}
+
+fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
+    let Some(gv) = state.git_view.as_ref() else {
+        f.render_widget(
+            Paragraph::new("(no repo selected)").block(styled_block("Changes", theme)),
+            area,
+        );
+        return;
+    };
+
+    let title = match &gv.status {
+        Some(s) => {
+            let mut t = format!("{} — {}", gv.spec, s.branch);
+            if s.ahead > 0 {
+                t.push_str(&format!("  ↑{}", s.ahead));
+            }
+            if s.behind > 0 {
+                t.push_str(&format!("  ↓{}", s.behind));
+            }
+            if !s.has_upstream {
+                t.push_str("  (no upstream)");
+            }
+            t
+        }
+        None => format!("{} — loading…", gv.spec),
+    };
+
+    let blk = styled_block(&title, theme);
+    let inner = blk.inner(area);
+    f.render_widget(blk, area);
+    if inner.height < 2 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(inner);
+
+    // ── Summary line ───────────────────────────────────────────────────
+    let staged = gv.staged_count();
+    let unstaged = gv
+        .status
+        .as_ref()
+        .map(|s| s.unstaged_count())
+        .unwrap_or(0);
+    let summary = if gv.status.is_none() {
+        Line::from(Span::styled(
+            "reading working tree…",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else if gv.entries().is_empty() {
+        Line::from(vec![
+            Span::styled("✓ clean", Style::default().fg(theme.success).bold()),
+            Span::styled(
+                "   nothing to commit",
+                Style::default().fg(theme.secondary),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                format!("{staged} staged"),
+                if staged > 0 {
+                    Style::default().fg(theme.success).bold()
+                } else {
+                    Style::default().fg(theme.secondary)
+                },
+            ),
+            Span::styled("   ", Style::default()),
+            Span::styled(
+                format!("{unstaged} unstaged"),
+                Style::default().fg(theme.warning),
+            ),
+            Span::styled(
+                format!("   {}", gv.path.display()),
+                Style::default().fg(Color::Rgb(90, 90, 115)),
+            ),
+        ])
+    };
+    f.render_widget(Paragraph::new(summary), chunks[0]);
+
+    // ── File list ──────────────────────────────────────────────────────
+    let rows: Vec<Row> = gv
+        .entries()
+        .iter()
+        .map(|e| {
+            let staged = e.is_staged();
+            let mark = if staged && e.has_unstaged() {
+                "◐"
+            } else if staged {
+                "●"
+            } else {
+                "○"
+            };
+            let mark_style = if staged {
+                Style::default().fg(theme.success).bold()
+            } else {
+                Style::default().fg(Color::Rgb(90, 90, 115))
+            };
+            let path_style = if staged {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let label_style = match e.label() {
+                "deleted" => Style::default().fg(theme.failure),
+                "untracked" => Style::default().fg(Color::Rgb(120, 120, 145)),
+                "conflict" => Style::default().fg(theme.failure).bold(),
+                _ => Style::default().fg(theme.warning),
+            };
+            Row::new(vec![
+                Cell::from(Span::styled(mark, mark_style)),
+                Cell::from(Span::styled(e.code(), Style::default().fg(Color::Rgb(110, 110, 140)))),
+                Cell::from(Span::styled(e.label(), label_style)),
+                Cell::from(Span::styled(e.path.clone(), path_style)),
+            ])
+        })
+        .collect();
+
+    if rows.is_empty() {
+        return;
+    }
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(1),   // staged marker
+            Constraint::Length(2),   // XY code
+            Constraint::Length(10),  // label
+            Constraint::Fill(1),     // path
+        ],
+    )
+    .header(
+        Row::new(vec![
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(Span::styled("Change", Style::default().fg(theme.secondary))),
+            Cell::from(Span::styled("File", Style::default().fg(theme.secondary))),
+        ])
+        .height(1)
+        .bottom_margin(1),
+    )
+    .column_spacing(1)
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::Rgb(35, 95, 120))
+            .fg(Color::Rgb(220, 240, 255))
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("▶ ");
+
+    let mut ts = TableState::default();
+    ts.select(Some(gv.cursor));
+    f.render_stateful_widget(table, chunks[1], &mut ts);
+}
+
+/// Commit message prompt, drawn over the working-tree view.
+fn render_commit_overlay(f: &mut Frame, area: Rect, state: &AppState) {
+    let Some(buf) = state
+        .git_view
+        .as_ref()
+        .and_then(|g| g.commit_input.as_ref())
+    else {
+        return;
+    };
+    let staged = state.git_view.as_ref().map(|g| g.staged_count()).unwrap_or(0);
+
+    let dialog_w = (area.width * 70 / 100).max(40).min(area.width);
+    let dialog_h = 4u16.min(area.height);
+    let x = area.x + area.width.saturating_sub(dialog_w) / 2;
+    let y = area.y + area.height.saturating_sub(dialog_h) / 2;
+    let popup = Rect { x, y, width: dialog_w, height: dialog_h };
+
+    let accent = state.theme.accent;
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" Commit {staged} staged file{} ", if staged == 1 { "" } else { "s" }),
+            Style::default().fg(accent).bold(),
+        ))
+        .title_alignment(ratatui::layout::Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent));
+    let inner = block.inner(popup);
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("  ", Style::default().fg(accent)),
+            Span::styled(buf.as_str(), Style::default().fg(Color::White)),
+            Span::styled("█", Style::default().fg(accent)),
+        ]),
+        Line::from(Span::styled(
+            "  ↵ commit · Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    f.render_widget(Clear, popup);
+    f.render_widget(block, popup);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Cut `s` to `max` characters, adding an ellipsis when it was longer.
+fn truncate(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    format!("{}…", chars[..max.saturating_sub(1)].iter().collect::<String>())
+}
+
+fn render_finder_overlay(f: &mut Frame, area: Rect, state: &AppState) {
+    let Some(finder) = &state.finder else { return };
+
+    let dialog_w = (area.width * 70 / 100).max(40).min(area.width);
+    let list_rows = finder.matches.len().clamp(1, 12) as u16;
+    // query line + separator + results, inside a border.
+    let dialog_h = (list_rows + 4).min(area.height);
+    let x = area.x + area.width.saturating_sub(dialog_w) / 2;
+    let y = area.y + area.height.saturating_sub(dialog_h) / 3;
+    let popup = Rect { x, y, width: dialog_w, height: dialog_h };
+
+    let accent = state.theme.accent;
+    let label = match finder.kind {
+        crate::app::state::FinderKind::Repos => "Find repo",
+        crate::app::state::FinderKind::Workflows => "Find workflow",
+        crate::app::state::FinderKind::Runs => "Find run",
+        crate::app::state::FinderKind::DetailItems => "Find job / step",
+        crate::app::state::FinderKind::GitEntries => "Find changed file",
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" {label}  ({}/{}) ", finder.matches.len(), finder.items.len()),
+            Style::default().fg(accent).bold(),
+        ))
+        .title_alignment(ratatui::layout::Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent));
+    let inner = block.inner(popup);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("  ", Style::default().fg(accent)),
+            Span::styled(finder.query.as_str(), Style::default().fg(Color::White)),
+            Span::styled("█", Style::default().fg(accent)),
+        ]),
+        Line::from(Span::styled(
+            "─".repeat(inner.width as usize),
+            Style::default().fg(Color::Rgb(55, 55, 80)),
+        )),
+    ];
+
+    if finder.matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matches",
+            Style::default().fg(Color::DarkGray).italic(),
+        )));
+    }
+
+    // Scroll the visible window so the cursor stays on screen in long lists.
+    let visible = list_rows as usize;
+    let start = finder.cursor.saturating_sub(visible.saturating_sub(1));
+    for (row, &item_idx) in finder.matches.iter().enumerate().skip(start).take(visible) {
+        let selected = row == finder.cursor;
+        let label = finder
+            .items
+            .get(item_idx)
+            .map(|(_, l)| l.as_str())
+            .unwrap_or("");
+        let style = if selected {
+            Style::default().fg(Color::Rgb(220, 240, 255)).bold()
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let line = Line::from(vec![
+            Span::styled(if selected { "▶ " } else { "  " }, Style::default().fg(accent)),
+            Span::styled(truncate(label, inner.width.saturating_sub(3) as usize), style),
+        ]);
+        lines.push(if selected {
+            line.style(Style::default().bg(Color::Rgb(35, 95, 120)))
+        } else {
+            line
+        });
+    }
+
+    f.render_widget(Clear, popup);
+    f.render_widget(block, popup);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_workflows(f: &mut Frame, area: Rect, state: &AppState) {
@@ -746,9 +1620,10 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
-    // Inner area = area minus the rounded border (1 row top + 1 row bottom).
+    // Inner area = area minus the rounded border (1 row/col on each side).
     let viewport = area.height.saturating_sub(2);
     state.last_logs_viewport_height.set(viewport);
+    state.last_logs_viewport_width.set(area.width.saturating_sub(2));
 
     let mut log_title = if state.log_section_idx.is_some() {
         if let Some(step_idx) = state.current_step_idx() {
@@ -779,12 +1654,33 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
         }
     }
 
-    log_title.push_str(&format!("  ({} lines)", state.log_lines.len()));
+    if state.log_focus {
+        // In focus mode the raw line count is a lie — report what's on screen.
+        log_title.push_str(&format!(
+            "   focus  ({} of {} lines · {}✗ {}⚠)",
+            state.log_rendered.len(),
+            state.log_lines.len(),
+            state.log_error_lines.len(),
+            state.log_warn_lines.len(),
+        ));
+    } else {
+        log_title.push_str(&format!("  ({} lines)", state.log_lines.len()));
+    }
 
-    let p = Paragraph::new(state.log_rendered.clone())
+    // `log_scroll` is an index into `log_rendered`, not a visual row offset:
+    // we slice from it and let the widget draw from the top. Scrolling a
+    // wrapping Paragraph instead would need the visual height of every line
+    // above the viewport, which can only be estimated — and the error compounds
+    // over a long log, so jumps land in the wrong place.
+    let first = (state.log_scroll as usize).min(state.log_rendered.len());
+    // Every rendered line occupies at least one screen row, so `viewport` of
+    // them is all the widget can possibly draw. Cutting there keeps the per-frame
+    // clone bounded instead of copying the tail of a 40k-line log each redraw.
+    // Cursor and current-match highlighting are applied here rather than during
+    // the rebuild, so moving the cursor costs a viewport, not the whole buffer.
+    let p = Paragraph::new(state.decorate_visible(first, viewport as usize))
         .block(styled_block(&log_title, &state.theme))
-        .wrap(Wrap { trim: false })
-        .scroll((state.log_scroll, 0));
+        .wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
 
@@ -1277,6 +2173,58 @@ fn relative_styled(t: chrono::DateTime<Utc>) -> (String, Style) {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+
+    #[test]
+    fn every_view_maps_to_a_real_help_section() {
+        let km = crate::config::KeymapConfig::default();
+        let titles: Vec<&str> = help_sections(&km).iter().map(|(t, _)| *t).collect();
+        // Guards against adding a View and forgetting its help section.
+        for view in [
+            View::Repos,
+            View::GitStatus,
+            View::Workflows,
+            View::Runs,
+            View::Watch,
+            View::RunDetail,
+            View::Diff,
+            View::Logs,
+            View::TriggerPrompt,
+        ] {
+            let section = help_section_for(view);
+            assert!(
+                titles.contains(&section),
+                "{view:?} maps to `{section}`, which is not a help section"
+            );
+        }
+    }
+
+    #[test]
+    fn help_reflects_remapped_keys() {
+        let km = crate::config::KeymapConfig {
+            git_commit: "x".into(),
+            ..Default::default()
+        };
+        let sections = help_sections(&km);
+        let changes = sections
+            .iter()
+            .find(|(t, _)| *t == "Changes — working tree")
+            .expect("changes section");
+        let commit = changes
+            .1
+            .iter()
+            .find(|(_, d)| d.starts_with("commit"))
+            .expect("commit row");
+        assert_eq!(commit.0, "x", "help must show the configured key, not the default");
+    }
+
+    #[test]
+    fn help_sections_are_all_populated() {
+        let km = crate::config::KeymapConfig::default();
+        for (title, rows) in help_sections(&km) {
+            assert!(!rows.is_empty(), "`{title}` has no rows");
+        }
+    }
 
     #[test]
     fn format_elapsed_under_hour() {
