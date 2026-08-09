@@ -93,6 +93,164 @@ impl GitView {
     }
 }
 
+/// How many lines of hook output to keep. A `pre-commit` running a full pytest
+/// suite can print tens of thousands; the interesting ones are at the end, so
+/// the front is what gets dropped.
+const MAX_OP_LINES: usize = 4000;
+
+/// One line of a running command's output, classified as it arrives.
+///
+/// Severity is computed once, on arrival, rather than on every frame: the pane
+/// redraws at 10fps while a hook runs and re-scanning thousands of lines of
+/// pytest output each time would be wasted work.
+#[derive(Debug, Clone)]
+pub struct OpLine {
+    pub text: String,
+    pub error: bool,
+    pub warn: bool,
+}
+
+/// A streaming git command — `commit` or `push` — and everything it has printed.
+///
+/// This outlives the process on purpose. When a `pre-commit` hook fails, the
+/// pytest or pyright output *is* the reason, and it is the only place that
+/// reason exists: git exits non-zero and says nothing further. So a failed op
+/// keeps its pane on screen, scrollable, until dismissed.
+#[derive(Debug, Clone)]
+pub struct GitOp {
+    /// What the user pressed a key to do: `commit`, `push`.
+    pub verb: String,
+    /// The hook this command is expected to run, when the repo has one enabled.
+    /// Names the pane, so a stalled-looking screen says *what* is stalling.
+    pub hook: Option<String>,
+    pub lines: Vec<OpLine>,
+    /// Set when the process exits. Until then the pane follows the tail.
+    pub finished: bool,
+    pub failed: bool,
+    /// Tick the command started on, for the elapsed-seconds readout.
+    pub started_tick: u64,
+    /// Index of the top visible line. `None` follows the tail, which is where a
+    /// running command should sit; any scroll key pins it.
+    pub scroll: Option<usize>,
+    /// Lines dropped off the front to stay under `MAX_OP_LINES`.
+    pub dropped: usize,
+}
+
+impl GitOp {
+    pub fn new(verb: &str, hook: Option<String>, started_tick: u64) -> Self {
+        Self {
+            verb: verb.to_string(),
+            hook,
+            lines: Vec::new(),
+            finished: false,
+            failed: false,
+            started_tick,
+            scroll: None,
+            dropped: 0,
+        }
+    }
+
+    /// What to call this in the pane title: the hook when there is one, since
+    /// "pre-commit hook" is the honest description of what the 40 seconds are
+    /// being spent on, and the bare verb otherwise.
+    pub fn label(&self) -> String {
+        match &self.hook {
+            Some(h) => format!("{h} hook"),
+            None => self.verb.clone(),
+        }
+    }
+
+    pub fn push_line(&mut self, text: String) {
+        let (errors, warns) = classify_log_severity(std::slice::from_ref(&text));
+        self.lines.push(OpLine {
+            text,
+            error: !errors.is_empty(),
+            warn: !warns.is_empty(),
+        });
+        if self.lines.len() > MAX_OP_LINES {
+            let excess = self.lines.len() - MAX_OP_LINES;
+            self.lines.drain(..excess);
+            self.dropped += excess;
+            // Pinned scroll offsets index into the vector that just shifted.
+            if let Some(s) = self.scroll.as_mut() {
+                *s = s.saturating_sub(excess);
+            }
+        }
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.lines.iter().filter(|l| l.error).count()
+    }
+
+    /// Whole seconds since the command started. Ticks are 100ms.
+    pub fn elapsed_secs(&self, now_tick: u64) -> u64 {
+        now_tick.saturating_sub(self.started_tick) / 10
+    }
+
+    fn max_scroll(&self, viewport: usize) -> usize {
+        self.lines.len().saturating_sub(viewport)
+    }
+
+    /// Index of the first visible line for a pane `viewport` rows tall.
+    pub fn scroll_offset(&self, viewport: usize) -> usize {
+        match self.scroll {
+            Some(s) => s.min(self.max_scroll(viewport)),
+            None => self.max_scroll(viewport),
+        }
+    }
+
+    pub fn scroll_by(&mut self, delta: isize, viewport: usize) {
+        let cur = self.scroll_offset(viewport) as isize;
+        let next = (cur + delta).clamp(0, self.max_scroll(viewport) as isize);
+        self.scroll = Some(next as usize);
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.scroll = Some(0);
+    }
+
+    /// Return to following the tail — where a still-running command belongs.
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll = None;
+    }
+
+    /// Put the next (or previous) error line at the top of the pane, wrapping at
+    /// the ends. Mirrors `e`/`E` in the log viewer, on the same classification.
+    pub fn jump_error(&mut self, forward: bool, viewport: usize) -> bool {
+        let from = self.scroll_offset(viewport);
+        let hits: Vec<usize> = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.error)
+            .map(|(i, _)| i)
+            .collect();
+        if hits.is_empty() {
+            return false;
+        }
+        let target = if forward {
+            hits.iter().find(|&&i| i > from).copied().unwrap_or(hits[0])
+        } else {
+            hits.iter()
+                .rev()
+                .find(|&&i| i < from)
+                .copied()
+                .unwrap_or(*hits.last().unwrap())
+        };
+        self.scroll = Some(target);
+        true
+    }
+
+    /// The whole output as text, for yanking into an editor or a bug report.
+    pub fn text(&self) -> String {
+        self.lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 /// One line of a file diff. Section banners are kept apart from the diff text so
 /// styling never has to guess which is which from the characters alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,6 +677,12 @@ pub struct AppState {
     pub status_msg: Option<String>,
     pub status_msg_tick: u64,
     pub repo_label: String,
+    /// True while `repo_label` is a bootstrap guess rather than a repo the user
+    /// chose. In workspace mode there is no checkout to read a remote from, so
+    /// startup picks the first discovered repo that has one — an arbitrary pick
+    /// the dashboard must not advertise as "active". Cleared on the first real
+    /// repo switch.
+    pub repo_label_implicit: bool,
     pub current_branch: String,
     pub workflow_for_runs: Option<String>,
     /// Preview pane in Workflows view: recent runs for the highlighted workflow.
@@ -549,11 +713,20 @@ pub struct AppState {
     pub finder: Option<Finder>,
     /// Working-tree view for the repo we drilled into from the dashboard.
     pub git_view: Option<GitView>,
+    /// Running and failed commits/pushes, keyed by repo.
+    ///
+    /// Held here rather than on `GitView` so a hook's output outlives the view
+    /// it was started from: a 90-second `pre-commit` should not pin you to one
+    /// screen, and walking away must not be the same as discarding the failure.
+    /// Also what lets a dashboard row say that a repo is mid-commit.
+    pub git_ops: HashMap<String, GitOp>,
     /// Diff for the file drilled into from the working-tree view.
     pub git_diff: Option<GitDiffView>,
     /// Rows the diff pane last drew, so paging and clamping match what is
     /// actually on screen rather than a guess.
     pub last_diff_viewport_height: Cell<u16>,
+    /// Rows the hook-output pane last drew, for the same reason.
+    pub last_op_viewport_height: Cell<u16>,
     /// Keybinding reference overlay.
     pub show_help: bool,
     pub help_scroll: u16,
@@ -607,6 +780,7 @@ impl AppState {
             status_msg: None,
             status_msg_tick: 0,
             repo_label,
+            repo_label_implicit: false,
             current_branch,
             workflow_for_runs: None,
             workflow_preview_file: None,
@@ -626,8 +800,10 @@ impl AppState {
             repo_cursor: 0,
             finder: None,
             git_view: None,
+            git_ops: HashMap::new(),
             git_diff: None,
             last_diff_viewport_height: Cell::new(0),
+            last_op_viewport_height: Cell::new(0),
             show_help: false,
             help_scroll: 0,
             workspace_root: None,
@@ -644,6 +820,30 @@ impl AppState {
     pub fn set_status(&mut self, msg: String) {
         self.status_msg = Some(msg);
         self.status_msg_tick = self.tick_count;
+    }
+
+    /// The commit/push output belonging to the repo whose working tree is open.
+    ///
+    /// Anything the user can see or scroll is this one; the rest of the map is
+    /// other repos' business.
+    pub fn current_op(&self) -> Option<&GitOp> {
+        let spec = &self.git_view.as_ref()?.spec;
+        self.git_ops.get(spec)
+    }
+
+    pub fn current_op_mut(&mut self) -> Option<&mut GitOp> {
+        let spec = self.git_view.as_ref()?.spec.clone();
+        self.git_ops.get_mut(&spec)
+    }
+
+    /// Whether a commit or push is still running for `spec`.
+    ///
+    /// Checked against the map rather than `GitView::busy` because leaving the
+    /// working-tree view drops the view but not the command: without this, going
+    /// back in and pressing `c` again would start a second `git commit` on a
+    /// repo that is already in one.
+    pub fn op_running(&self, spec: &str) -> bool {
+        self.git_ops.get(spec).is_some_and(|o| !o.finished)
     }
 
     pub fn current_step_idx(&self) -> Option<usize> {
@@ -1215,7 +1415,21 @@ pub fn wrapped_rows(text: &str, width: usize) -> u16 {
 fn is_test_failure(trimmed: &str) -> bool {
     // `test result: FAILED.`, `test some::case ... FAILED`, and pytest's
     // `FAILED tests/x.py::y` (already caught by the `failed` prefix rule).
-    if trimmed.ends_with("FAILED") || trimmed.starts_with("test result: FAILED") {
+    //
+    // Matched case-insensitively at the end of the line for the `pre-commit`
+    // framework, whose entire report is `ruff.................Failed` — the
+    // verdict is the last word because the tool name is padded out to meet it.
+    // That format shows up both in a local hook's output and in CI logs from
+    // jobs that run `pre-commit run --all-files`.
+    if trimmed.starts_with("test result: FAILED") {
+        return true;
+    }
+    let verdict = trimmed.trim_end_matches(['.', ':', '!', ')']);
+    if verdict
+        .rsplit(['.', ' ', '\t'])
+        .next()
+        .is_some_and(|last| last.eq_ignore_ascii_case("failed"))
+    {
         return true;
     }
     // Rust's panic header and the assertion line under it.
@@ -1512,6 +1726,133 @@ mod tests {
 
     fn section(label: &'static str, text: &str) -> crate::git::DiffSection {
         crate::git::DiffSection { label, text: text.to_string() }
+    }
+
+    fn op_with(raw: &[&str]) -> GitOp {
+        let mut op = GitOp::new("commit", Some("pre-commit".into()), 0);
+        for l in raw {
+            op.push_line((*l).to_string());
+        }
+        op
+    }
+
+    #[test]
+    fn hook_output_is_classified_as_it_arrives() {
+        let op = op_with(&[
+            "ruff.....Passed",
+            "FAILED tests/test_api.py::test_login",
+            "warning: unused import",
+        ]);
+        assert!(!op.lines[0].error && !op.lines[0].warn);
+        // The pytest line is the one worth colouring red and jumping to; it is
+        // caught by the same rule the CI log viewer uses.
+        assert!(op.lines[1].error);
+        assert!(op.lines[2].warn);
+        assert_eq!(op.error_count(), 1);
+    }
+
+    #[test]
+    fn a_running_op_follows_the_tail_until_scrolled() {
+        let mut op = op_with(&["one", "two", "three", "four"]);
+        // No explicit scroll: show the newest lines, since that is where a
+        // running hook is writing.
+        assert_eq!(op.scroll_offset(2), 2);
+        op.scroll_by(-1, 2);
+        assert_eq!(op.scroll_offset(2), 1);
+        // …and new output no longer drags the view along.
+        op.push_line("five".into());
+        assert_eq!(op.scroll_offset(2), 1);
+        op.scroll_to_bottom();
+        assert_eq!(op.scroll_offset(2), 3);
+    }
+
+    #[test]
+    fn jump_error_walks_errors_and_wraps() {
+        let mut op = op_with(&["a", "error: one", "b", "error: two", "c"]);
+        op.scroll_to_top();
+        assert!(op.jump_error(true, 2));
+        assert_eq!(op.scroll, Some(1));
+        assert!(op.jump_error(true, 2));
+        assert_eq!(op.scroll, Some(3));
+        // Past the last one, back to the first.
+        assert!(op.jump_error(true, 2));
+        assert_eq!(op.scroll, Some(1));
+        assert!(op.jump_error(false, 2));
+        assert_eq!(op.scroll, Some(3));
+    }
+
+    #[test]
+    fn jump_error_reports_when_there_is_nothing_to_jump_to() {
+        let mut op = op_with(&["all", "fine"]);
+        assert!(!op.jump_error(true, 2));
+    }
+
+    #[test]
+    fn dropping_old_lines_keeps_a_pinned_scroll_pointing_at_the_same_text() {
+        let mut op = GitOp::new("commit", None, 0);
+        for i in 0..MAX_OP_LINES {
+            op.push_line(format!("line {i}"));
+        }
+        op.scroll = Some(10);
+        op.push_line("overflow".into());
+        assert_eq!(op.lines.len(), MAX_OP_LINES);
+        assert_eq!(op.dropped, 1);
+        // Line 10 shifted down to index 9, and the offset has to shift with it
+        // or the pane silently scrolls itself while a hook is running.
+        assert_eq!(op.scroll, Some(9));
+        assert_eq!(op.lines[9].text, "line 10");
+    }
+
+    #[test]
+    fn a_running_hook_survives_leaving_the_view_it_started_in() {
+        let mut st = AppState::new(
+            "acme/api".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        let view = || GitView::new("acme/api".into(), PathBuf::from("/tmp/api"), true);
+        st.git_ops
+            .insert("acme/api".into(), GitOp::new("commit", Some("pre-commit".into()), 0));
+        st.git_view = Some(view());
+        assert!(st.current_op().is_some());
+
+        // Esc out of the working tree while the hook is still going.
+        st.git_view = None;
+        assert!(st.current_op().is_none());
+        // The command did not stop just because the screen changed — and
+        // pressing `c` again on that repo must not start a second one.
+        assert!(st.op_running("acme/api"));
+
+        // Walking back in re-attaches the output rather than showing a blank.
+        st.git_view = Some(view());
+        assert!(st.current_op().is_some());
+
+        // Another repo's working tree is not the place to show it.
+        st.git_view = Some(GitView::new(
+            "acme/web".into(),
+            PathBuf::from("/tmp/web"),
+            true,
+        ));
+        assert!(st.current_op().is_none());
+        assert!(!st.op_running("acme/web"));
+    }
+
+    #[test]
+    fn the_pane_is_named_after_the_hook_when_there_is_one() {
+        assert_eq!(op_with(&[]).label(), "pre-commit hook");
+        // No hook installed: don't invent one.
+        assert_eq!(GitOp::new("push", None, 0).label(), "push");
+    }
+
+    #[test]
+    fn elapsed_counts_whole_seconds_of_ticks() {
+        let op = GitOp::new("commit", None, 100);
+        assert_eq!(op.elapsed_secs(100), 0);
+        assert_eq!(op.elapsed_secs(145), 4);
+        // A tick count that went backwards must not panic.
+        assert_eq!(op.elapsed_secs(50), 0);
     }
 
     #[test]
@@ -1957,6 +2298,21 @@ mod tests {
         assert_eq!(errors, vec![0, 2, 4, 5, 8, 9], "got {errors:?}");
         // The passing test above all of it stays quiet.
         assert!(!errors.contains(&1));
+    }
+
+    #[test]
+    fn severity_reads_the_pre_commit_frameworks_verdict_column() {
+        // What a `pre-commit` hook prints, locally and in CI. The verdict is at
+        // the end of the line because the tool name is dot-padded out to it, so
+        // no leading-keyword rule can see it.
+        let ls = lines(&[
+            "ruff.....................................................................Passed",
+            "pyright..................................................................Failed",
+            "- hook id: pyright",
+            "- exit code: 1",
+        ]);
+        let (errors, _) = classify_log_severity(&ls);
+        assert_eq!(errors, vec![1], "got {errors:?}");
     }
 
     #[test]

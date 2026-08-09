@@ -6,8 +6,9 @@
 //! keeps the binary free of a libgit2 dependency.
 
 use anyhow::{Context, Result, anyhow};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Directory names that never contain a checkout worth listing and are
 /// expensive to walk.
@@ -193,6 +194,147 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("failed").to_string()
 }
 
+fn last_line(s: &str) -> String {
+    s.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("failed")
+        .to_string()
+}
+
+/// Run a git command in `dir`, handing each output line to `on_line` as it is
+/// produced instead of buffering until exit.
+///
+/// This exists for the commands that run hooks. `git commit` in a repo with a
+/// `pre-commit` hook is not a git command that takes 40 milliseconds — it is a
+/// pytest or pyright run that takes 40 seconds, and when it fails its output is
+/// the only description of what went wrong. `Command::output()` would hold all
+/// of that until the process exits and then let the caller drop it.
+///
+/// stdout and stderr are merged: hooks write to both, interleaved, and the
+/// distinction is not one the reader cares about. `stdin` is `null` — a hook
+/// that reads from stdin would otherwise be handed the terminal the TUI is
+/// reading keystrokes from, and the two would race for the user's typing.
+fn git_streaming(
+    dir: &Path,
+    args: &[&str],
+    on_line: &mut dyn FnMut(String),
+) -> Result<(bool, Vec<String>)> {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        // Hooks that colour their output would otherwise have to be stripped
+        // line by line; asking them not to is cheaper and more reliable.
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run git {}", args.join(" ")))?;
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut pumps = Vec::new();
+    for pipe in [
+        child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+        child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let tx = tx.clone();
+        pumps.push(std::thread::spawn(move || pump_lines(pipe, &tx)));
+    }
+    // The receive loop below ends when every sender is gone, so the original
+    // must not outlive the clones handed to the pumps.
+    drop(tx);
+
+    let mut collected = Vec::new();
+    for line in rx {
+        collected.push(line.clone());
+        on_line(line);
+    }
+    for p in pumps {
+        let _ = p.join();
+    }
+
+    let status = child
+        .wait()
+        .with_context(|| format!("wait for git {}", args.join(" ")))?;
+    Ok((status.success(), collected))
+}
+
+/// Forward one pipe's output line by line.
+///
+/// Reads bytes rather than `BufRead::lines()` because a hook's output is not
+/// guaranteed to be UTF-8 and one bad byte should not truncate the log. Lines
+/// rewritten in place with `\r` — every test runner's progress bar — are
+/// reported as their final state, which is what the same output would have
+/// looked like on a terminal.
+fn pump_lines(reader: impl Read, tx: &std::sync::mpsc::Sender<String>) {
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match std::io::BufRead::read_until(&mut reader, b'\n', &mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&buf);
+                let text = text.trim_end_matches(['\n', '\r']);
+                let text = text.rsplit('\r').next().unwrap_or(text);
+                if tx.send(text.to_string()).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Path to `hook` if this repo has an *enabled* one, honouring `core.hooksPath`.
+///
+/// Used only to name what is running: "running pre-commit hook" is a far better
+/// answer to a stalled-looking screen than "committing", and when the command
+/// fails it says which half failed. A hook git would skip — missing, or present
+/// but not executable — must not be named, or the label starts lying.
+pub fn hook_path(dir: &Path, hook: &str) -> Option<PathBuf> {
+    let configured = git(dir, &["config", "--get", "core.hooksPath"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let hooks_dir = match configured {
+        Some(p) => {
+            let p = PathBuf::from(p);
+            if p.is_absolute() { p } else { dir.join(p) }
+        }
+        None => {
+            let git_dir = git(dir, &["rev-parse", "--git-dir"]).ok()?.trim().to_string();
+            let git_dir = PathBuf::from(&git_dir);
+            let git_dir = if git_dir.is_absolute() {
+                git_dir
+            } else {
+                dir.join(git_dir)
+            };
+            git_dir.join("hooks")
+        }
+    };
+    let path = hooks_dir.join(hook);
+    if !path.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = std::fs::metadata(&path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+        if !executable {
+            return None;
+        }
+    }
+    Some(path)
+}
+
 pub fn current_branch(dir: &Path) -> Result<String> {
     Ok(git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])?
         .trim()
@@ -288,25 +430,72 @@ pub fn unstage(dir: &Path, path: &str) -> Result<()> {
 }
 
 /// Commit whatever is staged. Returns the short summary git prints.
-pub fn commit(dir: &Path, message: &str) -> Result<String> {
-    let out = git(dir, &["commit", "-m", message])?;
-    Ok(first_line(out.trim()))
+///
+/// Streams rather than buffers: `on_line` sees the `pre-commit` hook's output
+/// while it is still running, so a test suite that takes a minute reports its
+/// progress instead of looking like a hang.
+pub fn commit(dir: &Path, message: &str, on_line: &mut dyn FnMut(String)) -> Result<String> {
+    let (ok, lines) = git_streaming(dir, &["commit", "-m", message], on_line)?;
+    let text = lines.join("\n");
+    if !ok {
+        return Err(command_failure(dir, "commit", "pre-commit", &text));
+    }
+    // Not `first_line`: the hook has already printed by the time git says
+    // anything, so the first line of a hooked commit belongs to pytest. git's
+    // own summary is its `[branch sha] message` line, and the last one of those
+    // is git's even if a hook printed something bracketed of its own.
+    Ok(text
+        .lines()
+        .rev()
+        .find(|l| l.starts_with('['))
+        .unwrap_or("committed")
+        .to_string())
 }
 
 /// Push the current branch, setting upstream when there isn't one.
-pub fn push(dir: &Path, branch: &str, has_upstream: bool) -> Result<String> {
+///
+/// Streams for the same reason `commit` does — `pre-push` hooks are where the
+/// slow end of a test suite tends to live.
+pub fn push(
+    dir: &Path,
+    branch: &str,
+    has_upstream: bool,
+    on_line: &mut dyn FnMut(String),
+) -> Result<String> {
     let args: Vec<&str> = if has_upstream {
         vec!["push"]
     } else {
         vec!["push", "--set-upstream", "origin", branch]
     };
-    let out = git(dir, &args)?;
-    let text = out.trim();
-    Ok(if text.is_empty() {
-        format!("pushed {branch}")
-    } else {
-        first_line(text)
-    })
+    let (ok, lines) = git_streaming(dir, &args, on_line)?;
+    if !ok {
+        return Err(command_failure(dir, "push", "pre-push", &lines.join("\n")));
+    }
+    // git narrates a push over stderr — object counts, deltas, the remote's
+    // replies — and with a `pre-push` hook the narration starts with the hook's.
+    // None of it summarises anything, and all of it is in the pane, so the
+    // status line says the one thing that matters.
+    Ok(format!("pushed {branch}"))
+}
+
+/// Turn a failed streaming command into the one line the status bar gets.
+///
+/// The full output is already on screen in the op pane, so this only has to say
+/// *which* thing failed. git's own `fatal:`/`error:` lines are preferred when
+/// present because they are the precise diagnosis; otherwise a repo with the
+/// relevant hook installed gets blamed on the hook, which is right far more
+/// often than not — git itself rarely fails silently.
+fn command_failure(dir: &Path, verb: &str, hook: &str, output: &str) -> anyhow::Error {
+    if let Some(line) = output
+        .lines()
+        .find(|l| l.starts_with("fatal:") || l.starts_with("error:"))
+    {
+        return anyhow!("{}", line.trim());
+    }
+    if hook_path(dir, hook).is_some() {
+        return anyhow!("{hook} hook failed — {verb} aborted");
+    }
+    anyhow!("git {verb}: {}", last_line(output))
 }
 
 /// One `git diff` invocation's output, labelled with what it compared.
@@ -473,6 +662,174 @@ mod tests {
             git(&dir, &args).unwrap();
         }
         dir
+    }
+
+    /// Install an executable hook that runs `script`.
+    #[cfg(unix)]
+    fn install_hook(dir: &Path, name: &str, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let hooks = dir.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let path = hooks.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A repo with one commit behind it and a second change staged — the state
+    /// a user is in when they press `c`.
+    #[cfg(unix)]
+    fn staged_repo(name: &str) -> PathBuf {
+        let dir = scratch_repo(name);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&dir, &["add", "a.txt"]).unwrap();
+        git(&dir, &["commit", "-qm", "init"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        git(&dir, &["add", "a.txt"]).unwrap();
+        dir
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_hooks_output_is_reported_line_by_line() {
+        let dir = staged_repo("hook-stream");
+        install_hook(
+            &dir,
+            "pre-commit",
+            "#!/bin/sh\necho 'ruff.....Passed'\necho 'pytest..Passed' >&2\nexit 0\n",
+        );
+
+        let mut seen = Vec::new();
+        let summary = commit(&dir, "with hook", &mut |l| seen.push(l)).unwrap();
+
+        // Both streams, in one sequence: hooks write to whichever they like and
+        // the reader does not care which.
+        assert!(seen.iter().any(|l| l == "ruff.....Passed"), "{seen:?}");
+        assert!(seen.iter().any(|l| l == "pytest..Passed"), "{seen:?}");
+        assert!(summary.contains("with hook"), "{summary}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn output_arrives_while_the_hook_is_still_running() {
+        use std::time::{Duration, Instant};
+        let dir = staged_repo("hook-live");
+        install_hook(
+            &dir,
+            "pre-commit",
+            "#!/bin/sh\necho early\nsleep 1\necho late\nexit 0\n",
+        );
+
+        let start = Instant::now();
+        let mut early_at = None;
+        commit(&dir, "live", &mut |l| {
+            if l == "early" {
+                early_at = Some(start.elapsed());
+            }
+        })
+        .unwrap();
+        let total = start.elapsed();
+
+        // The whole point of streaming: the first line is readable a second
+        // before the command finishes, instead of the screen sitting blank and
+        // then filling in all at once.
+        let early = early_at.expect("the first line never arrived");
+        assert!(total >= Duration::from_millis(900), "hook exited too fast to tell: {total:?}");
+        assert!(
+            early < Duration::from_millis(500),
+            "first line took {early:?} of a {total:?} command — that is buffered, not streamed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failing_hook_aborts_the_commit_and_keeps_its_output() {
+        let dir = staged_repo("hook-fail");
+        install_hook(
+            &dir,
+            "pre-commit",
+            "#!/bin/sh\necho 'FAILED tests/test_api.py::test_login'\necho 'assert 1 == 2'\nexit 1\n",
+        );
+
+        let mut seen = Vec::new();
+        let err = commit(&dir, "blocked", &mut |l| seen.push(l)).unwrap_err();
+
+        // The one-line message names the hook — the detail is in the output the
+        // caller just collected, which is the whole reason it is collected.
+        assert!(format!("{err}").contains("pre-commit hook failed"), "{err}");
+        assert!(
+            seen.iter().any(|l| l.contains("test_login")),
+            "the failure has to survive the command that failed: {seen:?}"
+        );
+        // And nothing was committed: still just the repo's initial commit.
+        let log = git(&dir, &["log", "--oneline"]).unwrap();
+        assert_eq!(log.lines().count(), 1, "{log}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_rewritten_progress_line_reports_its_final_state() {
+        let dir = staged_repo("hook-progress");
+        // What every test runner's progress bar looks like on a pipe.
+        install_hook(
+            &dir,
+            "pre-commit",
+            "#!/bin/sh\nprintf '10%%\\r50%%\\r100%% done\\n'\nexit 0\n",
+        );
+
+        let mut seen = Vec::new();
+        commit(&dir, "progress", &mut |l| seen.push(l)).unwrap();
+
+        assert!(
+            seen.iter().any(|l| l == "100% done"),
+            "carriage returns should collapse to what a terminal would show: {seen:?}"
+        );
+        assert!(!seen.iter().any(|l| l.contains('\r')), "{seen:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_a_hook_git_would_actually_run_gets_named() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_repo("hook-detect");
+        assert!(hook_path(&dir, "pre-commit").is_none());
+
+        install_hook(&dir, "pre-commit", "#!/bin/sh\nexit 0\n");
+        assert!(hook_path(&dir, "pre-commit").is_some());
+
+        // git skips a hook that isn't executable, so labelling the pane after
+        // it would be a lie about what is taking the time.
+        let path = dir.join(".git/hooks/pre-commit");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(hook_path(&dir, "pre-commit").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hook_detection_follows_core_hookspath() {
+        let dir = scratch_repo("hook-path-config");
+        let elsewhere = dir.join("tooling-hooks");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = elsewhere.join("pre-commit");
+            std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Not in `.git/hooks`, so a naive lookup would report no hook at all.
+        git(&dir, &["config", "core.hooksPath", "tooling-hooks"]).unwrap();
+        assert_eq!(hook_path(&dir, "pre-commit"), Some(elsewhere.join("pre-commit")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

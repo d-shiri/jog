@@ -10,7 +10,7 @@ use ratatui::widgets::{
 use std::collections::HashMap;
 
 use super::animated_glyph;
-use crate::app::state::{AppState, DetailItem, Theme, View, build_detail_items};
+use crate::app::state::{AppState, DetailItem, GitOp, Theme, View, build_detail_items};
 use crate::history::HistoryEntry;
 use crate::provider::{Run, Status};
 
@@ -231,6 +231,28 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                 ("↵".into(), "commit"),
                 ("Esc".into(), "cancel"),
             ]
+        }
+        // Hook output on screen: the movement keys drive it, so say so rather
+        // than list the file-list keys it has taken over.
+        View::GitStatus if state.current_op().is_some() => {
+            let running = state.current_op().is_some_and(|o| !o.finished);
+            let mut hints = vec![
+                (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "scroll"),
+                (
+                    format!("{}/{}", display_key(&km.next_error), display_key(&km.prev_error)),
+                    "next/prev error",
+                ),
+                (
+                    format!("{}/{}", display_key(&km.scroll_top), display_key(&km.scroll_bottom)),
+                    "top/tail",
+                ),
+                (display_key(&km.yank).into(), "yank output"),
+            ];
+            hints.push((
+                display_key(&km.back).into(),
+                if running { "leave (keeps running)" } else { "dismiss" },
+            ));
+            hints
         }
         View::GitStatus => {
             let mut hints = vec![
@@ -479,6 +501,12 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                 Style::default().fg(Color::Rgb(120, 120, 145)),
             ));
         }
+        // A commit running (or stopped by a hook) in another repo is reported
+        // on its own row — otherwise the only way to learn that a 90-second
+        // `pre-commit` is still going is to walk back into that repo and look.
+        if let Some(op) = state.git_ops.get(&card.spec) {
+            spans.push(op_row_marker(op, state.tick_count, theme));
+        }
         Cell::from(Line::from(spans))
     };
 
@@ -514,7 +542,9 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         .repos
         .iter()
         .map(|card| {
-            let active = card.spec == state.repo_label;
+            // Same reasoning as the header above: until a repo is actually
+            // entered, the workspace dashboard has no active repo to point at.
+            let active = !state.repo_label_implicit && card.spec == state.repo_label;
             let name_style = if active {
                 Style::default().fg(Color::White).bold()
             } else {
@@ -680,6 +710,13 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
                 (k(&km.trigger), "open this repo's workflows to run CI"),
                 (k(&km.git_refresh), "re-read the working tree"),
                 (format!("{}/↵", k(&km.git_diff)), "diff the selected file"),
+                (
+                    pair(&km.down, &km.up),
+                    "scroll the hook output, while a commit/push is showing it",
+                ),
+                (pair(&km.next_error, &km.prev_error), "next / previous error in that output"),
+                (k(&km.yank), "yank the whole hook output"),
+                (k(&km.back), "dismiss the output of a failed commit/push"),
             ],
         ),
         (
@@ -890,10 +927,29 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
+    // A running or failed command takes the bottom half. It is capped rather
+    // than given a fixed share so a two-line failure doesn't push the file list
+    // off screen, and a 2,000-line pytest run doesn't get four rows.
+    let op = state.current_op();
+    let op_height = op.map(|op| {
+        let wanted = op.lines.len() as u16 + 3; // header + borders
+        wanted.clamp(6, (inner.height / 2).max(6)).min(inner.height.saturating_sub(4))
+    });
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .constraints(match op_height {
+            Some(h) => vec![
+                Constraint::Length(2),
+                Constraint::Min(0),
+                Constraint::Length(h),
+            ],
+            None => vec![Constraint::Length(2), Constraint::Min(0)],
+        })
         .split(inner);
+
+    if let (Some(op), Some(area)) = (op, chunks.get(2)) {
+        render_op_output(f, *area, op, state);
+    }
 
     // ── Summary line ───────────────────────────────────────────────────
     let staged = gv.staged_count();
@@ -1011,6 +1067,104 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
     let mut ts = TableState::default();
     ts.select(Some(gv.cursor));
     f.render_stateful_widget(table, chunks[1], &mut ts);
+}
+
+/// One dashboard row's note that this repo has a commit or push in it.
+///
+/// Deliberately terse: it shares a proportional column with the branch name,
+/// where a long name plus "pre-commit hook" would clip whichever came second.
+/// Which hook it was is in the pane, one keypress away; the row only has to say
+/// that this repo is in a commit, and whether that commit is now stuck.
+fn op_row_marker(op: &GitOp, tick: u64, theme: &Theme) -> Span<'static> {
+    if op.finished {
+        Span::styled(
+            format!("  ✗ {}", op.verb),
+            Style::default().fg(theme.failure).bold(),
+        )
+    } else {
+        Span::styled(
+            format!("  {} {}", animated_glyph(Status::Running, tick), op.verb),
+            Style::default().fg(theme.warning),
+        )
+    }
+}
+
+/// The output of a running — or just-failed — commit or push.
+///
+/// This pane exists for hooks. A `pre-commit` running pytest or pyright is the
+/// difference between a commit taking 40 milliseconds and 40 seconds, and while
+/// it runs the view would otherwise sit there looking hung. When it fails, its
+/// output is the only account of *why* anywhere in the system: git exits
+/// non-zero and adds nothing.
+fn render_op_output(f: &mut Frame, area: Rect, op: &GitOp, state: &AppState) {
+    let theme = &state.theme;
+    let errors = op.error_count();
+    let (title, border) = if !op.finished {
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let glyph = FRAMES[((state.tick_count / 2) % 10) as usize];
+        (
+            format!(
+                "{glyph} {} · {}s",
+                op.label(),
+                op.elapsed_secs(state.tick_count)
+            ),
+            theme.warning,
+        )
+    } else if op.failed {
+        let tally = if errors > 0 {
+            format!(" · {errors}✗")
+        } else {
+            String::new()
+        };
+        (format!("✗ {} failed{tally}", op.label()), theme.failure)
+    } else {
+        (format!("✓ {}", op.label()), theme.success)
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(border).bold(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    let viewport = inner.height as usize;
+    state.last_op_viewport_height.set(inner.height);
+    let offset = op.scroll_offset(viewport);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(viewport);
+    // Say so when the head of a long run was dropped, rather than let the top
+    // of the pane read as the start of the output.
+    if offset == 0 && op.dropped > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("⋯ {} earlier lines dropped ⋯", op.dropped),
+            Style::default().fg(Color::Rgb(110, 110, 140)),
+        )));
+    }
+    for l in op.lines.iter().skip(offset).take(viewport - lines.len()) {
+        let style = if l.error {
+            Style::default().fg(theme.failure)
+        } else if l.warn {
+            Style::default().fg(theme.warning)
+        } else {
+            Style::default().fg(Color::Rgb(190, 190, 210))
+        };
+        lines.push(Line::from(Span::styled(l.text.clone(), style)));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "waiting for output…",
+            Style::default().fg(Color::Rgb(110, 110, 140)),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Style one line of diff text.
@@ -2409,6 +2563,198 @@ mod tests {
             .filter(|l| l.starts_with('│') && !l.trim_matches(['│', ' ']).is_empty())
             .collect();
         assert_eq!(body.len(), 5, "got {body:?}");
+    }
+
+    /// Draw the Changes pane off-screen, same idea as `draw_logs`.
+    fn draw_changes(state: &AppState, w: u16, h: u16) -> String {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_git_status(f, f.area(), state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn state_with_op(op: GitOp) -> AppState {
+        let mut st = AppState::new(
+            "acme/api".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        let gv = crate::app::state::GitView::new(
+            "acme/api".into(),
+            std::path::PathBuf::from("/tmp/acme-api"),
+            true,
+        );
+        st.git_ops.insert(gv.spec.clone(), op);
+        st.git_view = Some(gv);
+        st.view = View::GitStatus;
+        st
+    }
+
+    #[test]
+    fn a_failed_hook_shows_the_failure_not_just_that_it_failed() {
+        let mut op = GitOp::new("commit", Some("pre-commit".into()), 0);
+        for l in [
+            "ruff.....Passed",
+            "pytest...Failed",
+            "FAILED tests/test_api.py::test_login",
+            "assert 1 == 2",
+        ] {
+            op.push_line(l.into());
+        }
+        op.finished = true;
+        op.failed = true;
+        let out = draw_changes(&state_with_op(op), 80, 14);
+
+        // The whole point: the pytest line is on screen, and the border names
+        // what produced it rather than saying "commit failed".
+        assert!(out.contains("pre-commit hook failed"), "got:\n{out}");
+        assert!(out.contains("test_login"), "got:\n{out}");
+        assert!(out.contains("assert 1 == 2"), "got:\n{out}");
+        // Both `pytest...Failed` and the `FAILED` line count as errors.
+        assert!(out.contains("2✗"), "got:\n{out}");
+    }
+
+    #[test]
+    fn a_running_hook_says_what_it_is_and_how_long_it_has_been() {
+        let mut op = GitOp::new("commit", Some("pre-commit".into()), 0);
+        for i in 0..40 {
+            op.push_line(format!("collecting test {i}"));
+        }
+        let mut st = state_with_op(op);
+        st.tick_count = 123; // 12.3s in
+        let out = draw_changes(&st, 80, 14);
+
+        assert!(out.contains("pre-commit hook · 12s"), "got:\n{out}");
+        // Still running, so the pane sits on the newest output — the oldest is
+        // scrolled off, not the other way round.
+        assert!(out.contains("collecting test 39"), "got:\n{out}");
+        assert!(!out.contains("collecting test 0 "), "got:\n{out}");
+    }
+
+    #[test]
+    #[ignore = "visual check: cargo test show_changes -- --ignored --nocapture"]
+    fn show_changes() {
+        let mut running = GitOp::new("commit", Some("pre-commit".into()), 0);
+        for l in ["ruff.....Passed", "pyright..", "collecting tests…"] {
+            running.push_line(l.into());
+        }
+        let mut st = state_with_op(running);
+        st.tick_count = 87;
+        println!("─── running ───\n{}", draw_changes(&st, 80, 14));
+
+        let mut failed = GitOp::new("commit", Some("pre-commit".into()), 0);
+        for l in [
+            "ruff.....Passed",
+            "pyright..Failed",
+            "- hook id: pyright",
+            "src/api.py:41:12 - error: \"user_id\" is not defined",
+            "1 error, 0 warnings",
+        ] {
+            failed.push_line(l.into());
+        }
+        failed.finished = true;
+        failed.failed = true;
+        println!("─── failed ───\n{}", draw_changes(&state_with_op(failed), 80, 14));
+    }
+
+    #[test]
+    fn the_dashboard_row_says_a_repo_is_mid_commit() {
+        let mut st = state_with_op(GitOp::new("commit", Some("pre-commit".into()), 0));
+        // The row for the repo being committed, plus one that isn't.
+        for spec in ["acme/api", "acme/web"] {
+            let mut card = crate::app::state::RepoCard::new(spec.into());
+            card.path = Some(std::path::PathBuf::from("/tmp").join(spec));
+            card.git = Some(crate::git::parse_status("## main\0 M a.txt\0"));
+            card.loaded = true;
+            st.repos.push(card);
+        }
+        st.view = View::Repos;
+
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 10)).unwrap();
+        term.draw(|f| render_repos(f, f.area(), &st)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        let api = rows.iter().find(|r| r.contains("acme/api")).unwrap();
+        let web = rows.iter().find(|r| r.contains("acme/web")).unwrap();
+        // Next to the branch, where the rest of the working-tree state lives.
+        assert!(api.contains("main ●1"), "got {api:?}");
+        assert!(api.contains("commit"), "got {api:?}");
+        // …and only on that repo. A marker on every row would say nothing.
+        assert!(!web.contains("commit"), "got {web:?}");
+    }
+
+    #[test]
+    fn a_guessed_active_repo_is_not_marked_active() {
+        let mut st = AppState::new(
+            "acme/api".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        for spec in ["acme/api", "acme/web"] {
+            let mut card = crate::app::state::RepoCard::new(spec.into());
+            card.path = Some(std::path::PathBuf::from("/tmp").join(spec));
+            card.git = Some(crate::git::parse_status("## main\0"));
+            card.loaded = true;
+            st.repos.push(card);
+        }
+        st.view = View::Repos;
+
+        let draw = |st: &AppState| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 10)).unwrap();
+            term.draw(|f| render_repos(f, f.area(), st)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .find(|r| r.contains("acme/api"))
+                .unwrap()
+        };
+
+        // Entered deliberately: the dot says which repo we're on.
+        assert!(draw(&st).contains("acme/api  ●"), "got {:?}", draw(&st));
+
+        // Guessed at startup from a workspace scan: nothing to point at.
+        st.repo_label_implicit = true;
+        assert!(!draw(&st).contains("●"), "got {:?}", draw(&st));
+    }
+
+    #[test]
+    fn no_op_means_no_pane() {
+        let st = AppState::new(
+            "acme/api".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        let out = draw_changes(&st, 80, 14);
+        assert!(!out.contains("hook"), "got:\n{out}");
     }
 
     #[test]

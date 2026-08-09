@@ -20,7 +20,8 @@ use tokio::sync::mpsc;
 use rayon::prelude::*;
 
 use crate::app::state::{
-    AppState, DetailItem, Finder, FinderKind, RepoCard, TriggerPrompt, View, build_detail_items,
+    AppState, DetailItem, Finder, FinderKind, GitOp, RepoCard, TriggerPrompt, View,
+    build_detail_items,
 };
 use crate::config::KeymapConfig;
 use crate::config::{Config, NotifyMode};
@@ -48,6 +49,13 @@ pub enum AppEvent {
     /// A git command finished. `Some(msg)` reports success, `Err` the failure;
     /// either way the status is refreshed afterwards.
     GitOpDone(String, Result<String, String>),
+    /// Live output from a running commit/push — mostly hook output. Batched
+    /// rather than one event per line: every event redraws, and a pytest run
+    /// would otherwise repaint the screen a few thousand times.
+    GitOpOutput(String, Vec<String>),
+    /// Which hook, if any, the command that just started will run. Resolved off
+    /// the UI thread, so it names the pane a moment after it opens.
+    GitOpStarted(String, Option<String>),
     /// The active repo changed: new label, default branch, and workflow list.
     RepoSwitched {
         label: String,
@@ -92,6 +100,9 @@ pub async fn run(
     state.repos = if opts.workspace.is_empty() {
         dashboard_repos(&config, &state.repo_label)
     } else {
+        // Workspace mode: `repo_label` is whichever scanned repo happened to
+        // have a usable remote, not somewhere the user asked to be.
+        state.repo_label_implicit = true;
         workspace_repos(&opts.workspace, &config)
     };
 
@@ -440,11 +451,53 @@ async fn event_loop(
                         }
                         state.pending = state.pending.saturating_sub(1);
                     }
+                    AppEvent::GitOpStarted(spec, hook) => {
+                        if let Some(op) = state.git_ops.get_mut(&spec)
+                            && !op.finished
+                        {
+                            op.hook = hook;
+                        }
+                    }
+                    AppEvent::GitOpOutput(spec, lines) => {
+                        if let Some(op) = state.git_ops.get_mut(&spec) {
+                            for line in lines {
+                                op.push_line(line);
+                            }
+                        }
+                    }
                     AppEvent::GitOpDone(spec, result) => {
+                        let failed = result.is_err();
                         if let Some(gv) = state.git_view.as_mut()
                             && gv.spec == spec
                         {
                             gv.busy = false;
+                        }
+                        let viewport = state.last_op_viewport_height.get().max(1) as usize;
+                        let had_op = match state.git_ops.entry(spec.clone()) {
+                            std::collections::hash_map::Entry::Occupied(mut e) => {
+                                if failed {
+                                    let op = e.get_mut();
+                                    op.finished = true;
+                                    op.failed = true;
+                                    // Land on the first error rather than the
+                                    // tail. A pytest tail is a summary count;
+                                    // the assertion is further up.
+                                    op.scroll_to_top();
+                                    op.jump_error(true, viewport);
+                                } else {
+                                    // Succeeded: the status line carries the
+                                    // summary and there is nothing left to read.
+                                    e.remove();
+                                }
+                                true
+                            }
+                            std::collections::hash_map::Entry::Vacant(_) => false,
+                        };
+                        // Only commit/push are in the map, and only those are
+                        // worth a sound: a failed `git add` is instant and its
+                        // message is already on screen.
+                        if failed && had_op {
+                            play_op_failed_sound(&config);
                         }
                         match result {
                             Ok(msg) => state.set_status(msg),
@@ -465,6 +518,7 @@ async fn event_loop(
                     }
                     AppEvent::RepoSwitched { label, branch, workflows } => {
                         state.repo_label = label;
+                        state.repo_label_implicit = false;
                         state.current_branch = branch;
                         state.workflows = sort_with_favorites(workflows, &config);
                         state.workflow_cursor = 0;
@@ -504,7 +558,14 @@ async fn event_loop(
                     // The finder holds indices into the list it was opened over.
                     // Refreshing that list underneath it would shift every index,
                     // so Enter would commit to whatever slid into the slot.
-                    if state.pending == 0 && state.finder.is_none() {
+                    //
+                    // A commit sitting in a 90-second `pre-commit` hook counts
+                    // towards `pending` — it should keep the footer spinning —
+                    // but it fetches nothing and changes no CI state, so it must
+                    // not pause polling: a run finishing in another repo would
+                    // go unannounced until the hook was done.
+                    let in_hooks = state.git_ops.values().filter(|o| !o.finished).count();
+                    if state.pending == in_hooks && state.finder.is_none() {
                         match state.view {
                             View::Repos => {
                                 spawn_fetch_repo_cards(&provider, state, &tx);
@@ -652,6 +713,22 @@ async fn handle_key(
         return None;
     }
 
+    // A *finished* hook-output pane takes `back` before the view does: what you
+    // do after reading the failure is fix the file it pointed at, so dismissing
+    // the output should not also throw you out of the repo. A command still
+    // running keeps its pane instead — `back` steps out of the view and leaves
+    // it to finish, and the output is waiting on the way back in.
+    if (key_is(&key, km.back) || key.code == KeyCode::Esc)
+        && state.view == View::GitStatus
+        && state.current_op().is_some_and(|o| o.finished)
+    {
+        let spec = state.git_view.as_ref().map(|g| g.spec.clone());
+        if let Some(spec) = spec {
+            state.git_ops.remove(&spec);
+        }
+        return None;
+    }
+
     // Global: back — Esc is always accepted as a fallback regardless of config
     if key_is(&key, km.back) || key.code == KeyCode::Esc {
         match state.view {
@@ -733,11 +810,15 @@ async fn handle_key(
     if key_is(&key, km.yank) {
         let text: Option<String> = match state.view {
             View::Repos => state.repos.get(state.repo_cursor).map(|c| c.spec.clone()),
-            View::GitStatus => state
-                .git_view
-                .as_ref()
-                .and_then(|g| g.selected())
-                .map(|e| e.path.clone()),
+            // With hook output on screen, the whole failure is what you want on
+            // the clipboard — to paste into an editor, a bug report, or a chat.
+            View::GitStatus => state.current_op().map(|o| o.text()).or_else(|| {
+                state
+                    .git_view
+                    .as_ref()
+                    .and_then(|g| g.selected())
+                    .map(|e| e.path.clone())
+            }),
             View::GitDiff => state.git_diff.as_ref().map(|d| d.file.clone()),
             View::Workflows => state.selected_workflow().map(|w| w.file_name.clone()),
             View::Runs | View::Watch => state
@@ -786,6 +867,12 @@ async fn handle_key(
             }
         }
         View::GitStatus => {
+            // With hook output on screen the movement keys belong to it — it is
+            // the thing that just changed, and reading it is why it is there.
+            // Everything else (stage, commit again) still falls through.
+            if state.current_op().is_some() && handle_op_pane_key(state, key, km) {
+                return None;
+            }
             let len = state.git_view.as_ref().map(|g| g.entries().len()).unwrap_or(0);
             if key_is(&key, km.down) || key.code == KeyCode::Down {
                 if let Some(g) = state.git_view.as_mut() {
@@ -1533,15 +1620,68 @@ fn toggle_stage_at_cursor(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEv
     }
 }
 
+/// Scroll keys for the hook-output pane. Returns whether the key was consumed.
+///
+/// Deliberately the same set as the log viewer, `e`/`E` included: a failed
+/// `pre-commit` is a test log, so the keys that walk a CI log's errors should
+/// walk this one's too.
+fn handle_op_pane_key(state: &mut AppState, key: KeyEvent, km: &Keymap) -> bool {
+    let viewport = state.last_op_viewport_height.get().max(1) as usize;
+    let page = viewport as isize;
+    let mut no_errors = false;
+    let consumed = {
+        let Some(op) = state.current_op_mut() else {
+            return false;
+        };
+        if key_is(&key, km.down) || key.code == KeyCode::Down {
+            op.scroll_by(1, viewport);
+            true
+        } else if key_is(&key, km.up) || key.code == KeyCode::Up {
+            op.scroll_by(-1, viewport);
+            true
+        } else if key.code == KeyCode::PageDown {
+            op.scroll_by(page, viewport);
+            true
+        } else if key.code == KeyCode::PageUp {
+            op.scroll_by(-page, viewport);
+            true
+        } else if key_is(&key, km.scroll_top) {
+            op.scroll_to_top();
+            true
+        } else if key_is(&key, km.scroll_bottom) {
+            op.scroll_to_bottom();
+            true
+        } else if key_is(&key, km.next_error) {
+            no_errors = !op.jump_error(true, viewport);
+            true
+        } else if key_is(&key, km.prev_error) {
+            no_errors = !op.jump_error(false, viewport);
+            true
+        } else {
+            false
+        }
+    };
+    if no_errors {
+        state.set_status("no errors in the output".into());
+    }
+    consumed
+}
+
 /// Open the commit-message editor, refusing when the index is empty.
 fn begin_commit(state: &mut AppState) {
-    let Some(gv) = state.git_view.as_mut() else {
+    let Some(gv) = state.git_view.as_ref() else {
         return;
     };
-    if gv.busy {
+    // `op_running` as well as `busy`: leaving the view and coming back clears
+    // the flag but not the commit it was guarding. Checked here rather than
+    // only at submit, so the refusal comes before the message is typed.
+    if gv.busy || state.op_running(&gv.spec) {
         state.set_status("a git command is already running".into());
         return;
     }
+    let Some(gv) = state.git_view.as_mut() else {
+        return;
+    };
     if gv.staged_count() == 0 {
         let has_changes = !gv.entries().is_empty();
         state.set_status(if has_changes {
@@ -1577,8 +1717,8 @@ fn handle_commit_input(
                 state.set_status("commit aborted: empty message".into());
                 return;
             }
-            spawn_git_op(state, tx, move |dir| {
-                crate::git::commit(dir, &msg)?;
+            spawn_git_op_streaming(state, tx, "commit", "pre-commit", move |dir, out| {
+                crate::git::commit(dir, &msg, out)?;
                 let sha = crate::git::head_sha(dir).unwrap_or_else(|_| "HEAD".into());
                 Ok(format!("committed {sha} — push, then `t` to run CI"))
             });
@@ -1603,7 +1743,7 @@ fn push_current(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
     };
     // Check this before reading `status`: a commit in flight has not been folded
     // into the ahead count yet, so we'd otherwise report "nothing to push".
-    if gv.busy {
+    if gv.busy || state.op_running(&gv.spec) {
         state.set_status("a git command is already running".into());
         return;
     }
@@ -1624,8 +1764,8 @@ fn push_current(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
     let branch = status.branch.clone();
     let has_upstream = status.has_upstream;
     state.set_status(format!("pushing {branch}…"));
-    spawn_git_op(state, tx, move |dir| {
-        crate::git::push(dir, &branch, has_upstream)
+    spawn_git_op_streaming(state, tx, "push", "pre-push", move |dir, out| {
+        crate::git::push(dir, &branch, has_upstream, out)
     });
 }
 
@@ -2250,25 +2390,122 @@ fn step_diff_file(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>, de
 }
 
 /// Run one git mutation off-thread; the result refreshes the status view.
+///
+/// For the quick ones — staging, unstaging — that produce nothing worth
+/// reading. `spawn_git_op_streaming` is the one for commands that run hooks.
 fn spawn_git_op<F>(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>, op: F)
 where
     F: FnOnce(&std::path::Path) -> anyhow::Result<String> + Send + 'static,
 {
-    let Some(gv) = state.git_view.as_mut() else {
+    let Some(gv) = state.git_view.as_ref() else {
         return;
     };
-    if gv.busy {
+    let (spec, path) = (gv.spec.clone(), gv.path.clone());
+    // Staging while a hook is mid-commit would change the index out from under
+    // the commit that is reading it.
+    if gv.busy || state.op_running(&spec) {
         state.set_status("a git command is already running".into());
         return;
     }
-    gv.busy = true;
-    let (spec, path) = (gv.spec.clone(), gv.path.clone());
+    if let Some(gv) = state.git_view.as_mut() {
+        gv.busy = true;
+    }
     let tx = tx.clone();
     state.pending += 1;
     tokio::task::spawn_blocking(move || {
         let result = op(&path).map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::GitOpDone(spec, result));
     });
+}
+
+/// Run a git command whose output the user needs to see — commit and push,
+/// where the work is done by a `pre-commit`/`pre-push` hook that can take a
+/// minute and fail with a wall of pytest output.
+///
+/// Opens the op pane immediately so the view stops looking frozen, then feeds
+/// it lines as the hook produces them.
+fn spawn_git_op_streaming<F>(
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+    verb: &'static str,
+    hook: &'static str,
+    op: F,
+) where
+    F: FnOnce(&std::path::Path, &mut dyn FnMut(String)) -> anyhow::Result<String>
+        + Send
+        + 'static,
+{
+    let tick = state.tick_count;
+    let Some(gv) = state.git_view.as_ref() else {
+        return;
+    };
+    let (spec, path) = (gv.spec.clone(), gv.path.clone());
+    if gv.busy || state.op_running(&spec) {
+        state.set_status("a git command is already running".into());
+        return;
+    }
+    if let Some(gv) = state.git_view.as_mut() {
+        gv.busy = true;
+    }
+    // Starts unnamed: whether a hook is installed takes two `git` calls to
+    // answer, which the worker does rather than the UI thread.
+    state
+        .git_ops
+        .insert(spec.clone(), GitOp::new(verb, None, tick));
+    let tx = tx.clone();
+    state.pending += 1;
+    tokio::task::spawn_blocking(move || {
+        let installed = crate::git::hook_path(&path, hook).map(|_| hook.to_string());
+        let _ = tx.send(AppEvent::GitOpStarted(spec.clone(), installed));
+        let mut batch = LineBatch::new(spec.clone(), tx.clone());
+        let result = op(&path, &mut |line| batch.push(line)).map_err(|e| format!("{e:#}"));
+        batch.flush();
+        let _ = tx.send(AppEvent::GitOpDone(spec, result));
+    });
+}
+
+/// Coalesces a command's output lines into batched events.
+///
+/// Every `AppEvent` costs a full redraw, and a hook running a test suite emits
+/// thousands of lines in a burst. Flushing on a 100ms floor keeps the pane
+/// visibly live — a line that arrives alone goes out immediately — while a
+/// burst repaints ten times a second instead of ten thousand.
+struct LineBatch {
+    spec: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+    buf: Vec<String>,
+    /// `None` until the first flush, so the very first line goes out at once.
+    last_flush: Option<std::time::Instant>,
+}
+
+impl LineBatch {
+    fn new(spec: String, tx: mpsc::UnboundedSender<AppEvent>) -> Self {
+        Self {
+            spec,
+            tx,
+            buf: Vec::new(),
+            last_flush: None,
+        }
+    }
+
+    fn push(&mut self, line: String) {
+        self.buf.push(line);
+        let due = self
+            .last_flush
+            .is_none_or(|t| t.elapsed() >= Duration::from_millis(100));
+        if self.buf.len() >= 64 || due {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.buf.is_empty() {
+            return;
+        }
+        let lines = std::mem::take(&mut self.buf);
+        let _ = self.tx.send(AppEvent::GitOpOutput(self.spec.clone(), lines));
+        self.last_flush = Some(std::time::Instant::now());
+    }
 }
 
 /// Open the working-tree view for the dashboard row under the cursor.
@@ -2640,6 +2877,19 @@ fn play_terminal_sound(status: Status, config: &Config) {
     if let Some(path) = sound_path(configured, bundled, name) {
         play_sound(&path);
     }
+}
+
+/// Sound for a commit or push that a hook rejected.
+///
+/// Reuses the CI fail sound and the same `notify` gate: a hook that fails after
+/// you have walked away from a 90-second test suite is exactly the "something
+/// broke" moment the sound exists for. Desktop notifications are skipped — the
+/// commit was a keystroke ago, the user is still here.
+fn play_op_failed_sound(config: &Config) {
+    if config.ui.notify_mode() == NotifyMode::Never || !config.ui.notify_sound {
+        return;
+    }
+    play_terminal_sound(Status::Failure, config);
 }
 
 /// Track a run across polls and announce it exactly once, when it transitions

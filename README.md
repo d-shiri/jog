@@ -130,6 +130,52 @@ The order matters: `workflow_dispatch` runs against the **remote**, so a commit
 that hasn't been pushed won't be the code CI builds. Commit → push → trigger.
 `jog` never pushes on its own; `P` is always an explicit keystroke.
 
+## Watching a pre-commit hook
+
+A repo with a `pre-commit` hook doesn't take 40 milliseconds to commit, it takes
+however long pytest and pyright take. `jog` shows that run instead of freezing
+for it:
+
+```
+ ╭ acme/api — main ─────────────────────────────────────────────────────────────╮
+ │ 3 staged   1 unstaged   ~/work/acme-api                                       │
+ │ ● M  src/api.py                                                               │
+ │                                                                               │
+ │╭ ✗ pre-commit hook failed · 2✗ ──────────────────────────────────────────────╮│
+ ││ pyright.................................................Failed              ││
+ ││ - hook id: pyright                                                          ││
+ ││ src/api.py:41:12 - error: "user_id" is not defined                          ││
+ ││ 1 error, 0 warnings                                                         ││
+ │╰─────────────────────────────────────────────────────────────────────────────╯│
+ ╰───────────────────────────────────────────────────────────────────────────────╯
+```
+
+- **While it runs** the pane titles itself with the hook and a running clock —
+  `⠹ pre-commit hook · 24s` — and follows the output as it arrives, line by
+  line, rather than dumping it all at the end.
+- **When it fails** the pane stays, and the view lands on the *first error*
+  rather than the tail: a test runner's last line is a summary count, and the
+  assertion that explains it is further up. The commit is aborted, as git
+  intended; nothing is committed behind your back.
+- **When it succeeds** the pane closes and the status line reports the commit.
+
+Errors are picked out with the same rules the CI log viewer uses, extended to
+the `pre-commit` framework's own `ruff.......Failed` verdict column.
+
+| Key | Action |
+|-----|--------|
+| `j`/`k` | scroll the output |
+| `e`/`E` | jump to the next / previous error |
+| `g`/`G` | top / back to following the tail |
+| `y` | yank the whole output — to paste into an editor |
+| `Esc` | dismiss it, staying on the file list |
+
+`pre-push` hooks get the same treatment on `P`.
+
+The output belongs to the repo, not to the screen: `Esc` out of a repo mid-hook
+and its dashboard row says so (`main ●3  ⠹ commit`, or `✗ commit` once a hook
+has rejected it), and walking back in picks the output up where it was.
+
 ## Fuzzy finder
 
 `Ctrl-P` opens a finder over whatever the current view lists — repos, workflows,
@@ -187,6 +233,7 @@ view you're in floats to the top.
 | Global    | `?` help · `q` quit · `Esc` back · `j`/`k` move · `Enter` open · `Ctrl-P` find · `H` repos · `y` yank |
 | Repos     | `Enter` open repo · `c` review changes · `o` open in browser |
 | Changes   | `d`/`Enter` diff the file · `Space` stage/unstage · `a` stage all · `c` commit · `P` push · `t` run CI · `r` refresh |
+| Hook output | `j`/`k` scroll · `e`/`E` next/prev error · `g`/`G` top/tail · `y` yank · `Esc` dismiss |
 | Diff      | `j`/`k` scroll · `d`/`u` page · `g`/`G` top/bottom · `n`/`p` next/prev file · `Space` stage/unstage |
 | Workflows | `t` trigger · `w` watch · `o` open in browser |
 | Runs      | `t` trigger · `r` rerun · `R` rerun-failed · `x` cancel · `w` watch |
