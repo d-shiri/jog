@@ -387,11 +387,6 @@ impl RepoCard {
         self.remote.is_some()
     }
 
-    /// Uncommitted changes, if we have local state for this row.
-    pub fn dirty_count(&self) -> usize {
-        self.git.as_ref().map(|g| g.entries.len()).unwrap_or(0)
-    }
-
     /// Status of the most recent run, which is what the dashboard row reports.
     pub fn latest_status(&self) -> Option<Status> {
         self.runs.first().map(|r| r.status)

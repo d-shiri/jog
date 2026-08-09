@@ -3038,12 +3038,17 @@ mod tests {
         assert!(!local_only.has_ci());
     }
 
+    /// What the dashboard's Changes column reports: staged and unstaged are
+    /// counted apart, and a file that is both shows up in each.
     #[test]
-    fn dirty_count_reflects_working_tree() {
+    fn dashboard_counts_staged_and_unstaged_apart() {
         let mut card = RepoCard::local("/tmp/x".into(), None);
-        assert_eq!(card.dirty_count(), 0);
-        card.git = Some(crate::git::parse_status("## main\0 M a.rs\0?? b.rs\0"));
-        assert_eq!(card.dirty_count(), 2);
+        assert!(card.git.is_none());
+        card.git = Some(crate::git::parse_status("## main\0M  a.rs\0 M b.rs\0MM c.rs\0?? d.rs\0"));
+        let g = card.git.as_ref().unwrap();
+        assert!(!g.is_clean());
+        assert_eq!(g.staged_count(), 2);
+        assert_eq!(g.unstaged_count(), 3);
     }
 
 

@@ -462,6 +462,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         Cell::from(""),
         Cell::from(Span::styled("Repo", hdr)),
         Cell::from(Span::styled("Local branch", hdr)),
+        Cell::from(Span::styled("Changes", hdr)),
         Cell::from(Span::styled("Latest run", hdr)),
         Cell::from(Span::styled("Ran on", hdr)),
         Cell::from(Span::styled("Updated", hdr)),
@@ -470,9 +471,10 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
     .height(1)
     .bottom_margin(1);
 
-    // Working-tree summary: the branch you are actually on, how dirty it is, and
-    // how far it has drifted from upstream. Distinct from the "Ran on" column,
-    // which reports the branch the latest CI run used.
+    // Which branch you are standing on, and how far it has drifted from
+    // upstream. Distinct from the "Ran on" column, which reports the branch the
+    // latest CI run used. How *dirty* the tree is lives in its own column, so a
+    // long branch name can never push the file count out of sight.
     let local_cell = |card: &crate::app::state::RepoCard| -> Cell<'static> {
         let Some(g) = card.git.as_ref() else {
             return Cell::from("");
@@ -481,14 +483,6 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
             truncate(&g.branch, 20),
             Style::default().fg(Color::Yellow),
         )];
-        if g.is_clean() {
-            spans.push(Span::styled(" ✓", Style::default().fg(theme.success)));
-        } else {
-            spans.push(Span::styled(
-                format!(" ●{}", card.dirty_count()),
-                Style::default().fg(theme.warning).bold(),
-            ));
-        }
         if g.ahead > 0 {
             spans.push(Span::styled(
                 format!(" ↑{}", g.ahead),
@@ -506,6 +500,41 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         // `pre-commit` is still going is to walk back into that repo and look.
         if let Some(op) = state.git_ops.get(&card.spec) {
             spans.push(op_row_marker(op, state.tick_count, theme));
+        }
+        Cell::from(Line::from(spans))
+    };
+
+    // How dirty the working tree is, split the same way the Changes view splits
+    // it: what is already staged, and what still isn't. A single lump count
+    // can't tell "31 files ready to commit" from "31 files untouched since the
+    // last commit", and those call for opposite next moves.
+    let changes_cell = |card: &crate::app::state::RepoCard| -> Cell<'static> {
+        let Some(g) = card.git.as_ref() else {
+            return Cell::from("");
+        };
+        if g.is_clean() {
+            return Cell::from(Line::from(vec![
+                Span::styled("✓ ", Style::default().fg(theme.success)),
+                Span::styled("clean", Style::default().fg(Color::Rgb(90, 110, 95))),
+            ]));
+        }
+        let staged = g.staged_count();
+        let unstaged = g.unstaged_count();
+        let mut spans: Vec<Span> = Vec::new();
+        if staged > 0 {
+            spans.push(Span::styled(
+                format!("✚{staged}"),
+                Style::default().fg(theme.success).bold(),
+            ));
+        }
+        if unstaged > 0 {
+            if !spans.is_empty() {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(
+                format!("●{unstaged}"),
+                Style::default().fg(theme.warning).bold(),
+            ));
         }
         Cell::from(Line::from(spans))
     };
@@ -565,6 +594,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                     Cell::from(Span::styled("!", Style::default().fg(theme.failure).bold())),
                     name_cell,
                     local_cell(card),
+                    changes_cell(card),
                     Cell::from(Span::styled(
                         truncate(err, 46),
                         Style::default().fg(theme.failure),
@@ -583,6 +613,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                     Cell::from(""),
                     name_cell,
                     local_cell(card),
+                    changes_cell(card),
                     Cell::from(Span::styled(
                         "local only — no GitHub remote",
                         Style::default().fg(Color::Rgb(90, 90, 115)).italic(),
@@ -598,6 +629,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                     Cell::from(""),
                     name_cell,
                     local_cell(card),
+                    changes_cell(card),
                     Cell::from(Span::styled("loading…", Style::default().fg(Color::DarkGray))),
                     Cell::from(""),
                     Cell::from(""),
@@ -633,6 +665,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                 )),
                 name_cell,
                 local_cell(card),
+                changes_cell(card),
                 Cell::from(Span::styled(workflow, Style::default().fg(Color::Rgb(180, 180, 210)))),
                 ran_on_cell(card, &branch),
                 Cell::from(Span::styled(when_text, when_style)),
@@ -645,7 +678,8 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
     let widths = [
         Constraint::Length(1),   // status glyph
         Constraint::Fill(40),    // repo
-        Constraint::Fill(32),    // local branch + working tree
+        Constraint::Fill(26),    // local branch + upstream drift
+        Constraint::Length(9),   // working-tree changes
         Constraint::Fill(35),    // latest workflow
         Constraint::Fill(26),    // branch the run used
         Constraint::Length(10),  // updated
@@ -2696,9 +2730,11 @@ mod tests {
 
         let api = rows.iter().find(|r| r.contains("acme/api")).unwrap();
         let web = rows.iter().find(|r| r.contains("acme/web")).unwrap();
-        // Next to the branch, where the rest of the working-tree state lives.
-        assert!(api.contains("main ●1"), "got {api:?}");
+        // The in-flight commit rides with the branch; the file count now has a
+        // column of its own.
+        assert!(api.contains("main"), "got {api:?}");
         assert!(api.contains("commit"), "got {api:?}");
+        assert!(api.contains("●1"), "got {api:?}");
         // …and only on that repo. A marker on every row would say nothing.
         assert!(!web.contains("commit"), "got {web:?}");
     }
