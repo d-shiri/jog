@@ -2,8 +2,7 @@
 
 A terminal UI for browsing and triggering GitHub Actions workflows.
 
-![Main](./images/main.png)
-![Runs](./images/runs.png)
+![The jog dashboard: every repo's CI, working tree and run history on one screen](./images/dashboard.png)
 
 ## Download
 
