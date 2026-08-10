@@ -20,8 +20,8 @@ use tokio::sync::mpsc;
 use rayon::prelude::*;
 
 use crate::app::state::{
-    AppState, DetailItem, Finder, FinderKind, GitOp, RepoCard, TriggerPrompt, View,
-    build_detail_items,
+    AppState, BatchCommit, BatchPhase, DetailItem, Finder, FinderKind, GitOp, RepoCard, Theme,
+    TriggerPrompt, View, build_detail_items,
 };
 use crate::config::KeymapConfig;
 use crate::config::{Config, NotifyMode};
@@ -29,6 +29,7 @@ use crate::history::History;
 use crate::provider::github::{GitHubProvider, RepoSpec, current_branch};
 use crate::provider::{Provider, Run, RunDetail, Status, Step, Workflow};
 
+mod motion;
 mod views;
 
 pub enum AppEvent {
@@ -42,6 +43,9 @@ pub enum AppEvent {
     RepoCardLoaded(String, Vec<Run>),
     /// A dashboard row could not be fetched (typo, no access, network).
     RepoCardFailed(String, String),
+    /// Jobs and steps of the run currently in flight on one dashboard row —
+    /// what the activity strip needs to name the step, not just the workflow.
+    RepoProgressLoaded(String, RunDetail),
     /// Working-tree state for a local checkout.
     GitStatusLoaded(String, crate::git::RepoStatus),
     /// The diff for one file: repo spec, path, and one section per comparison.
@@ -96,6 +100,7 @@ pub async fn run(
     );
 
     state.log_focus_context = config.ui.log_focus_context;
+    resolve_theme(&mut state, &config);
     state.workspace_root = opts.workspace_root.clone();
     state.repos = if opts.workspace.is_empty() {
         dashboard_repos(&config, &state.repo_label)
@@ -142,7 +147,36 @@ fn dashboard_repos(cfg: &Config, active: &str) -> Vec<RepoCard> {
             specs.push(r.to_string());
         }
     }
-    specs.into_iter().map(RepoCard::new).collect()
+    group_by_owner(specs.into_iter().map(RepoCard::new).collect())
+}
+
+/// Gather each owner's repos together, owners in the order they first appear.
+///
+/// The dashboard groups rows under an owner heading, and a heading can only
+/// describe a contiguous run — a list that goes muufree, drposture, muufree
+/// would grow two muufree headings and imply a structure that isn't there.
+///
+/// A stable sort rather than an alphabetical one: whatever order the repos were
+/// configured or discovered in is a choice someone made, and this disturbs it
+/// only as much as grouping requires.
+fn group_by_owner(mut cards: Vec<RepoCard>) -> Vec<RepoCard> {
+    let mut order: Vec<&str> = Vec::new();
+    let rank: Vec<usize> = cards
+        .iter()
+        .map(|c| {
+            let owner = c.spec.split_once('/').map(|(o, _)| o).unwrap_or("");
+            match order.iter().position(|o| *o == owner) {
+                Some(i) => i,
+                None => {
+                    order.push(owner);
+                    order.len() - 1
+                }
+            }
+        })
+        .collect();
+    let mut with_rank: Vec<(usize, RepoCard)> = rank.into_iter().zip(cards.drain(..)).collect();
+    with_rank.sort_by_key(|(r, _)| *r);
+    with_rank.into_iter().map(|(_, c)| c).collect()
 }
 
 /// Dashboard rows for a scanned workspace: one per discovered checkout, plus any
@@ -193,7 +227,7 @@ fn workspace_repos(paths: &[std::path::PathBuf], cfg: &Config) -> Vec<RepoCard> 
         }
         cards.push(RepoCard::new(extra.to_string()));
     }
-    cards
+    group_by_owner(cards)
 }
 
 fn sort_with_favorites(mut wfs: Vec<Workflow>, cfg: &Config) -> Vec<Workflow> {
@@ -210,6 +244,37 @@ fn sort_with_favorites(mut wfs: Vec<Workflow>, cfg: &Config) -> Vec<Workflow> {
             .unwrap_or(usize::MAX / 2)
     });
     wfs
+}
+
+/// Pick the palette: `[ui] theme`, then `[ui.colors]` on top, then fold the
+/// result down if the terminal can't do 24-bit colour.
+///
+/// Every problem here is reported rather than swallowed. A colour setting that
+/// silently does nothing is indistinguishable from a broken one, and the user
+/// has no way to tell which they are looking at.
+fn resolve_theme(state: &mut AppState, config: &Config) {
+    let mut notes: Vec<String> = Vec::new();
+    state.theme = match Theme::by_name(&config.ui.theme) {
+        Some(t) => t,
+        None => {
+            notes.push(format!(
+                "unknown theme {:?} — try {}",
+                config.ui.theme,
+                Theme::NAMES.join(", ")
+            ));
+            Theme::default()
+        }
+    };
+    let rejected = state.theme.apply_overrides(&config.ui.colors);
+    if !rejected.is_empty() {
+        notes.push(format!("[ui.colors]: ignored {}", rejected.join(", ")));
+    }
+    if !crate::app::state::terminal_has_truecolor() {
+        state.theme.degrade_to_256();
+    }
+    if !notes.is_empty() {
+        state.set_status(notes.join(" · "));
+    }
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -256,6 +321,7 @@ async fn event_loop(
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut last_poll = tokio::time::Instant::now();
     let poll_interval = Duration::from_millis(config.ui.poll_interval_ms.max(1000));
+    state.poll_ticks = (poll_interval.as_millis() / 100).max(1) as u64;
     tick.tick().await;
 
     loop {
@@ -432,11 +498,22 @@ async fn event_loop(
                         for r in &runs {
                             announce_if_finished(state, r, &spec, &config);
                         }
+                        let tick = state.tick_count;
                         if let Some(card) = state.repos.iter_mut().find(|c| c.spec == spec) {
+                            // Mark the row as moved only when its CI actually
+                            // moved. The first load is not a change — every row
+                            // flashing at startup would train the eye to ignore
+                            // the one thing the flash is for.
+                            let before = card.runs.first().map(|r| (r.id, r.status));
+                            let after = runs.first().map(|r| (r.id, r.status));
+                            if card.loaded && before != after {
+                                card.changed_tick = Some(tick);
+                            }
                             card.runs = runs;
                             card.error = None;
                             card.loaded = true;
                         }
+                        sync_repo_progress(&provider, state, &spec, &tx);
                         state.pending = state.pending.saturating_sub(1);
                     }
                     AppEvent::RepoCardFailed(spec, err) => {
@@ -444,7 +521,27 @@ async fn event_loop(
                             card.error = Some(err);
                             card.loaded = true;
                         }
+                        // A row we can no longer fetch has nothing to report as
+                        // in flight; leaving the old entry would strand a
+                        // spinner that never advances.
+                        state.run_progress.remove(&spec);
                         state.pending = state.pending.saturating_sub(1);
+                    }
+                    AppEvent::RepoProgressLoaded(spec, detail) => {
+                        // Only fold in detail for the run the row is still
+                        // waiting on: a push during the fetch means this answer
+                        // describes a run that has already been superseded.
+                        let current = state
+                            .run_progress
+                            .get(&spec)
+                            .is_some_and(|d| d.run.id == detail.run.id);
+                        if current {
+                            if detail.run.status.is_terminal() {
+                                state.run_progress.remove(&spec);
+                            } else {
+                                state.run_progress.insert(spec, detail);
+                            }
+                        }
                     }
                     AppEvent::GitStatusLoaded(spec, status) => {
                         if let Some(card) = state.repos.iter_mut().find(|c| c.spec == spec) {
@@ -520,8 +617,21 @@ async fn event_loop(
                         if failed && had_op {
                             play_op_failed_sound(&config);
                         }
+                        // A commit landing is the other thing worth flashing a
+                        // row for — it is the moment that repo's state changed,
+                        // and it may not be the row you are looking at.
+                        let tick = state.tick_count;
+                        if let Some(card) = state.repos.iter_mut().find(|c| c.spec == spec) {
+                            card.changed_tick = Some(tick);
+                        }
+                        // Before the status line, so a batch that has more repos
+                        // to do overwrites it with what it moved on to.
+                        batch_on_op_done(state, &tx, &spec, &result);
                         match result {
-                            Ok(msg) => state.set_status(msg),
+                            Ok(msg) => state.set_status(match msg.strip_prefix(BATCH_NOTHING) {
+                                Some(why) => format!("{spec}: {why}"),
+                                None => msg,
+                            }),
                             Err(err) => state.set_status(err),
                         }
                         state.pending = state.pending.saturating_sub(1);
@@ -576,6 +686,7 @@ async fn event_loop(
                 let now = tokio::time::Instant::now();
                 if now.duration_since(last_poll) >= poll_interval {
                     last_poll = now;
+                    state.last_poll_tick = state.tick_count;
                     // The finder holds indices into the list it was opened over.
                     // Refreshing that list underneath it would shift every index,
                     // so Enter would commit to whatever slid into the slot.
@@ -652,6 +763,13 @@ async fn handle_key(
         handle_commit_input(state, key, tx);
         return None;
     }
+    // Same for the one message a batch commit is about to apply everywhere.
+    if state.view == View::BatchCommit
+        && state.batch.as_ref().is_some_and(|b| b.input.is_some())
+    {
+        handle_batch_input(state, key, tx);
+        return None;
+    }
     // In trigger-prompt edit mode, route ALL keys to the text editor.
     if state.view == View::TriggerPrompt
         && state.trigger_prompt.as_ref().map(|p| p.editing).unwrap_or(false)
@@ -706,6 +824,16 @@ async fn handle_key(
 
     // Global: quit
     if key_is(&key, km.quit) {
+        // Quitting mid-batch would kill a `pre-commit` hook in the middle of
+        // rewriting files. Asked of the *op*, not the phase: Esc stops the batch
+        // but deliberately lets the repo in flight finish, and quitting during
+        // that window would kill the very hook the stop promised to leave alone.
+        if state.batch.as_ref().is_some_and(|b| {
+            b.is_working() || b.items.iter().any(|i| state.op_running(&i.spec))
+        }) {
+            state.set_status("a commit is running — wait for it, or Esc then q".into());
+            return None;
+        }
         return Some(AppEvent::Quit);
     }
 
@@ -717,6 +845,13 @@ async fn handle_key(
 
     // Global: jump to the multi-repo dashboard.
     if key_is(&key, km.repos_view) && state.view != View::Repos {
+        // …except while a batch is live. It is the only view that can stop or
+        // resume the run, nothing else switches to it, and a batch left running
+        // off-screen would commit repo after repo with no way back in.
+        if batch_is_live(state) {
+            state.switch_view(View::BatchCommit);
+            return None;
+        }
         // The active repo is always row one, so a single row means nothing was
         // configured — a one-row dashboard would just look broken.
         if state.repos.len() <= 1 {
@@ -742,6 +877,7 @@ async fn handle_key(
     if (key_is(&key, km.back) || key.code == KeyCode::Esc)
         && state.view == View::GitStatus
         && state.current_op().is_some_and(|o| o.finished)
+        && !batch_owns_current_op(state)
     {
         let spec = state.git_view.as_ref().map(|g| g.spec.clone());
         if let Some(spec) = spec {
@@ -759,7 +895,13 @@ async fn handle_key(
                 // Leaving the repo entirely also drops any diff of its files,
                 // so re-entering never opens on the previous repo's contents.
                 state.git_diff = None;
-                state.switch_view(View::Repos);
+                // Opened from a paused batch to fix the repo that failed: back
+                // goes back to the pause, with retry and skip still on offer.
+                state.switch_view(if batch_is_live(state) {
+                    View::BatchCommit
+                } else {
+                    View::Repos
+                });
             }
             View::GitDiff => {
                 state.git_diff = None;
@@ -794,6 +936,31 @@ async fn handle_key(
                 state.switch_view(View::RunDetail);
             }
             View::TriggerPrompt => cancel_trigger_prompt(state),
+            View::BatchCommit => {
+                let Some(batch) = state.batch.as_mut() else {
+                    state.switch_view(View::Repos);
+                    return None;
+                };
+                match batch.phase {
+                    // Stop starting repos. The one already in a hook is left to
+                    // finish — a half-run `pre-commit` is worse than a slow one.
+                    BatchPhase::Committing | BatchPhase::Pushing | BatchPhase::Paused => {
+                        let running = batch.is_working();
+                        batch.abort();
+                        state.set_status(if running {
+                            "batch stopped — the repo in flight will finish".into()
+                        } else {
+                            "batch stopped".to_string()
+                        });
+                    }
+                    // The summary has been read; drop it and the marks with it.
+                    _ => {
+                        state.batch = None;
+                        state.repo_marks.clear();
+                        state.switch_view(View::Repos);
+                    }
+                }
+            }
         }
         return None;
     }
@@ -861,6 +1028,14 @@ async fn handle_key(
                 .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect()),
             View::Diff => state.run_detail.as_ref().map(|d| d.run.url.clone()),
             View::TriggerPrompt => None,
+            // Whatever the batch is showing output for — the failure you are
+            // about to paste into an editor or a chat.
+            View::BatchCommit => state
+                .batch
+                .as_ref()
+                .and_then(|b| b.current())
+                .and_then(|i| state.git_ops.get(&i.spec))
+                .map(|o| o.text()),
         };
         if let Some(text) = text {
             match yank_to_clipboard(&text) {
@@ -885,13 +1060,61 @@ async fn handle_key(
                 switch_to_selected_repo(state, provider, tx);
             } else if key_is(&key, km.git_view) {
                 open_git_view(state, tx);
+            } else if key_is(&key, km.repo_mark) {
+                toggle_repo_mark(state);
+            } else if key_is(&key, km.batch_commit) {
+                start_batch_commit(state);
+            }
+        }
+        View::BatchCommit => {
+            // While a hook is talking, the movement keys belong to its output —
+            // it is the thing that just changed, and reading it is the point.
+            let op_spec = state
+                .batch
+                .as_ref()
+                .and_then(|b| b.current())
+                .map(|i| i.spec.clone());
+            if let Some(spec) = op_spec
+                && state.git_ops.contains_key(&spec)
+                && handle_op_pane_key(state, key, km, &spec)
+            {
+                return None;
+            }
+            match state.batch.as_ref().map(|b| b.phase) {
+                Some(BatchPhase::Paused) => {
+                    if key_is(&key, km.batch_retry) {
+                        if let Some(b) = state.batch.as_mut() {
+                            b.retry();
+                        }
+                        batch_step(state, tx);
+                    } else if key_is(&key, km.batch_skip) {
+                        if let Some(b) = state.batch.as_mut() {
+                            b.skip();
+                        }
+                        batch_step(state, tx);
+                    } else if key_is(&key, km.git_view) {
+                        open_git_view_for_paused(state, tx);
+                    }
+                }
+                Some(BatchPhase::AskPush)
+                    if key_is(&key, km.git_push)
+                        || key_is(&key, km.confirm)
+                        || key.code == KeyCode::Enter =>
+                {
+                    batch_start_push(state, tx);
+                }
+                _ => {}
             }
         }
         View::GitStatus => {
             // With hook output on screen the movement keys belong to it — it is
             // the thing that just changed, and reading it is why it is there.
             // Everything else (stage, commit again) still falls through.
-            if state.current_op().is_some() && handle_op_pane_key(state, key, km) {
+            let op_spec = state.git_view.as_ref().map(|g| g.spec.clone());
+            if let Some(spec) = op_spec
+                && state.git_ops.contains_key(&spec)
+                && handle_op_pane_key(state, key, km, &spec)
+            {
                 return None;
             }
             let len = state.git_view.as_ref().map(|g| g.entries().len()).unwrap_or(0);
@@ -1504,7 +1727,8 @@ fn open_finder(state: &mut AppState) {
                 .collect();
             Finder::new(FinderKind::GitEntries, items)
         }),
-        View::GitDiff | View::Logs | View::Diff | View::TriggerPrompt => None,
+        // The batch's list is short, fixed, and already all on screen.
+        View::GitDiff | View::Logs | View::Diff | View::TriggerPrompt | View::BatchCommit => None,
     };
     match finder {
         Some(f) if !f.items.is_empty() => state.finder = Some(f),
@@ -1646,12 +1870,12 @@ fn toggle_stage_at_cursor(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEv
 /// Deliberately the same set as the log viewer, `e`/`E` included: a failed
 /// `pre-commit` is a test log, so the keys that walk a CI log's errors should
 /// walk this one's too.
-fn handle_op_pane_key(state: &mut AppState, key: KeyEvent, km: &Keymap) -> bool {
+fn handle_op_pane_key(state: &mut AppState, key: KeyEvent, km: &Keymap, spec: &str) -> bool {
     let viewport = state.last_op_viewport_height.get().max(1) as usize;
     let page = viewport as isize;
     let mut no_errors = false;
     let consumed = {
-        let Some(op) = state.current_op_mut() else {
+        let Some(op) = state.git_ops.get_mut(spec) else {
             return false;
         };
         if key_is(&key, km.down) || key.code == KeyCode::Down {
@@ -1754,6 +1978,255 @@ fn handle_commit_input(
     }
 }
 
+/// What a batch worker returns when its repo turned out to have nothing to do,
+/// followed by the reason.
+///
+/// Carried through `GitOpDone`'s `Ok` because "nothing to commit" is a success:
+/// a clean repo is not a failure, and pausing the batch on one would make an
+/// already-committed repo look broken. Checked in the worker rather than
+/// against the dashboard's cached status, which can be a poll out of date.
+const BATCH_NOTHING: &str = "\u{0}nothing: ";
+
+/// Whether a batch still has decisions or work left in it.
+///
+/// A live batch owns the way back: `View::BatchCommit` is only ever entered by
+/// starting one, so anything that navigates away without this check strands the
+/// run — still committing, or still paused waiting for retry/skip, with no key
+/// that reaches it.
+fn batch_is_live(state: &AppState) -> bool {
+    state.batch.as_ref().is_some_and(|b| {
+        b.is_working() || matches!(b.phase, BatchPhase::Paused | BatchPhase::AskPush)
+    })
+}
+
+/// Whether the hook output on screen belongs to a live batch rather than to the
+/// working-tree view that happens to be showing it.
+///
+/// Dismissing it from a repo opened *out of* a paused batch would gut the pause:
+/// the batch view is showing that same output, and it is the entire account of
+/// why the run stopped. So `back` there just goes back — the output stays, and
+/// the batch is still the thing that owns it.
+fn batch_owns_current_op(state: &AppState) -> bool {
+    let Some(spec) = state.git_view.as_ref().map(|g| g.spec.as_str()) else {
+        return false;
+    };
+    batch_is_live(state)
+        && state
+            .batch
+            .as_ref()
+            .and_then(|b| b.current())
+            .is_some_and(|i| i.spec == spec)
+}
+
+/// Mark the row under the cursor for a batch commit.
+///
+/// Marking on its own does nothing at all — no staging, no commit. That is the
+/// point: the dangerous key is the one that starts the batch, and this one can
+/// be pressed freely while deciding.
+fn toggle_repo_mark(state: &mut AppState) {
+    let Some(card) = state.repos.get(state.repo_cursor) else {
+        return;
+    };
+    // Same rule as opening the working tree: no checkout, nothing to commit.
+    let (spec, local) = (card.spec.clone(), card.path.is_some());
+    if !local {
+        state.set_status(format!(
+            "{spec} has no local checkout — only repos found on disk can be committed"
+        ));
+        return;
+    }
+    if !state.repo_marks.remove(&spec) {
+        state.repo_marks.insert(spec);
+    }
+}
+
+/// Open the message box for a batch commit over every marked repo.
+fn start_batch_commit(state: &mut AppState) {
+    let marked: Vec<(String, std::path::PathBuf)> = state
+        .repos
+        .iter()
+        .filter(|c| state.repo_marks.contains(&c.spec))
+        .filter_map(|c| c.path.clone().map(|p| (c.spec.clone(), p)))
+        .collect();
+    if marked.is_empty() {
+        let key = views::display_key(&state.keymap.repo_mark).to_string();
+        state.set_status(format!(
+            "nothing marked — {key} marks the repo under the cursor, then C commits them all"
+        ));
+        return;
+    }
+    // Staging under a hook that is already reading the index would change the
+    // commit out from under it.
+    if let Some(busy) = marked.iter().find(|(spec, _)| state.op_running(spec)) {
+        state.set_status(format!("{} is already mid-commit — wait for it", busy.0));
+        return;
+    }
+    let items = marked
+        .into_iter()
+        .map(|(spec, path)| crate::app::state::BatchItem::new(spec, path))
+        .collect();
+    state.batch = Some(BatchCommit::new(items, state.tick_count));
+    state.switch_view(View::BatchCommit);
+}
+
+/// Type the one message every repo in the batch will get.
+fn handle_batch_input(state: &mut AppState, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+    let Some(batch) = state.batch.as_mut() else {
+        return;
+    };
+    let Some(buf) = batch.input.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            // Nothing has run yet, so abandoning costs nothing — and the marks
+            // survive, since re-marking four repos to fix a typo is a punishment.
+            state.batch = None;
+            state.switch_view(View::Repos);
+        }
+        KeyCode::Enter => {
+            // Read rather than take: refusing an all-whitespace message must not
+            // also wipe the draft, or Enter becomes a way to lose what you typed.
+            let msg = buf.trim().to_string();
+            if msg.is_empty() {
+                state.set_status("type a message first — ↵ starts, Esc cancels".into());
+                return;
+            }
+            batch.input = None;
+            batch.message = msg;
+            batch.phase = BatchPhase::Committing;
+            batch_step(state, tx);
+        }
+        KeyCode::Backspace => {
+            buf.pop();
+        }
+        KeyCode::Char(c) => {
+            buf.push(c);
+        }
+        _ => {}
+    }
+}
+
+/// Start the next repo in the batch, or wind the batch up.
+///
+/// Every move the batch makes goes through here, so "one repo at a time" is a
+/// property of the code rather than something each call site has to remember.
+fn batch_step(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
+    let tick = state.tick_count;
+    let Some(batch) = state.batch.as_mut() else {
+        return;
+    };
+    if !batch.is_working() {
+        return;
+    }
+    let Some(idx) = batch.advance(tick) else {
+        // `advance` has already moved the phase to AskPush or Done.
+        return;
+    };
+    let item = &batch.items[idx];
+    let (spec, path) = (item.spec.clone(), item.path.clone());
+    let pushing = batch.phase == BatchPhase::Pushing;
+    let msg = batch.message.clone();
+
+    if pushing {
+        spawn_streaming_op_for(state, tx, spec, path, "push", "pre-push", move |dir, out| {
+            // Read the branch here rather than trusting the dashboard's copy:
+            // the commit that just landed changed the ahead count, and pushing
+            // the wrong branch is not a recoverable mistake.
+            let st = crate::git::status(dir)?;
+            if st.detached {
+                return Ok(format!("{BATCH_NOTHING}detached HEAD"));
+            }
+            if st.has_upstream && st.ahead == 0 {
+                return Ok(format!("{BATCH_NOTHING}already up to date"));
+            }
+            crate::git::push(dir, &st.branch, st.has_upstream, out)
+        });
+    } else {
+        spawn_streaming_op_for(
+            state,
+            tx,
+            spec,
+            path,
+            "commit",
+            "pre-commit",
+            move |dir, out| {
+                crate::git::stage_all(dir)?;
+                // Asked after staging, so it answers the question that matters:
+                // is there anything to commit *now*.
+                if crate::git::status(dir)?.staged_count() == 0 {
+                    return Ok(format!("{BATCH_NOTHING}working tree is clean"));
+                }
+                crate::git::commit(dir, &msg, out)?;
+                Ok(crate::git::head_sha(dir).unwrap_or_else(|_| "HEAD".into()))
+            },
+        );
+    }
+}
+
+/// Fold a finished git command into the batch, if it was the batch that asked.
+fn batch_on_op_done(
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+    spec: &str,
+    result: &Result<String, String>,
+) {
+    let Some(batch) = state.batch.as_mut() else {
+        return;
+    };
+    // A commit the user started by hand in another repo is not ours to record.
+    if batch.current().is_none_or(|i| i.spec != spec) {
+        return;
+    }
+    match result {
+        Ok(summary) => match summary.strip_prefix(BATCH_NOTHING) {
+            Some(why) => batch.record_nothing(spec, why.to_string()),
+            None => batch.record(spec, Ok(summary.clone())),
+        },
+        // Only the first line: the rest of the failure is in the op pane right
+        // below, and a wall of pytest output does not fit on a list row.
+        Err(e) => batch.record(spec, Err(e.lines().next().unwrap_or(e).to_string())),
+    }
+    // That repo's working tree just changed, and its dashboard row is showing
+    // the old file count until the next poll — which could be seconds away.
+    let path = batch.current().map(|i| i.path.clone());
+    if let Some(path) = path {
+        spawn_git_status(spec.to_string(), path, tx.clone(), state);
+    }
+    batch_step(state, tx);
+}
+
+/// Push every repo the batch committed, one at a time.
+fn batch_start_push(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
+    let Some(batch) = state.batch.as_mut() else {
+        return;
+    };
+    if batch.phase != BatchPhase::AskPush {
+        return;
+    }
+    batch.phase = BatchPhase::Pushing;
+    batch_step(state, tx);
+}
+
+/// Open the working tree of the repo the batch is paused on, to fix it.
+///
+/// The batch stays paused and stays in `state` — coming back with `H` lands on
+/// the same pause, with retry and skip still on offer.
+fn open_git_view_for_paused(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
+    let Some(item) = state.batch.as_ref().and_then(|b| b.current()) else {
+        return;
+    };
+    let (spec, path) = (item.spec.clone(), item.path.clone());
+    let has_ci = state
+        .repos
+        .iter()
+        .find(|c| c.spec == spec)
+        .is_some_and(|c| c.has_ci());
+    state.git_view = Some(crate::app::state::GitView::new(spec.clone(), path.clone(), has_ci));
+    state.switch_view(View::GitStatus);
+    spawn_git_status(spec, path, tx.clone(), state);
+}
+
 /// Push the current branch, setting upstream on first push.
 ///
 /// This is the step that makes a commit visible to CI: `workflow_dispatch` runs
@@ -1849,6 +2322,10 @@ struct Keymap {
     prev_error: (KeyCode, KeyModifiers),
     finder: (KeyCode, KeyModifiers),
     repos_view: (KeyCode, KeyModifiers),
+    repo_mark: (KeyCode, KeyModifiers),
+    batch_commit: (KeyCode, KeyModifiers),
+    batch_retry: (KeyCode, KeyModifiers),
+    batch_skip: (KeyCode, KeyModifiers),
     git_view: (KeyCode, KeyModifiers),
     git_stage: (KeyCode, KeyModifiers),
     git_stage_all: (KeyCode, KeyModifiers),
@@ -1945,6 +2422,10 @@ fn resolve_keymap(cfg: &KeymapConfig) -> Result<Keymap> {
         prev_error:    parse_key(&cfg.prev_error)?,
         finder:        parse_key(&cfg.finder)?,
         repos_view:    parse_key(&cfg.repos_view)?,
+        repo_mark:     parse_key(&cfg.repo_mark)?,
+        batch_commit:  parse_key(&cfg.batch_commit)?,
+        batch_retry:   parse_key(&cfg.batch_retry)?,
+        batch_skip:    parse_key(&cfg.batch_skip)?,
         git_view:      parse_key(&cfg.git_view)?,
         git_stage:     parse_key(&cfg.git_stage)?,
         git_stage_all: parse_key(&cfg.git_stage_all)?,
@@ -2333,6 +2814,59 @@ fn spawn_fetch_repo_cards(
     }
 }
 
+/// Follow the in-flight run on one dashboard row down to its jobs and steps.
+///
+/// The row itself can only say *that* CI is going. This is what lets the strip
+/// at the bottom name the workflow and the step it is on right now.
+///
+/// Deliberately outside the `pending` counter: it is decoration over the row,
+/// and a repo whose detail fetch is slow or broken must not pause the poll that
+/// keeps every other row current.
+fn sync_repo_progress(
+    provider: &Arc<GitHubProvider>,
+    state: &mut AppState,
+    spec: &str,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    let target = state
+        .repos
+        .iter()
+        .find(|c| c.spec == spec)
+        .and_then(|c| c.active_run().cloned().map(|r| (r, c.remote.clone())));
+    let Some((run, remote)) = target else {
+        // Nothing in flight anymore — dropping the entry is what makes the
+        // strip clear itself the moment the last run lands.
+        state.run_progress.remove(spec);
+        return;
+    };
+
+    // Show what the row already knows immediately; the steps land a poll later.
+    // Without this a run would sit invisible until its first detail response.
+    match state.run_progress.get_mut(spec) {
+        Some(d) if d.run.id == run.id => d.run = run.clone(),
+        _ => {
+            state.run_progress.insert(
+                spec.to_string(),
+                RunDetail { run: run.clone(), jobs: Vec::new() },
+            );
+        }
+    }
+
+    let Some(remote) = remote else { return };
+    let Ok(rspec) = RepoSpec::parse(&remote) else {
+        return;
+    };
+    let p = provider.for_repo(rspec);
+    let (label, run_id, tx) = (spec.to_string(), run.id, tx.clone());
+    tokio::spawn(async move {
+        // A failure here is silent on purpose: the row still reports the run,
+        // and a toast per poll per repo would bury every other message.
+        if let Ok(detail) = p.get_run(run_id).await {
+            let _ = tx.send(AppEvent::RepoProgressLoaded(label, detail));
+        }
+    });
+}
+
 /// Read a checkout's working-tree state off-thread.
 ///
 /// `git status` is fast but not instant on a large repo, and the event loop must
@@ -2456,7 +2990,6 @@ fn spawn_git_op_streaming<F>(
         + Send
         + 'static,
 {
-    let tick = state.tick_count;
     let Some(gv) = state.git_view.as_ref() else {
         return;
     };
@@ -2468,6 +3001,28 @@ fn spawn_git_op_streaming<F>(
     if let Some(gv) = state.git_view.as_mut() {
         gv.busy = true;
     }
+    spawn_streaming_op_for(state, tx, spec, path, verb, hook, op);
+}
+
+/// The same, for a repo that isn't the one the working-tree view is open on.
+///
+/// Split out for the batch commit, which walks repos the user is not looking
+/// at. `git_ops` was already keyed by spec — this is the last thing that
+/// assumed the op belonged to `git_view`.
+fn spawn_streaming_op_for<F>(
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+    spec: String,
+    path: std::path::PathBuf,
+    verb: &'static str,
+    hook: &'static str,
+    op: F,
+) where
+    F: FnOnce(&std::path::Path, &mut dyn FnMut(String, bool)) -> anyhow::Result<String>
+        + Send
+        + 'static,
+{
+    let tick = state.tick_count;
     // Starts unnamed: whether a hook is installed takes two `git` calls to
     // answer, which the worker does rather than the UI thread.
     state
@@ -3002,8 +3557,7 @@ fn sound_path(configured: &str, bundled: &'static [u8], name: &str) -> Option<St
 
 pub fn animated_glyph(s: Status, tick: u64) -> &'static str {
     if s == Status::Running {
-        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        FRAMES[(tick % 10) as usize]
+        motion::Motion::new(tick).spinner()
     } else {
         status_glyph(s)
     }
@@ -3013,7 +3567,119 @@ pub fn animated_glyph(s: Status, tick: u64) -> &'static str {
 mod tests {
     use super::*;
 
+    /// A dashboard with two checkouts and one remote-only row.
+    fn dashboard() -> AppState {
+        let mut st = AppState::new(
+            "acme/api".into(),
+            "main".into(),
+            Vec::new(),
+            KeymapConfig::default(),
+            History::default(),
+        );
+        for spec in ["acme/api", "acme/web"] {
+            let mut card = RepoCard::new(spec.into());
+            card.path = Some(std::path::PathBuf::from("/tmp").join(spec));
+            card.git = Some(crate::git::parse_status("## main\0 M a.txt\0"));
+            card.loaded = true;
+            st.repos.push(card);
+        }
+        // No checkout: nothing on disk to stage.
+        st.repos.push(RepoCard::new("acme/remote-only".into()));
+        st.view = View::Repos;
+        st
+    }
 
+    #[test]
+    fn only_a_repo_on_disk_can_be_marked_for_a_batch() {
+        let mut st = dashboard();
+        toggle_repo_mark(&mut st);
+        assert!(st.repo_marks.contains("acme/api"));
+        // Pressing it again takes it back out — marking is a toggle, not a
+        // one-way door you have to restart the app to escape.
+        toggle_repo_mark(&mut st);
+        assert!(st.repo_marks.is_empty());
+
+        st.repo_cursor = 2;
+        toggle_repo_mark(&mut st);
+        assert!(st.repo_marks.is_empty(), "a remote-only row has nothing to commit");
+        assert!(
+            st.status_msg.as_deref().is_some_and(|m| m.contains("no local checkout")),
+            "got {:?}",
+            st.status_msg
+        );
+    }
+
+    // `open_git_view_for_paused` kicks off a `git status` read off-thread.
+    #[tokio::test]
+    async fn the_pause_keeps_its_hook_output_when_you_go_in_to_fix_the_repo() {
+        let mut st = dashboard();
+        st.repo_marks.insert("acme/api".into());
+        start_batch_commit(&mut st);
+        let batch = st.batch.as_mut().unwrap();
+        batch.input = None;
+        batch.phase = BatchPhase::Committing;
+        batch.advance(0);
+        batch.record("acme/api", Err("pre-commit hook failed".into()));
+
+        let mut op = GitOp::new("commit", Some("pre-commit".into()), 0);
+        op.push_line("assert 1 == 2".into(), false);
+        op.finished = true;
+        op.failed = true;
+        st.git_ops.insert("acme/api".into(), op);
+
+        // Opened out of the pause to fix the failure: `back` there must not
+        // dismiss the output, because the batch view behind it is the thing
+        // showing it — and it is the only account of why the run stopped.
+        open_git_view_for_paused(&mut st, &mpsc::unbounded_channel().0);
+        assert_eq!(st.view, View::GitStatus);
+        assert!(batch_owns_current_op(&st));
+
+        // A hand-started commit in a repo the batch is not on is still the
+        // view's own to dismiss.
+        st.git_view.as_mut().unwrap().spec = "acme/web".into();
+        assert!(!batch_owns_current_op(&st));
+    }
+
+    #[test]
+    fn a_batch_with_nothing_marked_says_how_to_mark() {
+        let mut st = dashboard();
+        start_batch_commit(&mut st);
+        assert!(st.batch.is_none(), "nothing marked, nothing to do");
+        assert_eq!(st.view, View::Repos);
+        // Refusing without saying which key marks is how a feature stays unused.
+        let msg = st.status_msg.clone().unwrap_or_default();
+        assert!(msg.contains("nothing marked"), "got {msg:?}");
+        assert!(msg.contains("␣"), "got {msg:?}");
+    }
+
+    #[test]
+    fn a_batch_will_not_start_on_a_repo_that_is_already_mid_commit() {
+        let mut st = dashboard();
+        st.repo_marks.insert("acme/api".into());
+        st.repo_marks.insert("acme/web".into());
+        // A hand-started commit is still holding acme/web's index.
+        st.git_ops
+            .insert("acme/web".into(), GitOp::new("commit", None, 0));
+
+        start_batch_commit(&mut st);
+        assert!(st.batch.is_none(), "staging under a running hook corrupts the commit");
+        assert!(
+            st.status_msg.as_deref().is_some_and(|m| m.contains("acme/web")),
+            "got {:?} — the refusal has to name the repo",
+            st.status_msg
+        );
+
+        // Once it finishes, the batch starts and takes both repos in row order.
+        st.git_ops.clear();
+        start_batch_commit(&mut st);
+        let batch = st.batch.as_ref().expect("batch started");
+        let specs: Vec<&str> = batch.items.iter().map(|i| i.spec.as_str()).collect();
+        assert_eq!(specs, vec!["acme/api", "acme/web"]);
+        assert_eq!(st.view, View::BatchCommit);
+        // Nothing has run yet: the message comes first.
+        assert_eq!(batch.phase, BatchPhase::Compose);
+        assert!(batch.input.is_some());
+    }
 
     #[test]
     fn workspace_disambiguates_repos_sharing_a_basename() {

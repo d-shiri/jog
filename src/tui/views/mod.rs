@@ -4,13 +4,17 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Clear, LineGauge, Paragraph, Row, Table, TableState, Wrap,
+    Block, BorderType, Borders, Cell, Clear, LineGauge, Padding, Paragraph, Row, Table, TableState,
+    Wrap,
 };
 
 use std::collections::HashMap;
 
 use super::animated_glyph;
-use crate::app::state::{AppState, DetailItem, GitOp, Theme, View, build_detail_items};
+use super::motion::{Motion, mix};
+use crate::app::state::{
+    AppState, BatchPhase, DetailItem, GitOp, ItemState, Theme, View, build_detail_items,
+};
 use crate::history::HistoryEntry;
 use crate::provider::{Run, Status};
 
@@ -36,6 +40,7 @@ pub fn render(f: &mut Frame, state: &AppState) {
         View::Watch => render_watch(f, chunks[1], state),
         View::TriggerPrompt => render_trigger_prompt(f, chunks[1], state),
         View::Diff => render_diff(f, chunks[1], state),
+        View::BatchCommit => render_batch_commit(f, chunks[1], state),
     }
     render_footer(f, chunks[2], state);
     if state.view == View::Logs {
@@ -51,13 +56,13 @@ pub fn render(f: &mut Frame, state: &AppState) {
 
 fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
-    let sep = || Span::styled("  ›  ", Style::default().fg(Color::Rgb(55, 55, 80)));
+    let sep = || Span::styled("  ›  ", Style::default().fg(theme.border_dim));
     let crumb: Vec<Span> = match state.view {
         View::Repos => vec![
             Span::styled("Repos", Style::default().fg(theme.primary).bold()),
         ],
         View::GitStatus => vec![
-            Span::styled("Repos", Style::default().fg(theme.secondary)),
+            Span::styled("Repos", Style::default().fg(theme.text_muted)),
             sep(),
             Span::styled(
                 state
@@ -65,13 +70,13 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
                     .as_ref()
                     .map(|g| g.spec.clone())
                     .unwrap_or_else(|| "?".into()),
-                Style::default().fg(theme.secondary),
+                Style::default().fg(theme.text_muted),
             ),
             sep(),
             Span::styled("Changes", Style::default().fg(theme.primary).bold()),
         ],
         View::GitDiff => vec![
-            Span::styled("Repos", Style::default().fg(theme.secondary)),
+            Span::styled("Repos", Style::default().fg(theme.text_muted)),
             sep(),
             Span::styled(
                 state
@@ -79,10 +84,10 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
                     .as_ref()
                     .map(|d| d.spec.clone())
                     .unwrap_or_else(|| "?".into()),
-                Style::default().fg(theme.secondary),
+                Style::default().fg(theme.text_muted),
             ),
             sep(),
-            Span::styled("Changes", Style::default().fg(theme.secondary)),
+            Span::styled("Changes", Style::default().fg(theme.text_muted)),
             sep(),
             Span::styled(
                 state
@@ -97,7 +102,7 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
             Span::styled("Workflows", Style::default().fg(theme.primary).bold()),
         ],
         View::Runs => vec![
-            Span::styled("Workflows", Style::default().fg(theme.secondary)),
+            Span::styled("Workflows", Style::default().fg(theme.text_muted)),
             sep(),
             Span::styled(
                 state.workflow_for_runs.as_deref().unwrap_or("?").to_string(),
@@ -112,9 +117,9 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
                     .map(|r| format!("#{}", r.id))
                     .unwrap_or_else(|| "?".into()));
             vec![
-                Span::styled("Workflows", Style::default().fg(theme.secondary)),
+                Span::styled("Workflows", Style::default().fg(theme.text_muted)),
                 sep(),
-                Span::styled(wf.to_string(), Style::default().fg(theme.secondary)),
+                Span::styled(wf.to_string(), Style::default().fg(theme.text_muted)),
                 sep(),
                 Span::styled(rid, Style::default().fg(theme.primary).bold()),
             ]
@@ -126,9 +131,20 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
                 .map(|s| s.as_str())
                 .unwrap_or("all steps");
             vec![
-                Span::styled("Logs", Style::default().fg(theme.secondary)),
+                Span::styled("Logs", Style::default().fg(theme.text_muted)),
                 sep(),
                 Span::styled(step.to_string(), Style::default().fg(theme.primary).bold()),
+            ]
+        }
+        View::BatchCommit => {
+            let n = state.batch.as_ref().map(|b| b.items.len()).unwrap_or(0);
+            vec![
+                Span::styled("Repos", Style::default().fg(theme.text_muted)),
+                sep(),
+                Span::styled(
+                    format!("Batch commit ({n})"),
+                    Style::default().fg(theme.primary).bold(),
+                ),
             ]
         }
         View::Watch         => vec![Span::styled("Watch",   Style::default().fg(theme.primary).bold())],
@@ -136,13 +152,13 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         View::TriggerPrompt => vec![Span::styled("Trigger", Style::default().fg(theme.primary).bold())],
     };
 
-    let dot = Style::default().fg(Color::Rgb(55, 55, 80));
+    let dot = Style::default().fg(theme.border_dim);
     let mut spans = vec![
         Span::styled(" ⚡ ", Style::default().fg(theme.accent)),
-        Span::styled("jog", Style::default().fg(Color::White).bold()),
+        Span::styled("jog", Style::default().fg(theme.text_bright).bold()),
         Span::styled(
             format!(" v{}", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(Color::Rgb(95, 95, 120)),
+            Style::default().fg(theme.text_faint),
         ),
         Span::styled("  ·  ", dot),
     ];
@@ -151,14 +167,14 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     match (&state.workspace_root, state.view) {
         (Some(root), View::Repos | View::GitStatus | View::GitDiff) => spans.push(Span::styled(
             format!("{}", root.display()),
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.text_bright),
         )),
         _ => {
             spans.push(Span::styled(
                 state.repo_label.as_str(),
-                Style::default().fg(Color::White),
+                Style::default().fg(theme.text_bright),
             ));
-            spans.push(Span::styled("  ⎇ ", Style::default().fg(Color::Rgb(90, 110, 150))));
+            spans.push(Span::styled("  ⎇ ", Style::default().fg(theme.info)));
             spans.push(Span::styled(
                 state.current_branch.as_str(),
                 Style::default().fg(theme.accent),
@@ -169,12 +185,44 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     spans.extend(crumb);
     let line = Line::from(spans);
     f.render_widget(
-        Paragraph::new(line).style(Style::default().bg(theme.header_bg)),
+        Paragraph::new(line).style(Style::default().bg(theme.surface)),
         area,
     );
+
+    // The right two thirds of the header were empty on every terminal wider
+    // than the ones jog was first written on. What belongs there is the state
+    // you'd otherwise have to guess at: when the next refresh lands, and what
+    // time it is — a run that "finished 3m ago" means nothing without it.
+    let right = Line::from(vec![
+        Span::styled(poll_clock(state), Style::default().fg(theme.text_faint)),
+        Span::styled("   ", Style::default()),
+        Span::styled(
+            chrono::Local::now().format("%H:%M").to_string(),
+            Style::default().fg(theme.text_muted),
+        ),
+        Span::raw(" "),
+    ]);
+    f.render_widget(Paragraph::new(right).right_aligned(), area);
 }
 
-fn display_key(s: &str) -> &str {
+/// A quarter-turn clock face counting down to the next poll.
+///
+/// A glyph rather than a number of seconds: the exact figure is never the
+/// question, only whether what is on screen was fetched recently — and a
+/// countdown you can read at a glance answers that without being read.
+fn poll_clock(state: &AppState) -> String {
+    const FACES: [&str; 4] = ["◴", "◵", "◶", "◷"];
+    if state.pending > 0 {
+        // Mid-fetch: spin rather than count down to something already happening.
+        return format!("{} fetching", FACES[(state.tick_count / 3 % 4) as usize]);
+    }
+    let elapsed = state.tick_count.saturating_sub(state.last_poll_tick);
+    let left = state.poll_ticks.saturating_sub(elapsed);
+    let quarter = ((left * 4) / state.poll_ticks.max(1)).min(3) as usize;
+    format!("{} {}s", FACES[3 - quarter], left.div_ceil(10))
+}
+
+pub(super) fn display_key(s: &str) -> &str {
     match s {
         "Enter" => "↵",
         "Esc" | "Escape" => "Esc",
@@ -193,37 +241,79 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
     if state.finder.is_some() {
         let spans = vec![
             Span::raw(" "),
-            Span::styled("type", Style::default().fg(Color::White).bold()),
+            Span::styled("type", Style::default().fg(theme.text_bright).bold()),
             Span::raw(" "),
-            Span::styled("filter", Style::default().fg(theme.secondary)),
+            Span::styled("filter", Style::default().fg(theme.text_muted)),
             Span::raw("  "),
-            Span::styled("↑/↓", Style::default().fg(Color::White).bold()),
+            Span::styled("↑/↓", Style::default().fg(theme.text_bright).bold()),
             Span::raw(" "),
-            Span::styled("move", Style::default().fg(theme.secondary)),
+            Span::styled("move", Style::default().fg(theme.text_muted)),
             Span::raw("  "),
-            Span::styled("↵", Style::default().fg(Color::White).bold()),
+            Span::styled("↵", Style::default().fg(theme.text_bright).bold()),
             Span::raw(" "),
-            Span::styled("select", Style::default().fg(theme.secondary)),
+            Span::styled("select", Style::default().fg(theme.text_muted)),
             Span::raw("  "),
-            Span::styled("Esc", Style::default().fg(Color::White).bold()),
+            Span::styled("Esc", Style::default().fg(theme.text_bright).bold()),
             Span::raw(" "),
-            Span::styled("cancel", Style::default().fg(theme.secondary)),
+            Span::styled("cancel", Style::default().fg(theme.text_muted)),
         ];
         f.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.footer_bg)),
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.surface)),
             area,
         );
         return;
     }
 
     let hints: Vec<(String, &str)> = match state.view {
-        View::Repos => vec![
-            ("↵".into(), "open repo"),
-            (display_key(&km.git_view).into(), "changes"),
-            (display_key(&km.finder).into(), "find"),
-            (display_key(&km.open_browser).into(), "open"),
-            (display_key(&km.quit).into(), "quit"),
-        ],
+        View::Repos => {
+            let mut hints = vec![
+                ("↵".into(), "open repo"),
+                (display_key(&km.git_view).into(), "changes"),
+                (
+                    display_key(&km.repo_mark).into(),
+                    if state.repo_marks.is_empty() { "mark" } else { "mark/unmark" },
+                ),
+            ];
+            // Only advertised once marking it would do something — the key is
+            // inert with an empty selection, and a dead key in the footer reads
+            // as a broken one.
+            if !state.repo_marks.is_empty() {
+                hints.push((display_key(&km.batch_commit).into(), "commit marked"));
+            }
+            hints.push((display_key(&km.finder).into(), "find"));
+            hints.push((display_key(&km.open_browser).into(), "open"));
+            hints.push((display_key(&km.quit).into(), "quit"));
+            hints
+        }
+        View::BatchCommit => match state.batch.as_ref().map(|b| b.phase) {
+            Some(BatchPhase::Compose) => vec![
+                ("type".into(), "message for every repo"),
+                ("Bksp".into(), "delete"),
+                ("↵".into(), "start"),
+                ("Esc".into(), "cancel"),
+            ],
+            Some(BatchPhase::Paused) => vec![
+                (display_key(&km.batch_retry).into(), "retry"),
+                (display_key(&km.batch_skip).into(), "skip"),
+                (display_key(&km.git_view).into(), "open repo"),
+                (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "scroll"),
+                (
+                    format!("{}/{}", display_key(&km.next_error), display_key(&km.prev_error)),
+                    "next/prev error",
+                ),
+                (display_key(&km.back).into(), "stop"),
+            ],
+            Some(BatchPhase::AskPush) => vec![
+                (display_key(&km.git_push).into(), "push all"),
+                (display_key(&km.back).into(), "done, don't push"),
+            ],
+            Some(BatchPhase::Done) => vec![(display_key(&km.back).into(), "back to repos")],
+            _ => vec![
+                (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "scroll"),
+                (display_key(&km.yank).into(), "yank output"),
+                (display_key(&km.back).into(), "stop after this repo"),
+            ],
+        },
         View::GitStatus if state.git_view.as_ref().is_some_and(|g| g.commit_input.is_some()) => {
             vec![
                 ("type".into(), "message"),
@@ -367,37 +457,100 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         if i > 0 {
             spans.push(Span::styled("  ", Style::default()));
         }
-        spans.push(Span::styled(key.clone(), Style::default().fg(Color::White).bold()));
+        spans.push(Span::styled(key.clone(), Style::default().fg(theme.text_bright).bold()));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(*desc, Style::default().fg(theme.secondary)));
+        spans.push(Span::styled(*desc, Style::default().fg(theme.text_muted)));
     }
 
     if state.pending > 0 {
-        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let frame = frames[(state.tick_count % frames.len() as u64) as usize];
-        spans.push(Span::styled(format!("  {frame}"), Style::default().fg(theme.accent)));
+        spans.push(Span::styled(
+            format!("  {}", Motion::new(state.tick_count).spinner()),
+            Style::default().fg(theme.accent),
+        ));
     }
 
     if let Some(msg) = &state.status_msg {
-        spans.push(Span::styled("   │   ", Style::default().fg(Color::Rgb(55, 55, 80))));
-        spans.push(Span::styled(msg.clone(), Style::default().fg(Color::White)));
+        spans.push(Span::styled("   │   ", Style::default().fg(theme.border)));
+        spans.push(Span::styled(msg.clone(), Style::default().fg(theme.text_bright)));
     }
 
     f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.footer_bg)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.surface)),
         area,
     );
 }
 
-fn styled_block<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
-    Block::default()
+/// One panel, drawn the same way everywhere.
+///
+/// The name sits in a chip cut into the top rule, and anything summarising the
+/// panel goes to the *right* end of that rule. Every panel used to pack its
+/// title, its counts and its badges into the left corner and leave three
+/// quarters of the border empty, which is why a wide terminal made jog look
+/// like it was designed for an 80-column one.
+fn panel<'a>(name: &str, right: Vec<Span<'a>>, theme: &Theme, accent: Color) -> Block<'a> {
+    let chip = Line::from(vec![
+        Span::styled("─┤ ", Style::default().fg(theme.border)),
+        Span::styled(name.to_string(), Style::default().fg(accent).bold()),
+        Span::styled(" ├", Style::default().fg(theme.border)),
+    ]);
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(55, 55, 80)))
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default().fg(theme.primary).bold(),
+        .border_style(Style::default().fg(theme.border))
+        .title(chip);
+    if !right.is_empty() {
+        let mut spans = vec![Span::styled("─ ", Style::default().fg(theme.border))];
+        spans.extend(right);
+        spans.push(Span::styled(" ─", Style::default().fg(theme.border)));
+        block = block.title(Line::from(spans).right_aligned());
+    }
+    block
+}
+
+fn styled_block<'a>(title: &str, theme: &Theme) -> Block<'a> {
+    panel(title, Vec::new(), theme, theme.primary)
+}
+
+/// What a view says when it has nothing to show.
+///
+/// Centred, and always three things: a glyph, one sentence of what is not here,
+/// and the way to change that. A grey italic line in the top-left corner reads
+/// as the app failing to draw something; this reads as an answer to a question.
+fn render_empty(f: &mut Frame, area: Rect, theme: &Theme, glyph: &str, what: &str, how: &str) {
+    if area.height < 3 || area.width < 20 {
+        // No room to be graceful; the sentence still beats nothing.
+        f.render_widget(
+            Paragraph::new(Span::styled(what.to_string(), Style::default().fg(theme.text_faint)))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
+    let lines = vec![
+        Line::from(Span::styled(
+            glyph.to_string(),
+            Style::default().fg(theme.text_ghost),
         ))
+        .centered(),
+        Line::raw(""),
+        Line::from(Span::styled(
+            what.to_string(),
+            Style::default().fg(theme.text_muted),
+        ))
+        .centered(),
+        Line::from(Span::styled(
+            how.to_string(),
+            Style::default().fg(theme.text_faint).italic(),
+        ))
+        .centered(),
+    ];
+    let top = area.y + area.height.saturating_sub(lines.len() as u16) / 2;
+    let box_area = Rect {
+        y: top,
+        height: (lines.len() as u16).min(area.height),
+        ..area
+    };
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), box_area);
 }
 
 fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
@@ -414,62 +567,107 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                 _ => (o, f, r, b),
             }
         });
-    let title = Line::from(vec![
-        Span::styled(
-            format!(" Repos ({}", state.repos.len()),
-            Style::default().fg(theme.primary).bold(),
-        ),
-        Span::styled(format!("  ✓{ok}"), Style::default().fg(theme.success)),
+    // Panel name on the left, what the panel amounts to on the right.
+    let mut tallies = vec![
+        Span::styled(format!("✓{ok}"), Style::default().fg(theme.success)),
         Span::styled(format!("  ✗{fail}"), Style::default().fg(theme.failure)),
-        if busy > 0 {
-            Span::styled(format!("  ⏵{busy}"), Style::default().fg(theme.warning).bold())
-        } else {
-            Span::raw("")
-        },
-        if broken > 0 {
-            Span::styled(format!("  !{broken}"), Style::default().fg(theme.failure).bold())
-        } else {
-            Span::raw("")
-        },
-        Span::styled(" ) ", Style::default().fg(theme.primary).bold()),
-    ]);
-    let blk = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(55, 55, 80)))
-        .title(title);
+    ];
+    if busy > 0 {
+        tallies.push(Span::styled(
+            format!("  ⏵{busy}"),
+            Style::default().fg(theme.warning).bold(),
+        ));
+    }
+    if broken > 0 {
+        tallies.push(Span::styled(
+            format!("  !{broken}"),
+            Style::default().fg(theme.failure).bold(),
+        ));
+    }
+    // What a batch commit would take, up where the eye already is — the marks
+    // are otherwise a column you have to scan for.
+    if !state.repo_marks.is_empty() {
+        tallies.push(Span::styled(
+            format!("   ◆ {} marked", state.repo_marks.len()),
+            Style::default().fg(theme.accent).bold(),
+        ));
+    }
+    let name = format!("Repos  {}", state.repos.len());
+
+    // Anything mid-flight gets its own strip along the bottom. It is given room
+    // only when the table can still show a useful number of rows — the list is
+    // the view, and a live panel that squeezes it out defeats the point.
+    let live = state.active_progress();
+    let strip_rows = live.len().min(4) as u16;
+    let (area, strip_area) = if strip_rows == 0 || area.height < strip_rows + 9 {
+        (area, None)
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(7), Constraint::Length(strip_rows + 2)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    };
+
+    let blk = panel(&name, tallies, theme, theme.primary);
     let inner = blk.inner(area);
     f.render_widget(blk, area);
+
+    if let Some(sa) = strip_area {
+        render_activity_strip(f, sa, state, &live);
+    }
 
     if inner.height < 2 {
         return;
     }
 
     if state.repos.is_empty() {
-        f.render_widget(
-            Paragraph::new(Span::styled(
-                "no repos configured — add `repos = [\"owner/name\", …]` under [provider] in config.toml",
-                Style::default().fg(Color::DarkGray).italic(),
-            ))
-            .wrap(Wrap { trim: false }),
+        render_empty(
+            f,
             inner,
+            theme,
+            "▢",
+            "No repos to watch yet.",
+            "add repos = [\"owner/name\", …] under [provider] in config.toml, or run jog from a directory of checkouts",
         );
         return;
     }
 
-    let hdr = Style::default().fg(theme.secondary);
-    let header = Row::new(vec![
+    // What fits. Columns are dropped by how much they add per column of width,
+    // rather than letting every one of them shrink until they all truncate —
+    // eight half-legible columns are worse than five whole ones.
+    let cols = Columns::for_width(inner.width);
+    let spark_w = cols.spark_w;
+
+    let hdr = Style::default().fg(theme.text_muted);
+    let mut header_cells = vec![
+        Cell::from(""),
         Cell::from(""),
         Cell::from(Span::styled("Repo", hdr)),
         Cell::from(Span::styled("Local branch", hdr)),
         Cell::from(Span::styled("Changes", hdr)),
         Cell::from(Span::styled("Latest run", hdr)),
-        Cell::from(Span::styled("Ran on", hdr)),
-        Cell::from(Span::styled("Updated", hdr)),
-        Cell::from(Span::styled("Recent", hdr)),
-    ])
-    .height(1)
-    .bottom_margin(1);
+    ];
+    if cols.ran_on {
+        header_cells.push(Cell::from(Span::styled("Ran on", hdr)));
+    }
+    if cols.updated {
+        header_cells.push(Cell::from(Span::styled("Updated", hdr)));
+    }
+    if cols.recent {
+        header_cells.push(Cell::from(Span::styled("Recent runs", hdr)));
+    }
+    let header = Row::new(header_cells).height(1).bottom_margin(1);
+
+    // Marked for a batch commit. Its own column rather than a prefix on the
+    // name, so the marks line up and can be counted down the list at a glance.
+    let mark_cell = |card: &crate::app::state::RepoCard| -> Cell<'static> {
+        if state.repo_marks.contains(&card.spec) {
+            Cell::from(Span::styled("◆", Style::default().fg(theme.accent).bold()))
+        } else {
+            Cell::from("")
+        }
+    };
 
     // Which branch you are standing on, and how far it has drifted from
     // upstream. Distinct from the "Ran on" column, which reports the branch the
@@ -481,7 +679,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         };
         let mut spans: Vec<Span> = vec![Span::styled(
             truncate(&g.branch, 20),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.accent),
         )];
         if g.ahead > 0 {
             spans.push(Span::styled(
@@ -492,7 +690,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         if g.behind > 0 {
             spans.push(Span::styled(
                 format!(" ↓{}", g.behind),
-                Style::default().fg(Color::Rgb(120, 120, 145)),
+                Style::default().fg(theme.text_muted),
             ));
         }
         // A commit running (or stopped by a hook) in another repo is reported
@@ -515,7 +713,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         if g.is_clean() {
             return Cell::from(Line::from(vec![
                 Span::styled("✓ ", Style::default().fg(theme.success)),
-                Span::styled("clean", Style::default().fg(Color::Rgb(90, 110, 95))),
+                Span::styled("clean", Style::default().fg(theme.success_dim)),
             ]));
         }
         let staged = g.staged_count();
@@ -549,15 +747,15 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         let local = card.git.as_ref().map(|g| g.branch.as_str());
         let diverged = local.is_some_and(|b| b != run_branch);
         let style = if diverged {
-            Style::default().fg(Color::Rgb(150, 130, 90))
+            Style::default().fg(theme.accent_dim)
         } else {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.accent)
         };
         // The marker leads rather than trails: a long branch name would clip a
         // trailing one off the end of the column, and leading keeps the markers
         // aligned so divergent rows are scannable down the list.
         let marker = if diverged {
-            Span::styled("≠ ", Style::default().fg(Color::Rgb(190, 160, 90)).bold())
+            Span::styled("≠ ", Style::default().fg(theme.accent_dim).bold())
         } else {
             Span::raw("  ")
         };
@@ -567,20 +765,42 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         ]))
     };
 
-    let rows: Vec<Row> = state
-        .repos
-        .iter()
-        .map(|card| {
+    // Rows for repos, optionally with an owner heading before each group. The
+    // heading rows shift every index after them, so the cursor is translated
+    // through `row_of` rather than used directly.
+    let groups = Grouping::of(&state.repos);
+    let mut rows: Vec<Row> = Vec::with_capacity(state.repos.len() + 4);
+    let mut row_of: Vec<usize> = Vec::with_capacity(state.repos.len());
+
+    for (i, card) in state.repos.iter().enumerate() {
+        if let Some(owner) = groups.heading_before(i) {
+            rows.push(
+                Row::new(vec![
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(Line::from(vec![
+                        Span::styled(owner.to_string(), Style::default().fg(theme.text_faint)),
+                        Span::styled(" ╌╌╌", Style::default().fg(theme.border_dim)),
+                    ])),
+                ])
+                .style(Style::default().bg(theme.row_idle)),
+            );
+        }
+        row_of.push(rows.len());
+        rows.push({
             // Same reasoning as the header above: until a repo is actually
             // entered, the workspace dashboard has no active repo to point at.
             let active = !state.repo_label_implicit && card.spec == state.repo_label;
             let name_style = if active {
-                Style::default().fg(Color::White).bold()
+                Style::default().fg(theme.text_bright).bold()
             } else {
-                Style::default().fg(Color::Rgb(200, 200, 220))
+                Style::default().fg(theme.text)
             };
+            // Under a heading the owner is already said; repeating it on every
+            // row costs the width the name needs.
+            let shown = groups.short_name(&card.spec);
             let name_cell = Cell::from(Line::from(vec![
-                Span::styled(card.spec.clone(), name_style),
+                Span::styled(shown, name_style),
                 if active {
                     Span::styled("  ●", Style::default().fg(theme.accent))
                 } else {
@@ -590,7 +810,8 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
 
             // A repo that failed to load says so instead of pretending to be idle.
             if let Some(err) = &card.error {
-                return Row::new(vec![
+                rows.push(Row::new(vec![
+                    mark_cell(card),
                     Cell::from(Span::styled("!", Style::default().fg(theme.failure).bold())),
                     name_cell,
                     local_cell(card),
@@ -599,48 +820,53 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                         truncate(err, 46),
                         Style::default().fg(theme.failure),
                     )),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                ])
-                .style(Style::default().bg(row_bg_for_status(Status::Failure)));
+                ]
+                .into_iter()
+                .chain(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")))
+                .collect::<Vec<_>>())
+                .style(Style::default().bg(row_bg_for_status(Status::Failure, theme))));
+                continue;
             }
 
             // A checkout with no GitHub origin never fetches, so it must not sit
             // at "loading…" forever — it just has no CI half to show.
             if !card.has_ci() {
-                return Row::new(vec![
+                rows.push(Row::new(vec![
+                    mark_cell(card),
                     Cell::from(""),
                     name_cell,
                     local_cell(card),
                     changes_cell(card),
                     Cell::from(Span::styled(
                         "local only — no GitHub remote",
-                        Style::default().fg(Color::Rgb(90, 90, 115)).italic(),
+                        Style::default().fg(theme.text_faint).italic(),
                     )),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                ]);
+                ]
+                .into_iter()
+                .chain(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")))
+                .collect::<Vec<_>>()));
+                continue;
             }
 
             if !card.loaded {
-                return Row::new(vec![
+                rows.push(Row::new(vec![
+                    mark_cell(card),
                     Cell::from(""),
                     name_cell,
                     local_cell(card),
                     changes_cell(card),
-                    Cell::from(Span::styled("loading…", Style::default().fg(Color::DarkGray))),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                ]);
+                    Cell::from(Line::from(skeleton(14, state.tick_count, theme))),
+                ]
+                .into_iter()
+                .chain(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")))
+                .collect::<Vec<_>>()));
+                continue;
             }
 
             let latest = card.runs.first();
             let status = card.latest_status().unwrap_or(Status::Unknown);
             let (when_text, when_style) = latest
-                .map(|r| relative_styled(r.updated_at))
+                .map(|r| relative_styled(r.updated_at, theme))
                 .unwrap_or_else(|| ("—".into(), Style::default().fg(theme.unknown)));
             let workflow = latest
                 .map(|r| truncate(&r.display_title, 28))
@@ -648,17 +874,34 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
             let branch = latest.map(|r| r.head_branch.clone()).unwrap_or_default();
 
             let (c_ok, c_fail, c_busy) = card.counts();
-            let sparkline = Line::from(vec![
-                Span::styled(format!("✓{c_ok} "), Style::default().fg(theme.success)),
-                Span::styled(format!("✗{c_fail} "), Style::default().fg(theme.failure)),
-                if c_busy > 0 {
-                    Span::styled(format!("⏵{c_busy}"), Style::default().fg(theme.warning).bold())
-                } else {
-                    Span::raw("")
-                },
-            ]);
+            let mut recent = run_sparkline(&card.runs, spark_w, theme);
+            recent.push(Span::styled(
+                format!(" ✓{c_ok}"),
+                Style::default().fg(theme.success_dim),
+            ));
+            if c_fail > 0 {
+                recent.push(Span::styled(
+                    format!(" ✗{c_fail}"),
+                    Style::default().fg(theme.failure),
+                ));
+            }
+            let sparkline = Line::from(recent);
+            let _ = c_busy;
+
+            // A row whose CI moved since you last looked lights up and fades
+            // back down, so the change is findable without diffing the screen
+            // against your memory of it.
+            let bg = match card.changed_tick {
+                Some(at) => mix(
+                    row_bg_for_status(status, theme),
+                    style_for_status(status, theme).fg.unwrap_or(theme.text),
+                    0.4 * Motion::new(state.tick_count).decay(at, FLASH_TICKS),
+                ),
+                None => row_bg_for_status(status, theme),
+            };
 
             Row::new(vec![
+                mark_cell(card),
                 Cell::from(Span::styled(
                     animated_glyph(status, state.tick_count),
                     style_for_status(status, theme),
@@ -666,40 +909,448 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                 name_cell,
                 local_cell(card),
                 changes_cell(card),
-                Cell::from(Span::styled(workflow, Style::default().fg(Color::Rgb(180, 180, 210)))),
+                Cell::from(Span::styled(workflow, Style::default().fg(theme.text))),
+            ]
+            .into_iter()
+            .chain(cols.tail(
                 ran_on_cell(card, &branch),
                 Cell::from(Span::styled(when_text, when_style)),
                 Cell::from(sparkline),
-            ])
-            .style(Style::default().bg(row_bg_for_status(status)))
-        })
-        .collect();
+            ))
+            .collect::<Vec<_>>())
+            .style(Style::default().bg(bg))
+        });
+    }
 
-    let widths = [
+    let mut widths = vec![
+        Constraint::Length(1),   // batch mark
         Constraint::Length(1),   // status glyph
         Constraint::Fill(40),    // repo
         Constraint::Fill(26),    // local branch + upstream drift
         Constraint::Length(9),   // working-tree changes
         Constraint::Fill(35),    // latest workflow
-        Constraint::Fill(26),    // branch the run used
-        Constraint::Length(10),  // updated
-        Constraint::Length(14),  // counts
     ];
+    if cols.ran_on {
+        widths.push(Constraint::Fill(26)); // branch the run used
+    }
+    if cols.updated {
+        widths.push(Constraint::Length(10));
+    }
+    if cols.recent {
+        widths.push(Constraint::Length(spark_w as u16 + 9));
+    }
 
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(2)
         .row_highlight_style(
             Style::default()
-                .bg(Color::Rgb(35, 95, 120))
-                .fg(Color::Rgb(220, 240, 255))
+                .bg(theme.select_bg)
+                .fg(theme.text_bright)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▶ ");
 
     let mut ts = TableState::default();
-    ts.select(Some(state.repo_cursor));
+    // Through the map, not directly: every owner heading pushes the rows below
+    // it down one, and selecting by repo index would highlight the wrong repo —
+    // or a heading — as soon as there were two owners.
+    ts.select(row_of.get(state.repo_cursor).copied());
     f.render_stateful_widget(table, inner, &mut ts);
+}
+
+/// Whether the dashboard's rows are worth grouping by owner, and where the
+/// headings go.
+///
+/// Only when there is more than one owner: heading every row of a single-org
+/// dashboard with that org says nothing and costs a row. And only when every
+/// row has one — a workspace scan produces bare directory names, which have no
+/// owner to group by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Grouping {
+    /// Owner per row, empty when grouping is off.
+    owners: Vec<String>,
+}
+
+impl Grouping {
+    fn of(repos: &[crate::app::state::RepoCard]) -> Self {
+        let owners: Vec<String> = repos
+            .iter()
+            .map(|c| c.spec.split_once('/').map(|(o, _)| o.to_string()).unwrap_or_default())
+            .collect();
+        let distinct: std::collections::HashSet<&String> = owners.iter().collect();
+        let worth_it = distinct.len() > 1 && owners.iter().all(|o| !o.is_empty());
+        Self { owners: if worth_it { owners } else { Vec::new() } }
+    }
+
+    fn on(&self) -> bool {
+        !self.owners.is_empty()
+    }
+
+    /// The owner heading that belongs above row `i`, if this row opens a group.
+    fn heading_before(&self, i: usize) -> Option<&str> {
+        let owner = self.owners.get(i)?;
+        // A group opens at the first row, or wherever the owner changes.
+        match i.checked_sub(1).and_then(|p| self.owners.get(p)) {
+            Some(prev) if prev == owner => None,
+            _ => Some(owner),
+        }
+    }
+
+    /// The repo's name with the owner dropped, when a heading already carries it.
+    fn short_name(&self, spec: &str) -> String {
+        match self.on() {
+            true => spec.split_once('/').map(|(_, r)| r.to_string()).unwrap_or_else(|| spec.into()),
+            false => spec.to_string(),
+        }
+    }
+}
+
+/// Which of the dashboard's optional columns this terminal has room for.
+///
+/// Dropping whole columns rather than letting all nine shrink together: the
+/// repo name and what its CI is doing are why the view exists, and eight
+/// columns truncated to six characters each answers nothing. What goes first is
+/// what is recoverable elsewhere — the run's branch and its age are both one
+/// keystroke away in the run list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Columns {
+    ran_on: bool,
+    updated: bool,
+    recent: bool,
+    /// History degrades by degrees rather than all at once, so it is the last
+    /// thing to go.
+    spark_w: usize,
+}
+
+impl Columns {
+    fn for_width(w: u16) -> Self {
+        match w {
+            0..=79 => Self { ran_on: false, updated: false, recent: false, spark_w: 0 },
+            80..=99 => Self { ran_on: false, updated: true, recent: false, spark_w: 0 },
+            100..=119 => Self { ran_on: false, updated: true, recent: true, spark_w: 5 },
+            120..=149 => Self { ran_on: true, updated: true, recent: true, spark_w: 5 },
+            150..=169 => Self { ran_on: true, updated: true, recent: true, spark_w: 8 },
+            _ => Self { ran_on: true, updated: true, recent: true, spark_w: 12 },
+        }
+    }
+
+    /// The optional cells, in column order, keeping only what fits.
+    fn tail<T>(self, ran_on: T, updated: T, recent: T) -> impl Iterator<Item = T> {
+        [
+            self.ran_on.then_some(ran_on),
+            self.updated.then_some(updated),
+            self.recent.then_some(recent),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+/// The last `width` runs as a bar per run, oldest on the left.
+///
+/// Height is how long the run took against the longest in the window; colour is
+/// how it ended. A pair of counts can say "18 passed, 2 failed" but never *"it
+/// started failing three runs ago"* or *"the last green one took twice as long
+/// as usual"*, which are the two questions a repo's history gets asked.
+fn run_sparkline(runs: &[Run], width: usize, theme: &Theme) -> Vec<Span<'static>> {
+    const BARS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    if runs.is_empty() {
+        return vec![Span::styled("—", Style::default().fg(theme.unknown))];
+    }
+    // `runs` is newest-first; a history reads left to right.
+    let window: Vec<&Run> = runs.iter().take(width).rev().collect();
+    let secs = |r: &Run| (r.updated_at - r.created_at).num_seconds().max(0) as f64;
+    let longest = window.iter().copied().map(secs).fold(0.0_f64, f64::max);
+    let shortest = window.iter().copied().map(secs).fold(f64::MAX, f64::min);
+    // Scale across the window's own range rather than from zero, so a minute of
+    // variation in ten-minute builds is still visible. But a history where every
+    // run took about the same time *is* flat, and stretching a 3% spread across
+    // the full height would invent a shape that isn't there.
+    let spread = longest - shortest;
+    let flat = longest <= 0.0 || spread / longest < 0.15;
+    window
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let newest = i + 1 == window.len();
+            let color = match r.status {
+                // Successes are the background against which a failure has to
+                // stand out, so they sit back except for the most recent one.
+                Status::Success if newest => theme.success,
+                Status::Success => theme.success_dim,
+                Status::Failure => theme.failure,
+                Status::Running | Status::Queued => theme.warning,
+                _ => theme.unknown,
+            };
+            // A run with no measurable duration still gets a bar: absence of a
+            // mark would read as "no run", which is a different fact.
+            let h = if flat {
+                3
+            } else {
+                (((secs(r) - shortest) / spread) * 7.0).round().clamp(0.0, 7.0) as usize
+            };
+            Span::styled(BARS[h], Style::default().fg(color))
+        })
+        .collect()
+}
+
+/// How long a row stays lit after its CI moves — one second, which is long
+/// enough to catch out of the corner of an eye and short enough that a busy
+/// dashboard is not permanently glowing.
+const FLASH_TICKS: u64 = 10;
+
+/// A row that has nothing to show yet, waiting rather than broken.
+///
+/// A static "loading…" looks identical whether the request left half a second
+/// ago or the network is gone; a moving one at least says the app is still
+/// asking.
+fn skeleton(width: usize, tick: u64, theme: &Theme) -> Vec<Span<'static>> {
+    let head = Motion::new(tick).sweep(width, 6);
+    (0..width)
+        .map(|i| {
+            // Weight carries the motion as well as colour, so it still reads on
+            // a terminal that has flattened the palette.
+            let lit = i == head || i + 1 == head;
+            Span::styled(
+                if lit { "━" } else { "─" },
+                Style::default().fg(if lit { theme.text_faint } else { theme.text_ghost }),
+            )
+        })
+        .collect()
+}
+
+/// The running step's name breathes between two brightnesses.
+///
+/// Motion is the cheapest way to say "this is now, not a snapshot" — a static
+/// step name looks identical whether it started two seconds or twenty minutes
+/// ago, and the whole point of the strip is that it is live.
+fn breathing(tick: u64, theme: &Theme) -> Color {
+    mix(theme.text, theme.text_bright, Motion::new(tick).pulse(16))
+}
+
+/// A progress bar that keeps moving even when the run doesn't.
+///
+/// The fill is real progress — steps a job has finished. The bright cell
+/// sweeping along it is not: it exists so an eight-minute test step still reads
+/// as *alive* rather than as a frozen screen.
+///
+/// `ratio` of `None` means nothing has started yet, so there is no honest fill.
+/// A single travelling cell says "waiting" without inventing progress.
+fn progress_bar(ratio: Option<f64>, width: usize, tick: u64, theme: &Theme) -> Vec<Span<'static>> {
+    let head = theme.text_bright;
+    let track = theme.border;
+    let fill = theme.warning;
+    let mut spans = Vec::with_capacity(width);
+    match ratio {
+        Some(r) => {
+            let filled = ((r.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+            // The sweep overshoots the bar before wrapping, so there is a pause
+            // between passes instead of a strobe.
+            let sweep = Motion::new(tick).sweep(width, 8);
+            for i in 0..width {
+                let (ch, color) = if i < filled {
+                    if i == sweep { ("━", head) } else { ("━", fill) }
+                } else if i == filled {
+                    ("╺", fill)
+                } else {
+                    ("─", track)
+                };
+                spans.push(Span::styled(ch, Style::default().fg(color)));
+            }
+        }
+        None => {
+            let pos = Motion::new(tick).bounce(width);
+            for i in 0..width {
+                // The weight changes with the colour, so the travel still reads
+                // on a terminal that has flattened the palette.
+                let (ch, color) = match (i as isize - pos as isize).abs() {
+                    0 => ("━", head),
+                    1 => ("━", fill),
+                    _ => ("─", track),
+                };
+                spans.push(Span::styled(ch, Style::default().fg(color)));
+            }
+        }
+    }
+    spans
+}
+
+/// The live CI/CD strip along the bottom of the dashboard: for every repo with
+/// something in flight, which workflow is running and which step it is on.
+///
+/// The table above can only say *that* a repo is busy. Answering "busy doing
+/// what?" otherwise costs two keystrokes and a screen change per repo, which is
+/// exactly the question you have while waiting on a deploy.
+fn render_activity_strip(
+    f: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    entries: &[(&crate::app::state::RepoCard, &crate::provider::RunDetail)],
+) {
+    let theme = &state.theme;
+    let tick = state.tick_count;
+
+    // A slow breath on the border, in step with the spinners: the one cue that
+    // survives peripheral vision, so CI reads as alive without being read.
+    let border = mix(theme.border, theme.accent_dim, Motion::new(tick).pulse(20));
+
+    let shown = entries.len().min(area.height.saturating_sub(2) as usize);
+    let mut title = vec![
+        Span::styled(
+            format!(" {} ", animated_glyph(Status::Running, tick)),
+            Style::default().fg(theme.warning).bold(),
+        ),
+        Span::styled("Live", Style::default().fg(theme.text_bright).bold()),
+        Span::styled(
+            format!("  {} in flight ", entries.len()),
+            Style::default().fg(theme.text_muted),
+        ),
+    ];
+    // Never let the strip imply it is showing everything when it isn't.
+    if shown < entries.len() {
+        title.push(Span::styled(
+            format!("(showing {shown}) "),
+            Style::default().fg(theme.text_muted).italic(),
+        ));
+    }
+
+    let rows: Vec<Row> = entries
+        .iter()
+        .take(shown)
+        .map(|(card, detail)| {
+            let run = &detail.run;
+            let running_job = detail.jobs.iter().find(|j| j.status == Status::Running);
+
+            let (ratio, count_text, step_spans) = match running_job {
+                Some(job) => {
+                    let total = job.steps.len();
+                    let done = job.steps.iter().filter(|s| s.status.is_terminal()).count();
+                    let cur = job.steps.iter().position(|s| s.status == Status::Running);
+                    let ratio = (total > 0).then(|| done as f64 / total as f64);
+                    let count = match (cur, total) {
+                        (_, 0) => String::new(),
+                        (Some(i), t) => format!("{}/{}", i + 1, t),
+                        (None, t) => format!("{done}/{t}"),
+                    };
+                    let mut spans = vec![Span::styled(
+                        truncate(&job.name, 18),
+                        Style::default().fg(theme.text_muted),
+                    )];
+                    match cur {
+                        Some(i) => {
+                            spans.push(Span::styled(
+                                " › ",
+                                Style::default().fg(theme.text_ghost),
+                            ));
+                            spans.push(Span::styled(
+                                truncate(&job.steps[i].name, 36),
+                                Style::default().fg(breathing(tick, theme)).bold(),
+                            ));
+                        }
+                        None => spans.push(Span::styled(
+                            "  ·  wrapping up",
+                            Style::default().fg(theme.text_muted).italic(),
+                        )),
+                    }
+                    (ratio, count, spans)
+                }
+                // No jobs at all: GitHub has accepted the run but hasn't placed
+                // it on a runner, so there is genuinely no step to name yet.
+                None if detail.jobs.is_empty() => (
+                    None,
+                    String::new(),
+                    vec![Span::styled(
+                        if run.status == Status::Queued {
+                            "queued · waiting for a runner"
+                        } else {
+                            "starting up…"
+                        },
+                        Style::default().fg(theme.text_muted).italic(),
+                    )],
+                ),
+                // Jobs exist but none is running: between two of them, or a
+                // matrix leg is still being scheduled.
+                None => {
+                    let done = detail.jobs.iter().filter(|j| j.status.is_terminal()).count();
+                    (
+                        Some(done as f64 / detail.jobs.len() as f64),
+                        format!("{done}/{} jobs", detail.jobs.len()),
+                        vec![Span::styled(
+                            "waiting for the next job",
+                            Style::default().fg(theme.text_muted).italic(),
+                        )],
+                    )
+                }
+            };
+
+            // A queued run is waiting, not stopped — the dashboard's static dot
+            // would be the only still thing in a panel about motion.
+            let glyph = if run.status == Status::Queued {
+                const PULSE: [&str; 4] = ["·", "•", "●", "•"];
+                // Quarter of the spinner's rate: waiting, not working.
+                PULSE[((tick / 5) % 4) as usize]
+            } else {
+                animated_glyph(run.status, tick)
+            };
+
+            Row::new(vec![
+                Cell::from(Span::styled(
+                    glyph,
+                    Style::default().fg(theme.warning).bold(),
+                )),
+                Cell::from(Span::styled(
+                    truncate(&card.spec, 24),
+                    Style::default().fg(theme.text_bright).bold(),
+                )),
+                Cell::from(Line::from(vec![
+                    Span::styled(
+                        truncate(&run.display_title, 24),
+                        Style::default().fg(theme.text),
+                    ),
+                    Span::styled(" · ", Style::default().fg(theme.text_ghost)),
+                    Span::styled(
+                        truncate(&run.head_branch, 14),
+                        Style::default().fg(theme.accent_dim),
+                    ),
+                ])),
+                Cell::from(Line::from(step_spans)),
+                Cell::from(Line::from(progress_bar(ratio, 14, tick, theme))),
+                Cell::from(Span::styled(
+                    count_text,
+                    Style::default().fg(theme.text_muted),
+                )),
+                Cell::from(
+                    Line::from(Span::styled(
+                        format_elapsed(elapsed_seconds(run)),
+                        Style::default().fg(theme.warning),
+                    ))
+                    .right_aligned(),
+                ),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(1),  // spinner
+        Constraint::Fill(26),   // repo
+        Constraint::Fill(30),   // workflow · branch the run used
+        Constraint::Fill(44),   // job › step
+        Constraint::Length(14), // progress
+        Constraint::Length(8),  // step counter
+        Constraint::Length(7),  // elapsed
+    ];
+
+    f.render_widget(
+        Table::new(rows, widths).column_spacing(2).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(border))
+                .title(Line::from(title)),
+        ),
+        area,
+    );
 }
 
 /// The full keybinding reference, built from the *configured* keys so remapped
@@ -731,7 +1382,25 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
             vec![
                 ("↵".into(), "switch to this repo"),
                 (k(&km.git_view), "review local changes"),
+                (k(&km.repo_mark), "mark / unmark this repo for a batch commit"),
+                (k(&km.batch_commit), "commit every marked repo with one message"),
                 (k(&km.open_browser), "open the repo's Actions page"),
+            ],
+        ),
+        (
+            "Batch commit",
+            vec![
+                (
+                    "↵".into(),
+                    "start — stages everything and commits each repo in turn",
+                ),
+                (k(&km.batch_retry), "retry the repo that failed",),
+                (k(&km.batch_skip), "skip it and carry on"),
+                (k(&km.git_view), "open the failed repo's working tree to fix it"),
+                (pair(&km.down, &km.up), "scroll the hook output"),
+                (pair(&km.next_error, &km.prev_error), "next / previous error"),
+                (k(&km.git_push), "push everything the batch committed"),
+                (k(&km.back), "stop — repos already committed keep their commits"),
             ],
         ),
         (
@@ -827,6 +1496,7 @@ fn help_section_for(view: View) -> &'static str {
         View::RunDetail | View::Diff => "Run detail",
         View::Logs => "Logs",
         View::TriggerPrompt => "Trigger prompt",
+        View::BatchCommit => "Batch commit",
     }
 }
 
@@ -876,10 +1546,10 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
                 Span::raw("   "),
                 Span::styled(
                     format!("{key:>key_w$}"),
-                    Style::default().fg(Color::White).bold(),
+                    Style::default().fg(theme.text_bright).bold(),
                 ),
                 Span::raw("   "),
-                Span::styled(*desc, Style::default().fg(Color::Rgb(190, 190, 215))),
+                Span::styled(*desc, Style::default().fg(theme.text)),
             ]));
         }
         lines.push(Line::default());
@@ -995,7 +1665,7 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
     let summary = if gv.status.is_none() {
         Line::from(Span::styled(
             "reading working tree…",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_faint),
         ))
     } else if gv.entries().is_empty() {
         // "Nothing to commit" is only the whole truth when there is also
@@ -1014,7 +1684,7 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
                 ),
                 Span::styled(
                     format!("   {} pushes", state.keymap.git_push),
-                    Style::default().fg(theme.secondary),
+                    Style::default().fg(theme.text_muted),
                 ),
             ])
         } else {
@@ -1022,7 +1692,7 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
                 Span::styled("✓ clean", Style::default().fg(theme.success).bold()),
                 Span::styled(
                     "   nothing to commit",
-                    Style::default().fg(theme.secondary),
+                    Style::default().fg(theme.text_muted),
                 ),
             ])
         }
@@ -1033,7 +1703,7 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
                 if staged > 0 {
                     Style::default().fg(theme.success).bold()
                 } else {
-                    Style::default().fg(theme.secondary)
+                    Style::default().fg(theme.text_muted)
                 },
             ),
             Span::styled("   ", Style::default()),
@@ -1043,7 +1713,7 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
             ),
             Span::styled(
                 format!("   {}", gv.path.display()),
-                Style::default().fg(Color::Rgb(90, 90, 115)),
+                Style::default().fg(theme.text_faint),
             ),
         ])
     };
@@ -1065,22 +1735,22 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
             let mark_style = if staged {
                 Style::default().fg(theme.success).bold()
             } else {
-                Style::default().fg(Color::Rgb(90, 90, 115))
+                Style::default().fg(theme.text_faint)
             };
             let path_style = if staged {
-                Style::default().fg(Color::White)
+                Style::default().fg(theme.text_bright)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(theme.text_muted)
             };
             let label_style = match e.label() {
                 "deleted" => Style::default().fg(theme.failure),
-                "untracked" => Style::default().fg(Color::Rgb(120, 120, 145)),
+                "untracked" => Style::default().fg(theme.text_muted),
                 "conflict" => Style::default().fg(theme.failure).bold(),
                 _ => Style::default().fg(theme.warning),
             };
             Row::new(vec![
                 Cell::from(Span::styled(mark, mark_style)),
-                Cell::from(Span::styled(e.code(), Style::default().fg(Color::Rgb(110, 110, 140)))),
+                Cell::from(Span::styled(e.code(), Style::default().fg(theme.text_muted))),
                 Cell::from(Span::styled(e.label(), label_style)),
                 Cell::from(Span::styled(e.path.clone(), path_style)),
             ])
@@ -1104,8 +1774,8 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
         Row::new(vec![
             Cell::from(""),
             Cell::from(""),
-            Cell::from(Span::styled("Change", Style::default().fg(theme.secondary))),
-            Cell::from(Span::styled("File", Style::default().fg(theme.secondary))),
+            Cell::from(Span::styled("Change", Style::default().fg(theme.text_muted))),
+            Cell::from(Span::styled("File", Style::default().fg(theme.text_muted))),
         ])
         .height(1)
         .bottom_margin(1),
@@ -1113,8 +1783,8 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
     .column_spacing(1)
     .row_highlight_style(
         Style::default()
-            .bg(Color::Rgb(35, 95, 120))
-            .fg(Color::Rgb(220, 240, 255))
+            .bg(theme.select_bg)
+            .fg(theme.text_bright)
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("▶ ");
@@ -1155,8 +1825,7 @@ fn render_op_output(f: &mut Frame, area: Rect, op: &GitOp, state: &AppState) {
     let theme = &state.theme;
     let errors = op.error_count();
     let (title, border) = if !op.finished {
-        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let glyph = FRAMES[((state.tick_count / 2) % 10) as usize];
+        let glyph = Motion::new(state.tick_count).spinner_slow();
         (
             format!(
                 "{glyph} {} · {}s",
@@ -1200,7 +1869,7 @@ fn render_op_output(f: &mut Frame, area: Rect, op: &GitOp, state: &AppState) {
     if offset == 0 && op.dropped > 0 {
         lines.push(Line::from(Span::styled(
             format!("⋯ {} earlier lines dropped ⋯", op.dropped),
-            Style::default().fg(Color::Rgb(110, 110, 140)),
+            Style::default().fg(theme.text_muted),
         )));
     }
     for l in op.lines.iter().skip(offset).take(viewport - lines.len()) {
@@ -1209,17 +1878,301 @@ fn render_op_output(f: &mut Frame, area: Rect, op: &GitOp, state: &AppState) {
         } else if l.warn {
             Style::default().fg(theme.warning)
         } else {
-            Style::default().fg(Color::Rgb(190, 190, 210))
+            Style::default().fg(theme.text)
         };
         lines.push(Line::from(Span::styled(l.text.clone(), style)));
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "waiting for output…",
-            Style::default().fg(Color::Rgb(110, 110, 140)),
+            Style::default().fg(theme.text_muted),
         )));
     }
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One commit message going out across several repos, one repo at a time.
+///
+/// Separate from the per-repo Changes view on purpose: this is a queue you are
+/// supervising, so what matters is where it has got to, what it did to each
+/// repo, and — when a hook says no — the output that explains it, alone on the
+/// screen rather than three repos deep in a scrollback.
+fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
+    let Some(batch) = state.batch.as_ref() else {
+        return;
+    };
+
+    // The op pane only earns its space while there is something to show in it.
+    let op = batch
+        .current()
+        .filter(|_| batch.phase != BatchPhase::Compose)
+        .and_then(|i| state.git_ops.get(&i.spec));
+    // The queue never squeezes the bottom pane out: a hook you cannot read, or
+    // a message box you have to type into blind because a dozen marked repos
+    // filled the screen, are the two things this view exists to avoid.
+    let composing = batch.input.is_some();
+    let lower = op.is_some() || composing;
+    // Borders, a row of top padding, and four lines of prompt. Fixed, because a
+    // four-line prompt stretched down forty rows is its own kind of clutter.
+    const COMPOSE_H: u16 = 7;
+    let reserve = if composing { COMPOSE_H } else { 3 };
+    let room = if lower {
+        area.height.saturating_sub(reserve + 1).max(3)
+    } else {
+        area.height
+    };
+    let list_h = (batch.items.len() as u16 + 2).min(room);
+    // A blank row between the two panes. Stacked borders touching each other
+    // read as one dense box; the gap is what makes them two things.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(match (lower, composing) {
+            // The hook output takes everything left: it is unbounded, and the
+            // line you need is as likely to be the last one as the first.
+            (true, false) => [
+                Constraint::Length(list_h),
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(0),
+            ],
+            (true, true) => [
+                Constraint::Length(list_h),
+                Constraint::Length(1),
+                Constraint::Length(COMPOSE_H.min(area.height.saturating_sub(list_h + 1))),
+                Constraint::Min(0),
+            ],
+            _ => [
+                Constraint::Length(list_h),
+                Constraint::Length(0),
+                Constraint::Min(0),
+                Constraint::Length(0),
+            ],
+        })
+        .split(area);
+    let (top, bottom) = (chunks[0], chunks[2]);
+
+    let (title, border) = match batch.phase {
+        BatchPhase::Compose => (
+            format!(" Commit {} repo{} ", batch.items.len(), plural(batch.items.len())),
+            theme.accent,
+        ),
+        BatchPhase::Paused => (
+            format!(
+                " Paused on {} — {} retry · {} skip · {} open · Esc stop ",
+                batch.current().map(|i| i.spec.as_str()).unwrap_or("?"),
+                display_key(&state.keymap.batch_retry),
+                display_key(&state.keymap.batch_skip),
+                display_key(&state.keymap.git_view),
+            ),
+            theme.failure,
+        ),
+        BatchPhase::AskPush => {
+            let t = batch.tally();
+            (
+                format!(
+                    " {} committed — {} pushes them all, Esc finishes ",
+                    t.committed,
+                    display_key(&state.keymap.git_push),
+                ),
+                theme.warning,
+            )
+        }
+        BatchPhase::Done => {
+            let t = batch.tally();
+            let mut parts = vec![format!("{} committed", t.committed)];
+            if t.pushed > 0 {
+                parts.push(format!("{} pushed", t.pushed));
+            }
+            if t.failed > 0 {
+                parts.push(format!("{} failed", t.failed));
+            }
+            if t.nothing > 0 {
+                parts.push(format!("{} had nothing to do", t.nothing));
+            }
+            if t.untouched > 0 {
+                parts.push(format!("{} not attempted", t.untouched));
+            }
+            (
+                format!(" Done · {} ", parts.join(" · ")),
+                if t.failed > 0 { theme.failure } else { theme.success },
+            )
+        }
+        _ => (
+            format!(
+                " {} {} · {}/{} ",
+                animated_glyph(Status::Running, state.tick_count),
+                if batch.phase == BatchPhase::Pushing { "Pushing" } else { "Committing" },
+                batch.cursor + 1,
+                batch.items.len(),
+            ),
+            theme.warning,
+        ),
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(title, Style::default().fg(border).bold()));
+    let inner = block.inner(top);
+    f.render_widget(block, top);
+
+    let dim = Style::default().fg(theme.text_muted);
+    // With more repos than rows, follow the one being worked on — a queue that
+    // scrolled the live repo off the top would be worse than no list at all.
+    let rows = inner.height as usize;
+    let hidden = batch.items.len().saturating_sub(rows);
+    let first = if hidden == 0 {
+        0
+    } else {
+        // One row of the window is spent saying what it is hiding.
+        batch.cursor.saturating_sub(1).min(hidden + 1)
+    };
+    let mut lines: Vec<Line> = batch
+        .items
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows.saturating_sub(usize::from(hidden > 0)))
+        .map(|(i, item)| {
+            let running = item.state == ItemState::Running && batch.is_working();
+            let (glyph, gstyle, note, nstyle) = match &item.state {
+                ItemState::Queued => (
+                    "·",
+                    dim,
+                    if batch.phase == BatchPhase::Done {
+                        "not attempted".to_string()
+                    } else {
+                        "queued".to_string()
+                    },
+                    dim,
+                ),
+                ItemState::Running => (
+                    animated_glyph(Status::Running, state.tick_count),
+                    Style::default().fg(theme.warning).bold(),
+                    format!(
+                        "{}… {}s",
+                        if batch.phase == BatchPhase::Pushing { "pushing" } else { "committing" },
+                        state.tick_count.saturating_sub(batch.started_tick) / 10,
+                    ),
+                    Style::default().fg(theme.text_bright),
+                ),
+                ItemState::Committed => (
+                    "✓",
+                    Style::default().fg(theme.success),
+                    format!("committed {}", item.sha.as_deref().unwrap_or("HEAD")),
+                    Style::default().fg(theme.success_dim),
+                ),
+                ItemState::Pushed => (
+                    "✓",
+                    Style::default().fg(theme.success).bold(),
+                    format!("pushed {}", item.sha.as_deref().unwrap_or("HEAD")),
+                    Style::default().fg(theme.success),
+                ),
+                // A push with nothing to do still leaves the batch's commit on
+                // disk; saying only "already up to date" would read as untouched.
+                ItemState::Nothing(why) => match item.sha.as_deref() {
+                    Some(sha) => (
+                        "✓",
+                        Style::default().fg(theme.success),
+                        format!("committed {sha} · {why}"),
+                        Style::default().fg(theme.success_dim),
+                    ),
+                    None => ("–", dim, why.clone(), dim),
+                },
+                // A push that failed still reports the commit that landed:
+                // "failed" alone would read as "this repo is untouched".
+                ItemState::Failed(err) => (
+                    "✗",
+                    Style::default().fg(theme.failure).bold(),
+                    match item.sha.as_deref() {
+                        Some(sha) => format!("committed {sha}, then failed: {err}"),
+                        None => err.clone(),
+                    },
+                    Style::default().fg(theme.failure),
+                ),
+            };
+            let name_style = if running || (batch.phase == BatchPhase::Paused && i == batch.cursor) {
+                Style::default().fg(theme.text_bright).bold()
+            } else {
+                Style::default().fg(theme.text)
+            };
+            Line::from(vec![
+                Span::styled(format!("{glyph}  "), gstyle),
+                Span::styled(format!("{:<24}", truncate(&item.spec, 24)), name_style),
+                Span::styled(truncate(&note, inner.width.saturating_sub(30) as usize), nstyle),
+            ])
+        })
+        .collect();
+    if hidden > 0 {
+        let shown = lines.len();
+        let t = batch.tally();
+        lines.push(Line::from(Span::styled(
+            format!(
+                "… {} more · {} committed · {} failed · {} waiting",
+                batch.items.len() - shown,
+                t.committed,
+                t.failed,
+                t.untouched,
+            ),
+            dim,
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+
+    match (batch.input.as_ref(), op) {
+        // Composing: the message box sits where the output will be, so the eye
+        // does not have to move once the run starts.
+        (Some(buf), _) => {
+            let dirty: usize = batch
+                .items
+                .iter()
+                .filter_map(|i| state.repos.iter().find(|c| c.spec == i.spec))
+                .filter_map(|c| c.git.as_ref())
+                .map(|g| g.entries.len())
+                .sum();
+            let blk = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.accent))
+                // The message is the one thing being typed on this screen, so it
+                // gets room around it rather than sitting against the border.
+                .padding(Padding::new(2, 2, 1, 0))
+                .title(Span::styled(
+                    format!(
+                        " One message for {} repo{} · {dirty} changed file{} ",
+                        batch.items.len(),
+                        plural(batch.items.len()),
+                        plural(dirty),
+                    ),
+                    Style::default().fg(theme.accent).bold(),
+                ));
+            let bi = blk.inner(bottom);
+            f.render_widget(blk, bottom);
+            // The caret line, then a gap, then the notes — so the eye lands on
+            // what it is typing instead of on a paragraph of hints.
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(buf.as_str(), Style::default().fg(theme.text_bright)),
+                    Span::styled("█", Style::default().fg(theme.accent)),
+                ]),
+                Line::raw(""),
+            ];
+            // On a short pane the caret comes first and the notes go without.
+            if bi.height >= 4 {
+                lines.push(Line::from(Span::styled(
+                    "every repo above is staged with `git add -A` and committed with this message",
+                    dim,
+                )));
+            }
+            lines.push(Line::from(Span::styled("↵ start · Esc cancel", dim)));
+            f.render_widget(Paragraph::new(lines), bi);
+        }
+        (None, Some(op)) => render_op_output(f, bottom, op, state),
+        (None, None) => {}
+    }
 }
 
 /// Style one line of diff text.
@@ -1228,7 +2181,7 @@ fn render_op_output(f: &mut Frame, area: Rect, op: &GitOp, state: &AppState) {
 /// file headers are the easy thing to get wrong: they start with the same
 /// characters as content but are not additions or deletions.
 fn diff_line_style(text: &str, theme: &Theme) -> Style {
-    let meta = Style::default().fg(Color::Rgb(110, 110, 140));
+    let meta = Style::default().fg(theme.text_muted);
     if text.starts_with("+++") || text.starts_with("---") {
         return meta;
     }
@@ -1249,7 +2202,7 @@ fn diff_line_style(text: &str, theme: &Theme) -> Style {
         {
             meta
         }
-        _ => Style::default().fg(Color::Rgb(190, 190, 210)),
+        _ => Style::default().fg(theme.text),
     }
 }
 
@@ -1292,7 +2245,7 @@ fn render_git_diff(f: &mut Frame, area: Rect, state: &AppState) {
             "no textual changes (mode change, rename, or an empty file)"
         };
         f.render_widget(
-            Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray).italic()))
+            Paragraph::new(Span::styled(msg, Style::default().fg(theme.text_faint).italic()))
                 .block(styled_block(&title, theme)),
             area,
         );
@@ -1327,6 +2280,7 @@ fn render_git_diff(f: &mut Frame, area: Rect, state: &AppState) {
 
 /// Commit message prompt, drawn over the working-tree view.
 fn render_commit_overlay(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
     let Some(buf) = state
         .git_view
         .as_ref()
@@ -1357,12 +2311,12 @@ fn render_commit_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     let lines = vec![
         Line::from(vec![
             Span::styled("  ", Style::default().fg(accent)),
-            Span::styled(buf.as_str(), Style::default().fg(Color::White)),
+            Span::styled(buf.as_str(), Style::default().fg(theme.text_bright)),
             Span::styled("█", Style::default().fg(accent)),
         ]),
         Line::from(Span::styled(
             "  ↵ commit · Esc cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_faint),
         )),
     ];
 
@@ -1372,6 +2326,12 @@ fn render_commit_overlay(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 /// Cut `s` to `max` characters, adding an ellipsis when it was longer.
+/// `s` for anything but one. Counts read as sloppy the moment they say
+/// "1 repos", and this view is nothing but counts.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
@@ -1381,6 +2341,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn render_finder_overlay(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
     let Some(finder) = &state.finder else { return };
 
     let dialog_w = (area.width * 70 / 100).max(40).min(area.width);
@@ -1413,19 +2374,19 @@ fn render_finder_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
             Span::styled("  ", Style::default().fg(accent)),
-            Span::styled(finder.query.as_str(), Style::default().fg(Color::White)),
+            Span::styled(finder.query.as_str(), Style::default().fg(theme.text_bright)),
             Span::styled("█", Style::default().fg(accent)),
         ]),
         Line::from(Span::styled(
             "─".repeat(inner.width as usize),
-            Style::default().fg(Color::Rgb(55, 55, 80)),
+            Style::default().fg(theme.border),
         )),
     ];
 
     if finder.matches.is_empty() {
         lines.push(Line::from(Span::styled(
             "  no matches",
-            Style::default().fg(Color::DarkGray).italic(),
+            Style::default().fg(theme.text_faint).italic(),
         )));
     }
 
@@ -1440,16 +2401,16 @@ fn render_finder_overlay(f: &mut Frame, area: Rect, state: &AppState) {
             .map(|(_, l)| l.as_str())
             .unwrap_or("");
         let style = if selected {
-            Style::default().fg(Color::Rgb(220, 240, 255)).bold()
+            Style::default().fg(theme.text_bright).bold()
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme.text_muted)
         };
         let line = Line::from(vec![
             Span::styled(if selected { "▶ " } else { "  " }, Style::default().fg(accent)),
             Span::styled(truncate(label, inner.width.saturating_sub(3) as usize), style),
         ]);
         lines.push(if selected {
-            line.style(Style::default().bg(Color::Rgb(35, 95, 120)))
+            line.style(Style::default().bg(theme.select_bg))
         } else {
             line
         });
@@ -1480,18 +2441,17 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
             _ => (o, f, r),
         }
     });
-    let wf_title = Line::from(vec![
-        Span::styled(format!(" Workflows ({count}"), Style::default().fg(theme.primary).bold()),
-        Span::styled(format!("  ✓{wf_ok}"), Style::default().fg(theme.success)),
+    let mut tallies = vec![
+        Span::styled(format!("✓{wf_ok}"), Style::default().fg(theme.success)),
         Span::styled(format!("  ✗{wf_fail}"), Style::default().fg(theme.failure)),
-        if wf_run > 0 { Span::styled(format!("  ⏵{wf_run}"), Style::default().fg(theme.warning).bold()) } else { Span::raw("") },
-        Span::styled(" ) ", Style::default().fg(theme.primary).bold()),
-    ]);
-    let blk = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(55, 55, 80)))
-        .title(wf_title);
+    ];
+    if wf_run > 0 {
+        tallies.push(Span::styled(
+            format!("  ⏵{wf_run}"),
+            Style::default().fg(theme.warning).bold(),
+        ));
+    }
+    let blk = panel(&format!("Workflows  {count}"), tallies, theme, theme.primary);
     let inner = blk.inner(area);
     f.render_widget(blk, area);
 
@@ -1499,9 +2459,9 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let sel_bg = Color::Rgb(35, 95, 120);
-    let sel_fg = Color::Rgb(220, 240, 255);
-    let hdr = Style::default().fg(theme.secondary);
+    let sel_bg = theme.select_bg;
+    let sel_fg = theme.text_bright;
+    let hdr = Style::default().fg(theme.text_muted);
 
     let header = Row::new(vec![
         Cell::from(""),
@@ -1520,17 +2480,17 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
             let status = w.last_status.unwrap_or(Status::Unknown);
             let (when_text, when_style) = w
                 .last_run_at
-                .map(|t| relative_styled(t.with_timezone(&Utc)))
+                .map(|t| relative_styled(t.with_timezone(&Utc), theme))
                 .unwrap_or_else(|| ("—".into(), Style::default().fg(theme.unknown)));
             let trig = if w.triggerable { "t" } else { " " };
 
-            let row_bg = row_bg_for_status(status);
+            let row_bg = row_bg_for_status(status, theme);
             Row::new(vec![
                 Cell::from(Span::styled(animated_glyph(status, state.tick_count), style_for_status(status, &state.theme))),
                 Cell::from(Span::styled(w.name.clone(), Style::default())),
                 Cell::from(Span::styled(
                     w.file_name.clone(),
-                    Style::default().fg(Color::Rgb(110, 110, 140)),
+                    Style::default().fg(theme.text_muted),
                 )),
                 Cell::from(Span::styled(when_text, when_style)),
                 Cell::from(Span::styled(
@@ -1557,13 +2517,23 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
         .highlight_symbol("▶ ");
 
     let mut ts = TableState::default();
-    if !state.workflows.is_empty() {
-        ts.select(Some(state.workflow_cursor));
+    if state.workflows.is_empty() {
+        render_empty(
+            f,
+            inner,
+            theme,
+            "⚙",
+            "This repo has no workflows.",
+            "add one under .github/workflows, or press H for the other repos",
+        );
+        return;
     }
+    ts.select(Some(state.workflow_cursor));
     f.render_stateful_widget(table, inner, &mut ts);
 }
 
 fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
     let selected = state.workflows.get(state.workflow_cursor);
 
     let title = selected
@@ -1585,7 +2555,7 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
 
     if !preview_ready {
         f.render_widget(
-            Paragraph::new(Span::styled("loading…", Style::default().fg(Color::DarkGray))),
+            Paragraph::new(Span::styled("loading…", Style::default().fg(theme.text_faint))),
             inner,
         );
         return;
@@ -1620,9 +2590,9 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
         f.render_widget(Block::default().style(Style::default().bg(bar_color)), rect);
     }
 
-    let sel_bg = Color::Rgb(25, 85, 110);
-    let sel_fg = Color::Rgb(220, 240, 255);
-    let hdr = Style::default().fg(Color::Rgb(120, 120, 145));
+    let sel_bg = theme.select_bg_dim;
+    let sel_fg = theme.text_bright;
+    let hdr = Style::default().fg(theme.text_muted);
 
     let header = Row::new(vec![
         Cell::from(""),
@@ -1636,13 +2606,13 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
         .workflow_preview_runs
         .iter()
         .map(|r| {
-            let (when_text, when_style) = relative_styled(r.updated_at);
+            let (when_text, when_style) = relative_styled(r.updated_at, theme);
             Row::new(vec![
                 Cell::from(Span::styled(animated_glyph(r.status, state.tick_count), style_for_status(r.status, &state.theme))),
-                Cell::from(Span::styled(r.head_branch.clone(), Style::default().fg(Color::Yellow))),
+                Cell::from(Span::styled(r.head_branch.clone(), Style::default().fg(theme.accent))),
                 Cell::from(Span::styled(when_text, when_style)),
             ])
-            .style(Style::default().bg(row_bg_for_status(r.status)))
+            .style(Style::default().bg(row_bg_for_status(r.status, theme)))
         })
         .collect();
 
@@ -1685,26 +2655,23 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
             _ => (o, f, r),
         }
     });
-    let title_line = Line::from(vec![
-        Span::styled(
-            if state.workflow_for_runs.is_some() {
-                format!(" Runs — {} ({}", wf_label, state.runs.len())
-            } else {
-                format!(" Runs ({}", state.runs.len())
-            },
-            Style::default().fg(theme.primary).bold(),
-        ),
-        Span::styled(format!("  ✓{ok}"), Style::default().fg(theme.success)),
+    let mut tallies = vec![
+        Span::styled(format!("✓{ok}"), Style::default().fg(theme.success)),
         Span::styled(format!("  ✗{fail}"), Style::default().fg(theme.failure)),
-        if running > 0 { Span::styled(format!("  ⏵{running}"), Style::default().fg(theme.warning).bold()) } else { Span::raw("") },
-        Span::styled(" ) ", Style::default().fg(theme.primary).bold()),
-    ]);
-    let blk = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(55, 55, 80)))
-        .style(Style::default().bg(Color::Rgb(18, 20, 32)))
-        .title(title_line);
+    ];
+    if running > 0 {
+        tallies.push(Span::styled(
+            format!("  ⏵{running}"),
+            Style::default().fg(theme.warning).bold(),
+        ));
+    }
+    let name = if state.workflow_for_runs.is_some() {
+        format!("Runs — {}  {}", wf_label, state.runs.len())
+    } else {
+        format!("Runs  {}", state.runs.len())
+    };
+    let blk = panel(&name, tallies, theme, theme.primary)
+        .style(Style::default().bg(theme.overlay));
     let inner = blk.inner(area);
     f.render_widget(blk, area);
 
@@ -1712,9 +2679,9 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let sel_bg = Color::Rgb(25, 85, 110);
-    let sel_fg = Color::Rgb(220, 240, 255);
-    let hdr = Style::default().fg(Color::Rgb(120, 120, 145));
+    let sel_bg = theme.select_bg_dim;
+    let sel_fg = theme.text_bright;
+    let hdr = Style::default().fg(theme.text_muted);
 
     let header = Row::new(vec![
         Cell::from(""),
@@ -1729,13 +2696,13 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
         .runs
         .iter()
         .map(|r| {
-            let (when_text, when_style) = relative_styled(r.updated_at);
+            let (when_text, when_style) = relative_styled(r.updated_at, theme);
             let dur_secs = elapsed_seconds(r);
             let dur_text = format_elapsed(dur_secs);
             let dur_style = if dur_secs > 900 {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(theme.accent)
             } else {
-                Style::default().fg(Color::Rgb(110, 110, 140))
+                Style::default().fg(theme.text_muted)
             };
             let commit_line = if r.commit_msg.is_empty() {
                 Line::default()
@@ -1748,12 +2715,12 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
                     chars.iter().collect()
                 };
                 Line::from(vec![
-                    Span::styled("⎿ ", Style::default().fg(Color::Rgb(65, 65, 80))),
-                    Span::styled(msg, Style::default().fg(Color::Rgb(110, 110, 140))),
+                    Span::styled("⎿ ", Style::default().fg(theme.text_ghost)),
+                    Span::styled(msg, Style::default().fg(theme.text_muted)),
                 ])
             };
             let branch_cell = ratatui::text::Text::from(vec![
-                Line::from(Span::styled(r.head_branch.clone(), Style::default().fg(Color::Yellow))),
+                Line::from(Span::styled(r.head_branch.clone(), Style::default().fg(theme.accent))),
                 commit_line,
             ]);
             Row::new(vec![
@@ -1780,13 +2747,23 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
         .highlight_symbol("▶ ");
 
     let mut ts = TableState::default();
-    if !state.runs.is_empty() {
-        ts.select(Some(state.run_cursor));
+    if state.runs.is_empty() {
+        render_empty(
+            f,
+            inner,
+            theme,
+            "◷",
+            "This workflow has never run.",
+            &format!("{} triggers it", display_key(&state.keymap.trigger)),
+        );
+        return;
     }
+    ts.select(Some(state.run_cursor));
     f.render_stateful_widget(table, inner, &mut ts);
 }
 
 fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
     let selected = state.runs.get(state.run_cursor);
 
     let title = selected.map(|r| {
@@ -1808,7 +2785,7 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
 
     if !preview_ready {
         f.render_widget(
-            Paragraph::new(Span::styled("loading…", Style::default().fg(Color::DarkGray))),
+            Paragraph::new(Span::styled("loading…", Style::default().fg(theme.text_faint))),
             inner,
         );
         return;
@@ -1820,8 +2797,8 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
         if let Some(run) = selected
             && !run.commit_msg.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled("󰊢 ", Style::default().fg(Color::Rgb(120, 120, 145))),
-                    Span::styled(run.commit_msg.clone(), Style::default().fg(Color::Rgb(180, 180, 210)).italic()),
+                    Span::styled("󰊢 ", Style::default().fg(theme.text_muted)),
+                    Span::styled(run.commit_msg.clone(), Style::default().fg(theme.text).italic()),
                 ]));
                 lines.push(Line::default());
             }
@@ -1848,6 +2825,7 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
     let detail = match &state.run_detail {
         Some(d) => d,
         None => {
@@ -1873,7 +2851,7 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
 
     let items = build_detail_items(detail);
     let cursor = state.detail_cursor;
-    let sel_bg = Color::Rgb(28, 38, 58);
+    let sel_bg = theme.surface_alt;
 
     let rows: Vec<Row> = items.iter().enumerate().map(|(flat_idx, item)| {
         let selected = flat_idx == cursor;
@@ -1883,7 +2861,7 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
                 let job = &detail.jobs[*ji];
                 let prefix = if selected { "▶ " } else { "  " };
                 let name_style = if selected {
-                    Style::default().bold().fg(Color::Cyan)
+                    Style::default().bold().fg(theme.primary)
                 } else {
                     Style::default().bold()
                 };
@@ -1900,9 +2878,9 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
                 let step = &detail.jobs[*ji].steps[*si];
                 let prefix = if selected { "  ▶ " } else { "    " };
                 let name_style = if selected {
-                    Style::default().fg(Color::White).bold()
+                    Style::default().fg(theme.text_bright).bold()
                 } else {
-                    Style::default().fg(Color::Gray)
+                    Style::default().fg(theme.text_muted)
                 };
                 let name_cell = Cell::from(Line::from(vec![
                     Span::raw(prefix),
@@ -1914,9 +2892,9 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
                     step_timing(step, max_secs_per_job[*ji], state.tick_count)
                 {
                     let bar_color = style_for_status(step.status, &state.theme)
-                        .fg.unwrap_or(Color::DarkGray);
+                        .fg.unwrap_or(theme.text_faint);
                     (
-                        Cell::from(format!("{dur:>6}")).style(Style::default().fg(Color::Rgb(80, 80, 100))),
+                        Cell::from(format!("{dur:>6}")).style(Style::default().fg(theme.text_ghost)),
                         Cell::from(bar).style(Style::default().fg(bar_color)),
                     )
                 } else {
@@ -1926,9 +2904,9 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
                     && failed > 0
                 {
                     let s = if failed * 2 >= total {
-                        Style::default().fg(Color::Red).bold()
+                        Style::default().fg(theme.failure).bold()
                     } else {
-                        Style::default().fg(Color::Yellow)
+                        Style::default().fg(theme.accent)
                     };
                     Cell::from(format!("  {failed}/{total} fails")).style(s)
                 } else {
@@ -1967,7 +2945,7 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
         } else {
             Span::styled("  ✓ all passed", Style::default().fg(theme.success))
         },
-        Span::styled(format!("  ⏱ {dur}"), Style::default().fg(theme.secondary)),
+        Span::styled(format!("  ⏱ {dur}"), Style::default().fg(theme.text_muted)),
     ]);
     f.render_widget(Paragraph::new(summary), inner_chunks[0]);
 
@@ -2052,13 +3030,102 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
     // clone bounded instead of copying the tail of a 40k-line log each redraw.
     // Cursor and current-match highlighting are applied here rather than during
     // the rebuild, so moving the cursor costs a viewport, not the whole buffer.
+    // The map needs a column of its own; text running into it would read as
+    // corruption rather than as a second thing on the screen.
+    let mapped = minimap_fits(area, state.log_rendered.len(), viewport as usize);
+    if mapped {
+        state.last_logs_viewport_width.set(area.width.saturating_sub(4));
+    }
+    let mut blk = styled_block(&log_title, &state.theme);
+    if mapped {
+        blk = blk.padding(Padding::right(2));
+    }
     let p = Paragraph::new(state.decorate_visible(first, viewport as usize))
-        .block(styled_block(&log_title, &state.theme))
+        .block(blk)
         .wrap(Wrap { trim: false });
     f.render_widget(p, area);
+    if mapped {
+        render_log_minimap(f, area, state, first, viewport as usize);
+    }
+}
+
+/// Whether a log is long enough, and a pane wide enough, for a map to say
+/// anything. Below a few screens everything is one page away.
+fn minimap_fits(area: Rect, total: usize, viewport: usize) -> bool {
+    area.height >= 6 && area.width >= 30 && total > viewport.max(1) * 2
+}
+
+/// A one-column map of the whole log down the right-hand rule.
+///
+/// The viewport shows a few dozen of what can be forty thousand lines, so the
+/// scrollbar answers "how far down am I" and nothing else. This answers the
+/// question a log actually gets asked — *where are the bad parts, and am I near
+/// one* — by marking every error and warning at its position in the whole file,
+/// with a bracket showing what is currently on screen.
+fn render_log_minimap(
+    f: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    first: usize,
+    viewport: usize,
+) {
+    let theme = &state.theme;
+    let total = state.log_rendered.len();
+    let rows = area.height.saturating_sub(2) as usize;
+    if rows == 0 {
+        return;
+    }
+    // Which rendered lines fall in each map row, and whether any is bad.
+    let mut marks = vec![None; rows];
+    let bucket = |line: usize| (line * rows) / total.max(1);
+    let mut mark = |line: usize, style: u8| {
+        if let Some(slot) = marks.get_mut(bucket(line)) {
+            // An error in the same band as a warning wins: it is the one you are
+            // looking for, and a band can only say one thing.
+            *slot = Some(slot.map_or(style, |s: u8| s.max(style)));
+        }
+    };
+    // `log_*_lines` index the raw log; the map is over rendered rows, which
+    // folding can make fewer. `log_rendered_src` maps one to the other.
+    let rendered_row = |raw: usize| -> Option<usize> {
+        state.log_rendered_src.iter().position(|s| *s == raw)
+    };
+    for l in &state.log_warn_lines {
+        if let Some(r) = rendered_row(*l) {
+            mark(r, 1);
+        }
+    }
+    for l in &state.log_error_lines {
+        if let Some(r) = rendered_row(*l) {
+            mark(r, 2);
+        }
+    }
+
+    let (top, bottom) = (bucket(first), bucket((first + viewport).min(total)));
+    let x = area.x + area.width - 2;
+    for (i, m) in marks.iter().enumerate() {
+        let here = i >= top && i <= bottom;
+        let (ch, color) = match m {
+            Some(2) => ("█", theme.failure),
+            Some(1) => ("▓", theme.warning),
+            // The unmarked track still shows where you are.
+            _ if here => ("│", theme.text_faint),
+            _ => ("·", theme.text_ghost),
+        };
+        let style = if here {
+            Style::default().fg(color).bg(theme.surface_alt)
+        } else {
+            Style::default().fg(color)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(ch, style))),
+            Rect { x, y: area.y + 1 + i as u16, width: 1, height: 1 },
+        );
+    }
 }
 
 fn render_search_overlay(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
     let Some(buf) = &state.log_search_input else { return };
 
     let dialog_w = (area.width * 60 / 100).max(40).min(area.width);
@@ -2078,7 +3145,7 @@ fn render_search_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(popup_area);
     let content = Line::from(vec![
         Span::styled("  ", Style::default().fg(accent)),
-        Span::styled(buf.as_str(), Style::default().fg(Color::White)),
+        Span::styled(buf.as_str(), Style::default().fg(theme.text_bright)),
         Span::styled("█", Style::default().fg(accent)),
     ]);
 
@@ -2088,6 +3155,7 @@ fn render_search_overlay(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(7), Constraint::Min(0)])
@@ -2098,22 +3166,22 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
         let step = detail.current_step().unwrap_or("—");
         vec![
             Line::from(vec![
-                Span::styled("Status: ", Style::default().fg(Color::Cyan).bold()),
+                Span::styled("Status: ", Style::default().fg(theme.primary).bold()),
                 Span::styled(
                     format!("{:?}", detail.run.status),
                     style_for_status(detail.run.status, &state.theme),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("Step:   ", Style::default().fg(Color::Cyan).bold()),
+                Span::styled("Step:   ", Style::default().fg(theme.primary).bold()),
                 Span::raw(step.to_string()),
             ]),
             Line::from(vec![
-                Span::styled("Elapsed:", Style::default().fg(Color::Cyan).bold()),
+                Span::styled("Elapsed:", Style::default().fg(theme.primary).bold()),
                 Span::raw(format!(" {}", elapsed)),
             ]),
             Line::from(vec![
-                Span::styled("Run:    ", Style::default().fg(Color::Cyan).bold()),
+                Span::styled("Run:    ", Style::default().fg(theme.primary).bold()),
                 Span::raw(format!(
                     "{} on {}",
                     detail.run.display_title, detail.run.head_branch
@@ -2159,10 +3227,10 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
             let label = Line::from(vec![
                 Span::styled(animated_glyph(job.status, state.tick_count), g_style),
                 Span::raw(" "),
-                Span::styled(job.name.clone(), Style::default().fg(Color::White).bold()),
+                Span::styled(job.name.clone(), Style::default().fg(theme.text_bright).bold()),
                 Span::styled(
                     format!("  {}/{}", done as u32, total as u32),
-                    Style::default().fg(theme.secondary),
+                    Style::default().fg(theme.text_muted),
                 ),
             ]);
             f.render_widget(
@@ -2170,7 +3238,7 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
                     .ratio(ratio)
                     .label(label)
                     .filled_style(g_style)
-                    .unfilled_style(Style::default().fg(Color::Rgb(55, 55, 80))),
+                    .unfilled_style(Style::default().fg(theme.border)),
                 areas[i * 2],
             );
 
@@ -2182,29 +3250,29 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
                 let (glyph_style, name_style) = match step.status {
                     Status::Success =>  (
                         Style::default().fg(theme.success),
-                        Style::default().fg(Color::Rgb(100, 110, 100)),
+                        Style::default().fg(theme.success_dim),
                     ),
                     Status::Failure =>  (
                         Style::default().fg(theme.failure).bold(),
-                        Style::default().fg(Color::Rgb(200, 120, 120)).bold(),
+                        Style::default().fg(theme.failure_dim).bold(),
                     ),
                     Status::Running =>  (
                         style_for_status(step.status, theme).bold(),
-                        Style::default().fg(Color::White).bold(),
+                        Style::default().fg(theme.text_bright).bold(),
                     ),
                     Status::Cancelled | Status::Skipped => (
                         Style::default().fg(theme.unknown),
-                        Style::default().fg(Color::Rgb(75, 75, 85)),
+                        Style::default().fg(theme.text_ghost),
                     ),
                     _ => (
-                        Style::default().fg(Color::Rgb(60, 60, 75)),
-                        Style::default().fg(Color::Rgb(75, 75, 90)),
+                        Style::default().fg(theme.text_ghost),
+                        Style::default().fg(theme.text_ghost),
                     ),
                 };
                 Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(animated_glyph(step.status, state.tick_count), glyph_style),
-                    Span::styled(format!(" {}. ", si + 1), Style::default().fg(Color::Rgb(70, 70, 90))),
+                    Span::styled(format!(" {}. ", si + 1), Style::default().fg(theme.text_ghost)),
                     Span::styled(step.name.clone(), name_style),
                 ])
             }).collect();
@@ -2218,6 +3286,7 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_diff(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
     let blk = styled_block("Diff vs last successful run", &state.theme);
     let inner = blk.inner(area);
     f.render_widget(blk, area);
@@ -2241,17 +3310,17 @@ fn render_diff(f: &mut Frame, area: Rect, state: &AppState) {
     let header = Line::from(vec![
         Span::styled(
             format!("current run #{}", detail.run.id),
-            Style::default().fg(Color::White).bold(),
+            Style::default().fg(theme.text_bright).bold(),
         ),
         Span::raw("   vs   "),
         match &baseline {
             Some(b) => Span::styled(
                 format!("last success #{}", b.run_id),
-                Style::default().fg(Color::Green).bold(),
+                Style::default().fg(theme.success).bold(),
             ),
             None => Span::styled(
                 "no successful run in history",
-                Style::default().fg(Color::DarkGray).italic(),
+                Style::default().fg(theme.text_faint).italic(),
             ),
         },
     ]);
@@ -2294,9 +3363,9 @@ fn render_diff(f: &mut Frame, area: Rect, state: &AppState) {
                     style_for_status(step.status, &state.theme),
                 ),
                 Span::raw(" "),
-                Span::styled(step.name.clone(), Style::default().fg(Color::White)),
+                Span::styled(step.name.clone(), Style::default().fg(theme.text_bright)),
                 Span::raw("  "),
-                Span::styled(prev_text, Style::default().fg(Color::DarkGray)),
+                Span::styled(prev_text, Style::default().fg(theme.text_faint)),
                 Span::raw(" → "),
                 Span::styled(
                     format!("{:?}", step.status),
@@ -2319,12 +3388,12 @@ fn render_diff(f: &mut Frame, area: Rect, state: &AppState) {
         if baseline.is_some() {
             lines.push(Line::from(Span::styled(
                 "no step-status differences",
-                Style::default().fg(Color::DarkGray).italic(),
+                Style::default().fg(theme.text_faint).italic(),
             )));
         } else {
             lines.push(Line::from(Span::styled(
                 "browse a few completed runs first to populate history",
-                Style::default().fg(Color::DarkGray).italic(),
+                Style::default().fg(theme.text_faint).italic(),
             )));
         }
     }
@@ -2337,21 +3406,21 @@ fn style_for_status(s: Status, theme: &Theme) -> Style {
         Status::Success => Style::default().fg(theme.success).bold(),
         Status::Failure => Style::default().fg(theme.failure).bold(),
         Status::Running => Style::default().fg(theme.warning).bold(),
-        Status::Queued => Style::default().fg(Color::Blue).bold(),
+        Status::Queued => Style::default().fg(theme.info).bold(),
         Status::Cancelled => Style::default().fg(theme.unknown),
         Status::Skipped => Style::default().fg(theme.unknown),
         Status::Unknown => Style::default().fg(theme.unknown),
     }
 }
 
-fn row_bg_for_status(s: Status) -> Color {
+fn row_bg_for_status(s: Status, theme: &Theme) -> Color {
     match s {
-        Status::Failure            => Color::Rgb(45, 20, 20),
-        Status::Running            => Color::Rgb(40, 36, 12),
-        Status::Queued             => Color::Rgb(18, 20, 40),
+        Status::Failure            => theme.row_failure,
+        Status::Running            => theme.row_running,
+        Status::Queued             => theme.row_queued,
         Status::Cancelled
-        | Status::Skipped          => Color::Rgb(32, 32, 36),
-        _                          => Color::Rgb(28, 30, 42),
+        | Status::Skipped          => theme.row_idle,
+        _                          => theme.surface,
     }
 }
 
@@ -2377,6 +3446,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 fn render_trigger_prompt(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
     let modal = centered_rect(70, 80, area);
 
     let Some(prompt) = state.trigger_prompt.as_ref() else {
@@ -2400,7 +3470,7 @@ fn render_trigger_prompt(f: &mut Frame, area: Rect, state: &AppState) {
         let selected = i == prompt.cursor;
         let prefix = if selected { "▶ " } else { "  " };
         let label_style = if selected {
-            Style::default().bold().fg(Color::Cyan)
+            Style::default().bold().fg(theme.primary)
         } else {
             Style::default()
         };
@@ -2411,29 +3481,29 @@ fn render_trigger_prompt(f: &mut Frame, area: Rect, state: &AppState) {
         };
         let editing_marker = if selected && prompt.editing { "_" } else { "" };
         let value_style = if selected && prompt.editing {
-            Style::default().fg(Color::Yellow).bold()
+            Style::default().fg(theme.accent).bold()
         } else if selected {
-            Style::default().fg(Color::White).bold()
+            Style::default().fg(theme.text_bright).bold()
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme.text_muted)
         };
         let mut spans = vec![
             Span::raw(prefix),
             Span::styled(format!("{:<width$}", field.name, width = name_width), label_style),
             Span::raw("  "),
             Span::styled(value_display, value_style),
-            Span::styled(editing_marker, Style::default().fg(Color::Yellow)),
+            Span::styled(editing_marker, Style::default().fg(theme.accent)),
         ];
         if field.required {
             spans.push(Span::styled(
                 "  (required)",
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme.failure),
             ));
         }
         if let Some(opts) = &field.options {
             spans.push(Span::styled(
                 format!("  [{}]", opts.join("/")),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.text_faint),
             ));
         }
         lines.push(Line::from(spans));
@@ -2446,14 +3516,14 @@ fn render_trigger_prompt(f: &mut Frame, area: Rect, state: &AppState) {
     let submit_key = display_key(&state.keymap.tp_submit).to_string();
     let cancel_key = display_key(&state.keymap.back).to_string();
     let mut hint_spans = vec![
-        Span::styled(submit_key, Style::default().fg(Color::White).bold()),
-        Span::styled(" trigger  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(cancel_key, Style::default().fg(Color::White).bold()),
-        Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
+        Span::styled(submit_key, Style::default().fg(theme.text_bright).bold()),
+        Span::styled(" trigger  ", Style::default().fg(theme.text_faint)),
+        Span::styled(cancel_key, Style::default().fg(theme.text_bright).bold()),
+        Span::styled(" cancel", Style::default().fg(theme.text_faint)),
     ];
     if has_options {
-        hint_spans.push(Span::styled("  Space", Style::default().fg(Color::White).bold()));
-        hint_spans.push(Span::styled(" cycle", Style::default().fg(Color::DarkGray)));
+        hint_spans.push(Span::styled("  Space", Style::default().fg(theme.text_bright).bold()));
+        hint_spans.push(Span::styled(" cycle", Style::default().fg(theme.text_faint)));
     }
     lines.push(Line::from(hint_spans));
     let p = Paragraph::new(lines)
@@ -2522,7 +3592,7 @@ fn step_timing(
     Some((dur, bar))
 }
 
-fn relative_styled(t: chrono::DateTime<Utc>) -> (String, Style) {
+fn relative_styled(t: chrono::DateTime<Utc>, theme: &Theme) -> (String, Style) {
     let secs = (Utc::now() - t).num_seconds().max(0);
     let text = if secs < 60 {
         format!("{}s ago", secs)
@@ -2534,11 +3604,11 @@ fn relative_styled(t: chrono::DateTime<Utc>) -> (String, Style) {
         format!("{}d ago", secs / 86400)
     };
     let style = if secs < 3600 {
-        Style::default().fg(Color::White)
+        Style::default().fg(theme.text_bright)
     } else if secs < 86400 {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(theme.accent)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.text_faint)
     };
     (text, style)
 }
@@ -2604,6 +3674,41 @@ mod tests {
         // and scrolling 431 lines is the slow way to ask.
         assert!(title.contains("431 lines"), "got {title:?}");
         assert!(title.contains("1✗"), "got {title:?}");
+    }
+
+    /// The minimap column of a drawn Logs pane, top to bottom.
+    fn map_column(out: &str) -> String {
+        out.lines()
+            .filter(|l| l.starts_with('│'))
+            .filter_map(|l| l.chars().rev().nth(1))
+            .collect()
+    }
+
+    #[test]
+    fn the_log_map_shows_where_the_errors_are_from_anywhere_in_the_file() {
+        let out = draw_logs(&noisy_log_state(false), 80, 12);
+        let col = map_column(&out);
+
+        // The error is 400 lines below the viewport. Its mark is on screen from
+        // the very top of the log — that is the whole point of the column.
+        assert!(col.contains('█'), "got {col:?}");
+        assert!(col.ends_with('█'), "near the end of the log, got {col:?}");
+        // …and the bracket says where you are, which is the top.
+        assert!(col.starts_with('│'), "got {col:?}");
+        assert_eq!(col.matches('│').count(), 1, "the viewport is one band, got {col:?}");
+    }
+
+    #[test]
+    fn a_log_that_fits_on_screen_gets_no_map() {
+        let mut st = noisy_log_state(false);
+        st.log_lines.truncate(6);
+        st.init_log_groups();
+        st.recompute_log_rendered();
+        let out = draw_logs(&st, 80, 12);
+
+        // Mapping six lines onto ten rows says nothing, and the column it costs
+        // is a column of log.
+        assert_eq!(map_column(&out).trim(), "", "got:\n{out}");
     }
 
     #[test]
@@ -2796,6 +3901,508 @@ mod tests {
         assert!(!web.contains("commit"), "got {web:?}");
     }
 
+    fn a_run(id: u64, title: &str, status: Status, age_secs: i64) -> Run {
+        let now = Utc::now();
+        Run {
+            id,
+            display_title: title.into(),
+            head_branch: "main".into(),
+            commit_msg: "wip".into(),
+            status,
+            created_at: now - chrono::Duration::seconds(age_secs),
+            updated_at: now,
+            url: String::new(),
+            workflow_file: Some("deploy.yml".into()),
+        }
+    }
+
+    fn a_job(name: &str, steps: &[(&str, Status)]) -> crate::provider::Job {
+        crate::provider::Job {
+            id: 7,
+            name: name.into(),
+            status: Status::Running,
+            steps: steps
+                .iter()
+                .map(|(n, s)| crate::provider::Step {
+                    name: (*n).into(),
+                    status: *s,
+                    started_at: None,
+                    completed_at: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Three repos, two of them mid-deploy — one on a step, one still queued.
+    fn dashboard_with_live_ci() -> AppState {
+        let mut st = AppState::new(
+            "muufree/backend".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        st.view = View::Repos;
+        for spec in ["muufree/backend", "muufree/cms", "muufree/website"] {
+            let mut card = crate::app::state::RepoCard::new(spec.into());
+            card.git = Some(crate::git::parse_status("## main\0"));
+            card.loaded = true;
+            st.repos.push(card);
+        }
+        st.repos[0].runs = vec![a_run(1, "Deploy to Stage", Status::Running, 102)];
+        st.repos[1].runs = vec![a_run(2, "Deploy to Stage", Status::Queued, 9)];
+        st.repos[2].runs = vec![a_run(3, "CodeQL Security Risk", Status::Success, 400)];
+
+        st.run_progress.insert(
+            "muufree/backend".into(),
+            crate::provider::RunDetail {
+                run: st.repos[0].runs[0].clone(),
+                jobs: vec![a_job(
+                    "build",
+                    &[
+                        ("Checkout", Status::Success),
+                        ("Set up Docker", Status::Success),
+                        ("Run migrations", Status::Running),
+                        ("Push image", Status::Queued),
+                    ],
+                )],
+            },
+        );
+        st.run_progress.insert(
+            "muufree/cms".into(),
+            crate::provider::RunDetail {
+                run: st.repos[1].runs[0].clone(),
+                jobs: Vec::new(),
+            },
+        );
+        st
+    }
+
+    fn draw_repos(state: &AppState, w: u16, h: u16) -> String {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_repos(f, f.area(), state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_strip_says_which_step_a_running_deploy_is_on() {
+        let out = draw_repos(&dashboard_with_live_ci(), 150, 16);
+        // The row above can only say "running". The question you actually have
+        // while waiting on a deploy is *what* it is doing, and this is it.
+        assert!(out.contains("Run migrations"), "got:\n{out}");
+        assert!(out.contains("build"), "got:\n{out}");
+        // Two done of four steps, sitting on the third.
+        assert!(out.contains("3/4"), "got:\n{out}");
+        // 1:42 in — a deploy that has been going too long has to be visible.
+        assert!(out.contains("1:42"), "got:\n{out}");
+        assert!(out.contains("2 in flight"), "got:\n{out}");
+    }
+
+    #[test]
+    fn a_queued_run_says_it_is_waiting_rather_than_inventing_a_step() {
+        let out = draw_repos(&dashboard_with_live_ci(), 150, 16);
+        assert!(out.contains("waiting for a runner"), "got:\n{out}");
+        // The settled repo has no business in a strip about what's in flight.
+        let strip: String = out
+            .lines()
+            .skip_while(|l| !l.contains("in flight"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!strip.contains("muufree/website"), "got:\n{strip}");
+    }
+
+    fn batch_state(phase: BatchPhase) -> AppState {
+        let mut st = dashboard_with_live_ci();
+        st.view = View::BatchCommit;
+        let items = ["muufree/backend", "muufree/cms", "muufree/flutter"]
+            .iter()
+            .map(|s| {
+                crate::app::state::BatchItem::new(
+                    (*s).into(),
+                    std::path::PathBuf::from("/tmp").join(s),
+                )
+            })
+            .collect();
+        let mut b = crate::app::state::BatchCommit::new(items, 0);
+        b.message = "chore: bump shared client to 2.1".into();
+        b.input = (phase == BatchPhase::Compose).then(|| "chore: bump shared".to_string());
+        b.phase = phase;
+        if phase != BatchPhase::Compose {
+            b.items[0].state = crate::app::state::ItemState::Committed;
+            b.items[0].sha = Some("9f2c1ab".into());
+            b.cursor = 1;
+            b.items[1].state = match phase {
+                BatchPhase::Paused => {
+                    crate::app::state::ItemState::Failed("pytest failed".into())
+                }
+                _ => crate::app::state::ItemState::Running,
+            };
+            let mut op = GitOp::new("commit", Some("pre-commit".into()), 0);
+            for l in ["ruff.....Passed", "pytest...Failed", "assert 1 == 2"] {
+                op.push_line(l.into(), false);
+            }
+            op.finished = phase == BatchPhase::Paused;
+            op.failed = phase == BatchPhase::Paused;
+            st.git_ops.insert("muufree/cms".into(), op);
+        }
+        st.batch = Some(b);
+        st
+    }
+
+    fn draw_batch(state: &AppState, w: u16, h: u16) -> String {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_batch_commit(f, f.area(), state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_message_box_says_how_many_repos_one_message_is_about_to_hit() {
+        let out = draw_batch(&batch_state(BatchPhase::Compose), 110, 14);
+        // The whole risk of the feature is committing to more repos than you
+        // meant to, so the count and the list are on screen before Enter.
+        assert!(out.contains("One message for 3 repos"), "got:\n{out}");
+        assert!(out.contains("chore: bump shared"), "got:\n{out}");
+        for spec in ["muufree/backend", "muufree/cms", "muufree/flutter"] {
+            assert!(out.contains(spec), "{spec} missing from:\n{out}");
+        }
+        assert!(out.contains("git add -A"), "got:\n{out}");
+    }
+
+    #[test]
+    fn one_marked_repo_is_a_repo_not_a_repos() {
+        let mut st = batch_state(BatchPhase::Compose);
+        if let Some(b) = st.batch.as_mut() {
+            b.items.truncate(1);
+        }
+        let out = draw_batch(&st, 110, 14);
+        assert!(out.contains("Commit 1 repo "), "got:\n{out}");
+        assert!(out.contains("One message for 1 repo "), "got:\n{out}");
+
+        // The caret gets a line to itself, with air above and below it.
+        let caret = out.lines().position(|l| l.contains('█')).unwrap();
+        let above = out.lines().nth(caret - 1).unwrap();
+        let below = out.lines().nth(caret + 1).unwrap();
+        assert_eq!(above.trim_matches(['│', ' ']), "", "got {above:?}");
+        assert_eq!(below.trim_matches(['│', ' ']), "", "got {below:?}");
+    }
+
+    #[test]
+    fn a_running_batch_says_which_repo_it_is_on_and_what_the_hook_is_saying() {
+        let out = draw_batch(&batch_state(BatchPhase::Committing), 110, 16);
+        assert!(out.contains("Committing · 2/3"), "got:\n{out}");
+        // What is done, what is happening, what is waiting — all three.
+        assert!(out.contains("committed 9f2c1ab"), "got:\n{out}");
+        assert!(out.contains("committing…"), "got:\n{out}");
+        assert!(out.contains("queued"), "got:\n{out}");
+        // The hook's own output, live, is the reason this view exists.
+        assert!(out.contains("ruff.....Passed"), "got:\n{out}");
+    }
+
+    #[test]
+    fn a_paused_batch_shows_the_failure_and_what_can_be_done_about_it() {
+        let out = draw_batch(&batch_state(BatchPhase::Paused), 110, 16);
+        assert!(out.contains("Paused on muufree/cms"), "got:\n{out}");
+        assert!(out.contains("r retry"), "got:\n{out}");
+        assert!(out.contains("s skip"), "got:\n{out}");
+        // Not just "it failed": the assertion that failed is on screen.
+        assert!(out.contains("assert 1 == 2"), "got:\n{out}");
+        // The repo behind it kept its commit, and says so.
+        assert!(out.contains("committed 9f2c1ab"), "got:\n{out}");
+    }
+
+    #[test]
+    fn pushing_is_offered_never_assumed() {
+        let mut st = batch_state(BatchPhase::AskPush);
+        if let Some(b) = st.batch.as_mut() {
+            b.items[1].state = crate::app::state::ItemState::Committed;
+            b.items[1].sha = Some("77aa310".into());
+            b.items[2].state = crate::app::state::ItemState::Nothing("working tree is clean".into());
+        }
+        st.git_ops.clear();
+        let out = draw_batch(&st, 110, 12);
+        assert!(out.contains("2 committed"), "got:\n{out}");
+        assert!(out.contains("pushes them all"), "got:\n{out}");
+        // A clean repo is reported, not quietly dropped from the list.
+        assert!(out.contains("working tree is clean"), "got:\n{out}");
+    }
+
+    #[test]
+    fn the_dashboard_shows_what_a_batch_would_take() {
+        let mut st = dashboard_with_live_ci();
+        let out = draw_repos(&st, 150, 16);
+        assert!(!out.contains("marked"), "unmarked dashboard says nothing");
+
+        st.repo_marks.insert("muufree/backend".into());
+        st.repo_marks.insert("muufree/cms".into());
+        let out = draw_repos(&st, 150, 16);
+        assert!(out.contains("◆ 2 marked"), "got:\n{out}");
+        // …and which rows they are, not just how many.
+        let backend = out.lines().find(|l| l.contains("muufree/backend")).unwrap();
+        let website = out.lines().find(|l| l.contains("muufree/website")).unwrap();
+        assert!(backend.contains('◆'), "got {backend:?}");
+        assert!(!website.contains('◆'), "got {website:?}");
+    }
+
+    #[test]
+    fn a_queue_taller_than_the_screen_follows_the_repo_being_worked_on() {
+        let mut st = batch_state(BatchPhase::Committing);
+        if let Some(b) = st.batch.as_mut() {
+            b.items = (0..12)
+                .map(|i| {
+                    crate::app::state::BatchItem::new(
+                        format!("acme/repo{i:02}"),
+                        std::path::PathBuf::from("/tmp"),
+                    )
+                })
+                .collect();
+            b.cursor = 9;
+            b.items[9].state = crate::app::state::ItemState::Running;
+            for item in b.items.iter_mut().take(9) {
+                item.state = crate::app::state::ItemState::Committed;
+                item.sha = Some("9f2c1ab".into());
+            }
+        }
+        st.git_ops.clear();
+        let out = draw_batch(&st, 110, 10);
+
+        // The repo in flight is the one you are waiting on; it must be visible.
+        assert!(out.contains("acme/repo09"), "got:\n{out}");
+        // And the rows that didn't fit are counted, not silently dropped.
+        assert!(out.contains("more · 9 committed"), "got:\n{out}");
+    }
+
+    #[test]
+    #[ignore = "visual check: cargo test show_batch_commit -- --ignored --nocapture"]
+    fn show_batch_commit() {
+        for (label, phase) in [
+            ("compose", BatchPhase::Compose),
+            ("committing", BatchPhase::Committing),
+            ("paused", BatchPhase::Paused),
+            ("done", BatchPhase::Done),
+        ] {
+            println!("─── {label} ───\n{}", draw_batch(&batch_state(phase), 110, 14));
+        }
+    }
+
+    /// The background colour of the row naming `spec`.
+    fn row_bg(state: &AppState, spec: &str) -> Color {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 12)).unwrap();
+        term.draw(|f| render_repos(f, f.area(), state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let y = (0..buf.area.height)
+            .find(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains(spec)
+            })
+            .expect("row on screen");
+        buf[(20, y)].bg
+    }
+
+    #[test]
+    fn owners_get_one_heading_each_and_the_cursor_still_lands_on_repos() {
+        let mut st = dashboard_with_live_ci();
+        let mut gam = crate::app::state::RepoCard::new("drposture/gam".into());
+        gam.loaded = true;
+        st.repos.push(gam);
+
+        // Tall enough that the live strip does not clip the last group off.
+        let out = draw_repos(&st, 150, 22);
+        assert_eq!(out.matches("muufree ╌").count(), 1, "got:\n{out}");
+        assert_eq!(out.matches("drposture ╌").count(), 1, "got:\n{out}");
+        // The owner is said once, in the heading, not repeated down the column.
+        // (The live strip below still names repos in full — it has no heading
+        // to inherit the owner from.)
+        let row = out
+            .lines()
+            .find(|l| l.contains("backend") && l.contains("clean"))
+            .unwrap();
+        assert!(row.contains(" backend"), "got {row:?}");
+        assert!(!row.contains("muufree/"), "got {row:?}");
+
+        // Headings push every row below them down, so the highlight has to be
+        // translated — otherwise the cursor drifts onto a heading.
+        for (cursor, expect) in [(0usize, "backend"), (3, "gam")] {
+            st.repo_cursor = cursor;
+            let out = draw_repos(&st, 150, 22);
+            let marked = out.lines().find(|l| l.contains('▶')).unwrap();
+            assert!(marked.contains(expect), "cursor {cursor}: got {marked:?}");
+        }
+    }
+
+    #[test]
+    fn one_owner_is_not_worth_a_heading() {
+        let st = dashboard_with_live_ci();
+        let out = draw_repos(&st, 150, 16);
+        assert!(!out.contains("╌╌╌"), "got:\n{out}");
+        // …and with nothing to group by, the full spec stays on the row.
+        assert!(out.contains("muufree/backend"), "got:\n{out}");
+    }
+
+    #[test]
+    fn columns_go_whole_rather_than_all_shrinking_together() {
+        // What survives narrowing is what the view is for: which repo, what its
+        // CI did, and whether the tree is dirty.
+        let narrow = Columns::for_width(90);
+        assert!(!narrow.ran_on && !narrow.recent);
+        assert!(Columns::for_width(200).ran_on);
+        // History degrades by degrees, so it is the last thing to go entirely.
+        assert!(Columns::for_width(110).spark_w < Columns::for_width(200).spark_w);
+
+        let st = dashboard_with_live_ci();
+        let out = draw_repos(&st, 90, 12);
+        assert!(out.contains("muufree/backend"), "got:\n{out}");
+        assert!(out.contains("clean"), "got:\n{out}");
+        // The run's branch is one keystroke away in the run list; the repo name
+        // truncated to six characters is not recoverable at all.
+        assert!(!out.contains("Ran on"), "got:\n{out}");
+    }
+
+    #[test]
+    fn the_history_bars_say_when_a_repo_started_failing() {
+        let theme = Theme::default();
+        // Newest first, as the API hands them over: two fresh failures behind a
+        // wall of green.
+        let runs: Vec<Run> = (0..6)
+            .map(|i| {
+                let mut r = a_run(i, "CI", if i < 2 { Status::Failure } else { Status::Success }, 60);
+                r.updated_at = r.created_at + chrono::Duration::seconds(if i == 5 { 300 } else { 60 });
+                r
+            })
+            .collect();
+        let bars = run_sparkline(&runs, 6, &theme);
+
+        // Oldest on the left, so the recent failures are where the eye lands.
+        let colors: Vec<Color> = bars.iter().map(|s| s.style.fg.unwrap()).collect();
+        assert_eq!(&colors[4..], &[theme.failure, theme.failure]);
+        // The newest success is the live one; older ones sit back so a failure
+        // is the only thing shouting.
+        assert_eq!(colors[0], theme.success_dim);
+        // Height is duration: the five-minute run towers over the one-minute ones.
+        let glyphs: Vec<&str> = bars.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(glyphs[0], "█", "the longest run in the window");
+        assert!(glyphs[1] < glyphs[0], "got {glyphs:?}");
+
+        // A repo with no runs says so rather than drawing a flat line, which
+        // would read as "ran, took no time".
+        assert_eq!(run_sparkline(&[], 6, &theme).len(), 1);
+
+        // A history where every run took about the same time is flat, and must
+        // draw flat. Scaling a 3% spread to full height invents a shape, and an
+        // invented shape is worse than no chart.
+        let steady: Vec<Run> = (0..6)
+            .map(|i| {
+                let mut r = a_run(i, "CI", Status::Success, 60);
+                r.updated_at = r.created_at + chrono::Duration::seconds(60 + i as i64);
+                r
+            })
+            .collect();
+        let bars = run_sparkline(&steady, 6, &theme);
+        let glyphs: std::collections::HashSet<&str> =
+            bars.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(glyphs.len(), 1, "got {glyphs:?}");
+    }
+
+    #[test]
+    fn a_repo_whose_ci_moved_lights_up_and_settles_back_down() {
+        let mut st = dashboard_with_live_ci();
+        let settled = row_bg(&st, "muufree/website");
+
+        st.repos[2].changed_tick = Some(100);
+        st.tick_count = 100;
+        let lit = row_bg(&st, "muufree/website");
+        assert_ne!(lit, settled, "a change you did not watch happen is invisible");
+
+        // …and it does not stay lit: a dashboard that keeps glowing at you
+        // teaches you to stop looking at the glow.
+        st.tick_count = 100 + FLASH_TICKS;
+        assert_eq!(row_bg(&st, "muufree/website"), settled);
+
+        // Rows that did not move are untouched throughout.
+        st.tick_count = 100;
+        assert_eq!(row_bg(&st, "muufree/backend"), {
+            st.repos[2].changed_tick = None;
+            row_bg(&st, "muufree/backend")
+        });
+    }
+
+    #[test]
+    fn a_row_still_loading_says_so_by_moving() {
+        let mut st = dashboard_with_live_ci();
+        st.repos[0].loaded = false;
+        st.repos[0].runs.clear();
+
+        // Two frames far enough apart that the sweep has to have moved.
+        st.tick_count = 0;
+        let a = draw_repos(&st, 150, 12);
+        st.tick_count = 6;
+        let b = draw_repos(&st, 150, 12);
+        let row = |out: &str| {
+            out.lines()
+                .find(|l| l.contains("muufree/backend"))
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(row(&a), row(&b), "a still image cannot say 'still waiting'");
+        assert!(row(&a).contains('─'), "got {:?}", row(&a));
+    }
+
+    #[test]
+    fn nothing_running_means_no_strip_at_all() {
+        let mut st = dashboard_with_live_ci();
+        st.run_progress.clear();
+        let out = draw_repos(&st, 150, 16);
+        assert!(!out.contains("in flight"), "got:\n{out}");
+        // …and the table gets the space back.
+        assert!(out.contains("muufree/website"), "got:\n{out}");
+    }
+
+    #[test]
+    fn a_short_terminal_keeps_the_table_over_the_strip() {
+        // The list is the view. On a screen too short for both, the strip is
+        // the part that yields — losing repo rows to a status panel is worse
+        // than not knowing which step a deploy is on.
+        let out = draw_repos(&dashboard_with_live_ci(), 150, 9);
+        assert!(!out.contains("in flight"), "got:\n{out}");
+        for spec in ["muufree/backend", "muufree/cms", "muufree/website"] {
+            assert!(out.contains(spec), "{spec} missing from:\n{out}");
+        }
+    }
+
+    #[test]
+    #[ignore = "visual check: cargo test show_live_strip -- --ignored --nocapture"]
+    fn show_live_strip() {
+        let mut st = dashboard_with_live_ci();
+        for tick in [0u64, 6, 12] {
+            st.tick_count = tick;
+            println!("─── tick {tick} ───\n{}", draw_repos(&st, 150, 16));
+        }
+    }
+
     #[test]
     fn a_guessed_active_repo_is_not_marked_active() {
         let mut st = AppState::new(
@@ -2856,7 +4463,7 @@ mod tests {
         let fg = |s: &str| diff_line_style(s, &theme).fg.unwrap();
         // `+++`/`---` open with the same characters as an added/removed line but
         // are file headers; colouring them green/red fakes a change per file.
-        let meta = Color::Rgb(110, 110, 140);
+        let meta = theme.text_muted;
         assert_eq!(fg("+++ b/src/main.rs"), meta);
         assert_eq!(fg("--- a/src/main.rs"), meta);
         assert_eq!(fg("diff --git a/x b/x"), meta);
@@ -2866,8 +4473,8 @@ mod tests {
         assert_eq!(fg("-let x = 0;"), theme.failure);
         assert_eq!(fg("@@ -1,4 +1,4 @@"), theme.accent);
         // A context line keeps the neutral body colour, blank lines included.
-        assert_eq!(fg(" unchanged"), Color::Rgb(190, 190, 210));
-        assert_eq!(fg(""), Color::Rgb(190, 190, 210));
+        assert_eq!(fg(" unchanged"), theme.text);
+        assert_eq!(fg(""), theme.text);
     }
 
     #[test]

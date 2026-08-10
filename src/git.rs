@@ -243,8 +243,11 @@ fn git_streaming(
         .stderr(writer2)
         .spawn()
         .with_context(|| format!("run git {}", args.join(" ")))?;
-    // `spawn` dropped the parent's copies of the write end, so `reader` hits
-    // EOF when the child (and anything it handed the pipe to) exits.
+    // The parent's copies of the write end live in the `Command`, which is a
+    // temporary and so is dropped at the end of this statement — that is what
+    // closes them and lets `reader` see EOF when the child (and anything it
+    // handed the pipe to) exits. Binding the builder to a `let` instead would
+    // keep a write end open in this process and `pump_lines` would never return.
 
     let mut collected = Vec::new();
     pump_lines(reader, &mut |text, partial| {
@@ -296,6 +299,17 @@ fn pump_lines(mut reader: impl Read, emit: &mut dyn FnMut(String, bool)) {
                     let line: Vec<u8> = acc.drain(..=pos).collect();
                     emit(rendered(&line), false);
                     last_partial.clear();
+                }
+                // Everything before the last carriage return has already been
+                // overwritten and can never render again. Dropping it bounds
+                // `acc` to one screen line: a hook whose progress bar rewrites
+                // itself for ten minutes without ever printing a newline would
+                // otherwise accumulate the whole stream, and re-render all of it
+                // on every read.
+                let tail_crs = acc.iter().rev().take_while(|&&b| b == b'\r').count();
+                let end = acc.len() - tail_crs;
+                if let Some(cr) = acc[..end].iter().rposition(|&b| b == b'\r') {
+                    acc.drain(..=cr);
                 }
                 if !acc.is_empty() {
                     let text = rendered(&acc);

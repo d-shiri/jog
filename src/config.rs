@@ -55,6 +55,13 @@ pub struct UiConfig {
     /// Lines of surrounding context kept around each error/warning in log focus mode.
     #[serde(default = "default_focus_context")]
     pub log_focus_context: usize,
+    /// Per-token colour overrides on top of `theme`, as `token = "#rrggbb"`.
+    ///
+    /// A whole palette is the blunt instrument; this is for the one colour that
+    /// is wrong on your terminal. Unknown token names are reported rather than
+    /// ignored, since a silent typo looks exactly like the setting not working.
+    #[serde(default)]
+    pub colors: std::collections::HashMap<String, String>,
 }
 
 impl Default for UiConfig {
@@ -69,6 +76,7 @@ impl Default for UiConfig {
             notify_sound: true,
             notify_desktop: true,
             log_focus_context: default_focus_context(),
+            colors: std::collections::HashMap::new(),
         }
     }
 }
@@ -94,7 +102,7 @@ impl UiConfig {
 }
 
 fn default_theme() -> String {
-    "dark".into()
+    "midnight".into()
 }
 fn default_poll_ms() -> u64 {
     5000
@@ -144,6 +152,11 @@ pub struct KeymapConfig {
     pub finder: String,
     // multi-repo dashboard
     pub repos_view: String,
+    // batch commit: mark repos on the dashboard, commit them with one message
+    pub repo_mark: String,
+    pub batch_commit: String,
+    pub batch_retry: String,
+    pub batch_skip: String,
     // working tree (stage / commit / push) for a local checkout
     pub git_view: String,
     pub git_stage: String,
@@ -193,6 +206,10 @@ impl Default for KeymapConfig {
             prev_error: "E".into(),
             finder: "ctrl+p".into(),
             repos_view: "H".into(),
+            repo_mark: "Space".into(),
+            batch_commit: "C".into(),
+            batch_retry: "r".into(),
+            batch_skip: "s".into(),
             git_view: "c".into(),
             git_stage: "Space".into(),
             git_stage_all: "a".into(),

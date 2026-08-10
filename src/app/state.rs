@@ -47,6 +47,8 @@ pub enum View {
     Watch,
     TriggerPrompt,
     Diff,
+    /// One message committed across several repos, one repo at a time.
+    BatchCommit,
 }
 
 /// The working-tree view for one local checkout: stage, commit, push, then hand
@@ -347,6 +349,249 @@ impl GitDiffView {
 }
 
 /// One row of the multi-repo dashboard: a repo plus its most recent runs.
+/// Where one repo of a batch commit has got to.
+///
+/// A single enum rather than a pile of flags: every repo is in exactly one of
+/// these, which is what lets the summary be read straight off the list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemState {
+    /// Not attempted yet. Still says this after an abort — "not attempted" is a
+    /// truthful thing to report, and "skipped" would not be.
+    Queued,
+    Running,
+    Committed,
+    Pushed,
+    /// Nothing here for the batch to do, and why.
+    Nothing(String),
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchItem {
+    /// Key of the `RepoCard`, and of any `GitOp` this repo's work produces.
+    pub spec: String,
+    pub path: PathBuf,
+    pub state: ItemState,
+    /// Set once this repo's commit lands. Kept apart from `state` so a failed
+    /// *push* doesn't erase the fact that the commit is sitting on disk — the
+    /// difference between "retry the push" and "retry the commit".
+    pub sha: Option<String>,
+}
+
+impl BatchItem {
+    pub fn new(spec: String, path: PathBuf) -> Self {
+        Self { spec, path, state: ItemState::Queued, sha: None }
+    }
+
+    /// Has a commit from this batch that hasn't been pushed yet.
+    pub fn ready_to_push(&self) -> bool {
+        self.state == ItemState::Committed
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchPhase {
+    /// Typing the one message that every repo will get.
+    Compose,
+    Committing,
+    /// A repo failed. Nothing else starts until the user says what to do.
+    Paused,
+    /// Every commit is in. Pushing is a separate decision, deliberately.
+    AskPush,
+    Pushing,
+    Done,
+}
+
+/// One commit message applied across several repos, one repo at a time.
+///
+/// Sequential rather than parallel on purpose: hooks produce a lot of output,
+/// and four repos failing at once in four panes is not something anyone reads.
+/// One at a time means a failure is on screen, alone, when it happens.
+#[derive(Debug, Clone)]
+pub struct BatchCommit {
+    pub message: String,
+    /// `Some` while the message is being typed; `None` once the run starts.
+    pub input: Option<String>,
+    /// Frozen at start, in dashboard order.
+    pub items: Vec<BatchItem>,
+    pub cursor: usize,
+    pub phase: BatchPhase,
+    /// The phase a pause interrupted, so retry and skip know what to go back to.
+    pub resume: BatchPhase,
+    /// Tick the current repo started on, for its elapsed clock.
+    pub started_tick: u64,
+}
+
+/// What the batch has actually done, for the summary line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchTally {
+    pub committed: usize,
+    pub pushed: usize,
+    pub failed: usize,
+    pub nothing: usize,
+    pub untouched: usize,
+}
+
+impl BatchCommit {
+    pub fn new(items: Vec<BatchItem>, tick: u64) -> Self {
+        Self {
+            message: String::new(),
+            input: Some(String::new()),
+            items,
+            cursor: 0,
+            phase: BatchPhase::Compose,
+            resume: BatchPhase::Committing,
+            started_tick: tick,
+        }
+    }
+
+    pub fn current(&self) -> Option<&BatchItem> {
+        self.items.get(self.cursor)
+    }
+
+    /// Whether a git command the batch started is still out there.
+    pub fn is_working(&self) -> bool {
+        matches!(self.phase, BatchPhase::Committing | BatchPhase::Pushing)
+    }
+
+    /// Move to the next repo with work left in this phase, marking it running.
+    ///
+    /// Returns the index to start, or `None` when the phase is over — in which
+    /// case `phase` has already moved on, so the caller only has to look.
+    pub fn advance(&mut self, tick: u64) -> Option<usize> {
+        // Only a phase that is *running* repos has a queue to advance. Asked in
+        // any other phase the answer is "nothing to start" — and, crucially, the
+        // phase stays put: winding a paused batch up to Done here would throw
+        // away the retry/skip decision the pause exists to wait for.
+        if !self.is_working() {
+            return None;
+        }
+        let next = match self.phase {
+            BatchPhase::Committing => {
+                self.items.iter().position(|i| i.state == ItemState::Queued)
+            }
+            BatchPhase::Pushing => self.items.iter().position(|i| i.ready_to_push()),
+            _ => None,
+        };
+        match next {
+            Some(i) => {
+                self.resume = self.phase;
+                self.cursor = i;
+                self.items[i].state = ItemState::Running;
+                self.started_tick = tick;
+                Some(i)
+            }
+            None => {
+                // Committing ends at the push question — but only if there is
+                // something to push. Asking about nothing is just a keystroke.
+                self.phase = if self.phase == BatchPhase::Committing
+                    && self.items.iter().any(|i| i.ready_to_push())
+                {
+                    BatchPhase::AskPush
+                } else {
+                    BatchPhase::Done
+                };
+                None
+            }
+        }
+    }
+
+    /// Fold in the result of whichever repo was running.
+    ///
+    /// A failure pauses the whole batch: the next repo starting would scroll the
+    /// output that explains the failure off the screen.
+    ///
+    /// The outcome is recorded even after an abort — the repo's work happened,
+    /// and a summary that omits it would be wrong about what is on disk. Only
+    /// the *pause* is conditional, since there is nothing left to pause.
+    pub fn record(&mut self, spec: &str, result: Result<String, String>) {
+        let (working, pushing) = (self.is_working(), self.resume == BatchPhase::Pushing);
+        let Some(item) = self.items.iter_mut().find(|i| i.spec == spec) else {
+            return;
+        };
+        match result {
+            Ok(sha) => {
+                if pushing {
+                    item.state = ItemState::Pushed;
+                } else {
+                    item.state = ItemState::Committed;
+                    item.sha = Some(sha);
+                }
+            }
+            Err(error) => {
+                item.state = ItemState::Failed(error);
+                if working {
+                    self.phase = BatchPhase::Paused;
+                }
+            }
+        }
+    }
+
+    /// Nothing to do here — a clean tree, or a branch already up to date.
+    ///
+    /// The state moves to `Nothing` even when a commit landed earlier (a push
+    /// that found a detached HEAD, say), because the item must stop being
+    /// `ready_to_push` or the push queue would hand it back forever. `sha`
+    /// survives, and both the tally and the row read it, so the commit sitting
+    /// on disk is still reported.
+    pub fn record_nothing(&mut self, spec: &str, why: String) {
+        if let Some(item) = self.items.iter_mut().find(|i| i.spec == spec) {
+            item.state = ItemState::Nothing(why);
+        }
+    }
+
+    /// Put the paused repo back in the queue and resume.
+    ///
+    /// Back to *committing* only if the commit is what failed; a repo whose
+    /// commit landed and whose push failed goes back to the push queue, because
+    /// re-committing it would find nothing to commit.
+    pub fn retry(&mut self) {
+        if let Some(item) = self.items.get_mut(self.cursor)
+            && matches!(item.state, ItemState::Failed(_))
+        {
+            item.state = if item.sha.is_some() {
+                ItemState::Committed
+            } else {
+                ItemState::Queued
+            };
+        }
+        self.phase = self.resume;
+    }
+
+    /// Leave the failure on the record and carry on with the rest.
+    pub fn skip(&mut self) {
+        self.phase = self.resume;
+    }
+
+    /// Start no further repos. Whatever already committed stays committed —
+    /// there is no honest way to undo a hook that has already run.
+    pub fn abort(&mut self) {
+        self.phase = BatchPhase::Done;
+    }
+
+    pub fn tally(&self) -> BatchTally {
+        let mut t = BatchTally::default();
+        for i in &self.items {
+            match i.state {
+                ItemState::Committed => t.committed += 1,
+                ItemState::Pushed => {
+                    t.committed += 1;
+                    t.pushed += 1;
+                }
+                ItemState::Failed(_) => t.failed += 1,
+                // A repo whose *push* had nothing to do still has the commit
+                // this batch made, and is counted for it. Counting it under
+                // "nothing" as well would inflate the summary past the number of
+                // repos in the run — the row already says why it wasn't pushed.
+                ItemState::Nothing(_) if i.sha.is_some() => t.committed += 1,
+                ItemState::Nothing(_) => t.nothing += 1,
+                ItemState::Queued | ItemState::Running => t.untouched += 1,
+            }
+        }
+        t
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RepoCard {
     /// Unique key and display label. `owner/name` when the GitHub remote is
@@ -365,6 +610,13 @@ pub struct RepoCard {
     /// Working-tree state, refreshed alongside the run list. Only ever `Some`
     /// for rows with a local checkout.
     pub git: Option<RepoStatus>,
+    /// Tick this row's CI last changed under us, if it has.
+    ///
+    /// Drives the flash that draws the eye back to a row that moved while you
+    /// were reading a different one. Poll intervals are measured in seconds, so
+    /// without it the only evidence that anything happened is a glyph that is
+    /// now a different shape than it was the last time you looked at it.
+    pub changed_tick: Option<u64>,
 }
 
 impl RepoCard {
@@ -378,6 +630,7 @@ impl RepoCard {
             error: None,
             loaded: false,
             git: None,
+            changed_tick: None,
         }
     }
 
@@ -395,6 +648,7 @@ impl RepoCard {
             error: None,
             loaded: false,
             git: None,
+            changed_tick: None,
         }
     }
 
@@ -406,6 +660,16 @@ impl RepoCard {
     /// Status of the most recent run, which is what the dashboard row reports.
     pub fn latest_status(&self) -> Option<Status> {
         self.runs.first().map(|r| r.status)
+    }
+
+    /// The newest run that hasn't settled yet — what the activity strip follows.
+    ///
+    /// Not just `runs.first()`: a repo can push a new commit while an older run
+    /// is still going, and the freshly *queued* one is the one worth watching.
+    pub fn active_run(&self) -> Option<&Run> {
+        self.runs
+            .iter()
+            .find(|r| matches!(r.status, Status::Running | Status::Queued))
     }
 
     /// Counts across the loaded runs: (success, failure, in-flight).
@@ -596,31 +860,347 @@ impl TriggerPrompt {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Every colour the UI draws with, named by the job it does rather than by its
+/// hue.
+///
+/// Roles, not values: a view asks for `text_muted` instead of picking a grey.
+/// The same idea used to be spelled four slightly different ways across one
+/// file — `110,110,140` beside `120,120,145` beside `95,95,120` — and that drift
+/// is most of what makes a screen look assembled rather than designed. It also
+/// means a palette can be swapped whole, which is what `[ui] theme` does.
+#[derive(Debug, Clone, Copy)]
 pub struct Theme {
-    pub header_bg: Color,
-    pub footer_bg: Color,
+    // ── Surfaces, back to front ──────────────────────────────────────────
+    /// Chrome behind the header and footer.
+    pub surface: Color,
+    /// A row or pane lifted off the background: cursor lines, previews.
+    pub surface_alt: Color,
+    /// Behind a modal. Darker than `surface`, so an overlay reads as being in
+    /// front of the screen rather than part of it.
+    pub overlay: Color,
+
+    // ── Structure ────────────────────────────────────────────────────────
+    /// Panel borders and separators.
+    pub border: Color,
+    /// Rules that should be sensed rather than read.
+    pub border_dim: Color,
+
+    // ── Text, brightest to faintest ──────────────────────────────────────
+    /// The one thing on the row you are meant to read first.
+    pub text_bright: Color,
+    /// Body text.
+    pub text: Color,
+    /// Labels, units, secondary facts.
+    pub text_muted: Color,
+    /// Present but not competing: stale timestamps, hints.
+    pub text_faint: Color,
+    /// Barely there: disabled steps, structural punctuation.
+    pub text_ghost: Color,
+
+    // ── Selection ────────────────────────────────────────────────────────
+    pub select_bg: Color,
+    /// The selection when the pane does not have the keyboard.
+    pub select_bg_dim: Color,
+
+    // ── Meaning ──────────────────────────────────────────────────────────
     pub primary: Color,
-    pub secondary: Color,
     pub accent: Color,
+    /// Accent at rest — a branch name, a divergence marker.
+    pub accent_dim: Color,
+    pub info: Color,
     pub success: Color,
+    /// A success already absorbed: a step that passed, a clean tree.
+    pub success_dim: Color,
     pub failure: Color,
+    pub failure_dim: Color,
     pub warning: Color,
     pub unknown: Color,
+
+    // ── Dashboard row tints ──────────────────────────────────────────────
+    ///
+    /// Deliberately close to `surface`: the row's *glyph* carries the status,
+    /// and a row bright enough to read as a warning on its own would make eight
+    /// repos look like eight alarms.
+    pub row_failure: Color,
+    pub row_running: Color,
+    pub row_queued: Color,
+    pub row_idle: Color,
 }
 
 impl Default for Theme {
     fn default() -> Self {
+        Self::midnight()
+    }
+}
+
+/// `#rrggbb` or `rrggbb`, case-insensitive.
+fn parse_hex(s: &str) -> Option<Color> {
+    let h = s.trim().trim_start_matches('#');
+    if h.len() != 6 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let v = u32::from_str_radix(h, 16).ok()?;
+    Some(Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
+}
+
+/// Nearest xterm-256 colour: the 6×6×6 cube, or the 24-step grey ramp when the
+/// channels are close enough that the cube would tint a grey.
+fn rgb_to_xterm256(r: u8, g: u8, b: u8) -> u8 {
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    if max - min < 12 {
+        let level = ((r as u16 + g as u16 + b as u16) / 3) as u8;
+        // The ramp runs 8, 18, … 238 at indices 232..=255, with the cube's own
+        // black and white beyond either end of it.
+        return match level {
+            0..=4 => 16,
+            245..=255 => 231,
+            _ => 232 + ((level as u16 - 8) * 23 / 230).min(23) as u8,
+        };
+    }
+    let axis = |v: u8| -> u16 {
+        // Cube steps are 0, 95, 135, 175, 215, 255 — not evenly spaced, so the
+        // boundaries are the midpoints between them rather than v/51.
+        match v {
+            0..=47 => 0,
+            48..=114 => 1,
+            115..=154 => 2,
+            155..=194 => 3,
+            195..=234 => 4,
+            _ => 5,
+        }
+    };
+    (16 + 36 * axis(r) + 6 * axis(g) + axis(b)) as u8
+}
+
+/// Whether this terminal can be trusted with 24-bit colour.
+///
+/// Conservative: only an explicit `COLORTERM` claim counts. Guessing wrong
+/// upwards leaves the palette rounded by the terminal into mud, which is the
+/// exact failure `degrade_to_256` exists to avoid.
+pub fn terminal_has_truecolor() -> bool {
+    matches!(
+        std::env::var("COLORTERM").as_deref(),
+        Ok("truecolor") | Ok("24bit")
+    )
+}
+
+impl Theme {
+    /// Look one up by name, for `[ui] theme` in config.
+    pub fn by_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "midnight" | "default" => Some(Self::midnight()),
+            "nord" => Some(Self::nord()),
+            "gruvbox" => Some(Self::gruvbox()),
+            "mono" => Some(Self::mono()),
+            _ => None,
+        }
+    }
+
+    pub const NAMES: [&'static str; 4] = ["midnight", "nord", "gruvbox", "mono"];
+
+    /// Point a token name at its slot, so config can address one colour.
+    fn slot(&mut self, token: &str) -> Option<&mut Color> {
+        Some(match token {
+            "surface" => &mut self.surface,
+            "surface_alt" => &mut self.surface_alt,
+            "overlay" => &mut self.overlay,
+            "border" => &mut self.border,
+            "border_dim" => &mut self.border_dim,
+            "text_bright" => &mut self.text_bright,
+            "text" => &mut self.text,
+            "text_muted" => &mut self.text_muted,
+            "text_faint" => &mut self.text_faint,
+            "text_ghost" => &mut self.text_ghost,
+            "select_bg" => &mut self.select_bg,
+            "select_bg_dim" => &mut self.select_bg_dim,
+            "primary" => &mut self.primary,
+            "accent" => &mut self.accent,
+            "accent_dim" => &mut self.accent_dim,
+            "info" => &mut self.info,
+            "success" => &mut self.success,
+            "success_dim" => &mut self.success_dim,
+            "failure" => &mut self.failure,
+            "failure_dim" => &mut self.failure_dim,
+            "warning" => &mut self.warning,
+            "unknown" => &mut self.unknown,
+            "row_failure" => &mut self.row_failure,
+            "row_running" => &mut self.row_running,
+            "row_queued" => &mut self.row_queued,
+            "row_idle" => &mut self.row_idle,
+            _ => return None,
+        })
+    }
+
+    /// Apply `[ui.colors]` on top of the palette.
+    ///
+    /// Returns what it could not use. A mistyped token or a malformed hex looks
+    /// exactly like the setting being ignored, so the caller reports it rather
+    /// than leaving the user to wonder which of the two happened.
+    pub fn apply_overrides(&mut self, colors: &HashMap<String, String>) -> Vec<String> {
+        let mut rejected: Vec<String> = colors
+            .iter()
+            .filter_map(|(token, value)| match (parse_hex(value), token.as_str()) {
+                (Some(c), t) => {
+                    let known = self.slot(t).map(|slot| *slot = c).is_some();
+                    (!known).then(|| format!("{token} (unknown colour)"))
+                }
+                (None, _) => Some(format!("{token} = {value:?} (not #rrggbb)")),
+            })
+            .collect();
+        rejected.sort();
+        rejected
+    }
+
+    /// Fold every colour down to the xterm-256 cube.
+    ///
+    /// A terminal without truecolor doesn't reject 24-bit colour, it *rounds* it
+    /// — usually to something muddy and inconsistent between two shades that
+    /// were meant to differ. Choosing the nearest indexed colour ourselves keeps
+    /// the palette's relationships intact at lower fidelity.
+    pub fn degrade_to_256(&mut self) {
+        for token in Self::TOKENS {
+            if let Some(slot) = self.slot(token)
+                && let Color::Rgb(r, g, b) = *slot
+            {
+                *slot = Color::Indexed(rgb_to_xterm256(r, g, b));
+            }
+        }
+    }
+
+    const TOKENS: [&'static str; 26] = [
+        "surface", "surface_alt", "overlay", "border", "border_dim", "text_bright", "text",
+        "text_muted", "text_faint", "text_ghost", "select_bg", "select_bg_dim", "primary",
+        "accent", "accent_dim", "info", "success", "success_dim", "failure", "failure_dim",
+        "warning", "unknown", "row_failure", "row_running", "row_queued", "row_idle",
+    ];
+
+    /// The house palette: cool slate, cyan headings, amber for anything moving.
+    pub fn midnight() -> Self {
         Self {
-            header_bg: Color::Rgb(28, 30, 42),
-            footer_bg: Color::Rgb(28, 30, 42),
-            primary: Color::Cyan,
-            secondary: Color::Rgb(120, 120, 145),
-            accent: Color::Yellow,
-            success: Color::Green,
-            failure: Color::Red,
-            warning: Color::Yellow,
-            unknown: Color::DarkGray,
+            surface: Color::Rgb(28, 30, 42),
+            surface_alt: Color::Rgb(35, 42, 58),
+            overlay: Color::Rgb(18, 20, 32),
+            border: Color::Rgb(55, 55, 80),
+            border_dim: Color::Rgb(42, 42, 60),
+            text_bright: Color::Rgb(220, 240, 255),
+            text: Color::Rgb(190, 190, 212),
+            text_muted: Color::Rgb(120, 120, 145),
+            text_faint: Color::Rgb(92, 92, 118),
+            text_ghost: Color::Rgb(64, 64, 82),
+            select_bg: Color::Rgb(35, 95, 120),
+            select_bg_dim: Color::Rgb(25, 85, 110),
+            primary: Color::Rgb(96, 205, 226),
+            accent: Color::Rgb(226, 192, 90),
+            accent_dim: Color::Rgb(150, 132, 88),
+            info: Color::Rgb(128, 158, 210),
+            success: Color::Rgb(126, 202, 130),
+            success_dim: Color::Rgb(96, 132, 100),
+            failure: Color::Rgb(228, 110, 110),
+            failure_dim: Color::Rgb(160, 96, 96),
+            warning: Color::Rgb(226, 178, 78),
+            unknown: Color::Rgb(96, 96, 112),
+            row_failure: Color::Rgb(45, 20, 20),
+            row_running: Color::Rgb(40, 36, 12),
+            row_queued: Color::Rgb(18, 20, 40),
+            row_idle: Color::Rgb(28, 30, 42),
+        }
+    }
+
+    /// Nord: lower contrast, colder, easier on a bright room.
+    pub fn nord() -> Self {
+        Self {
+            surface: Color::Rgb(46, 52, 64),
+            surface_alt: Color::Rgb(59, 66, 82),
+            overlay: Color::Rgb(36, 41, 51),
+            border: Color::Rgb(76, 86, 106),
+            border_dim: Color::Rgb(59, 66, 82),
+            text_bright: Color::Rgb(236, 239, 244),
+            text: Color::Rgb(216, 222, 233),
+            text_muted: Color::Rgb(143, 154, 174),
+            text_faint: Color::Rgb(110, 121, 141),
+            text_ghost: Color::Rgb(76, 86, 106),
+            select_bg: Color::Rgb(67, 96, 118),
+            select_bg_dim: Color::Rgb(59, 82, 100),
+            primary: Color::Rgb(136, 192, 208),
+            accent: Color::Rgb(235, 203, 139),
+            accent_dim: Color::Rgb(163, 143, 104),
+            info: Color::Rgb(129, 161, 193),
+            success: Color::Rgb(163, 190, 140),
+            success_dim: Color::Rgb(122, 142, 108),
+            failure: Color::Rgb(191, 97, 106),
+            failure_dim: Color::Rgb(145, 84, 90),
+            warning: Color::Rgb(235, 203, 139),
+            unknown: Color::Rgb(103, 112, 130),
+            row_failure: Color::Rgb(59, 44, 48),
+            row_running: Color::Rgb(56, 55, 44),
+            row_queued: Color::Rgb(46, 54, 68),
+            row_idle: Color::Rgb(46, 52, 64),
+        }
+    }
+
+    /// Gruvbox dark: warm, high contrast, retro.
+    pub fn gruvbox() -> Self {
+        Self {
+            surface: Color::Rgb(40, 40, 40),
+            surface_alt: Color::Rgb(60, 56, 54),
+            overlay: Color::Rgb(29, 32, 33),
+            border: Color::Rgb(80, 73, 69),
+            border_dim: Color::Rgb(60, 56, 54),
+            text_bright: Color::Rgb(251, 241, 199),
+            text: Color::Rgb(235, 219, 178),
+            text_muted: Color::Rgb(168, 153, 132),
+            text_faint: Color::Rgb(124, 111, 100),
+            text_ghost: Color::Rgb(80, 73, 69),
+            select_bg: Color::Rgb(69, 84, 85),
+            select_bg_dim: Color::Rgb(60, 70, 71),
+            primary: Color::Rgb(131, 165, 152),
+            accent: Color::Rgb(250, 189, 47),
+            accent_dim: Color::Rgb(168, 132, 56),
+            info: Color::Rgb(131, 165, 152),
+            success: Color::Rgb(184, 187, 38),
+            success_dim: Color::Rgb(134, 138, 44),
+            failure: Color::Rgb(251, 73, 52),
+            failure_dim: Color::Rgb(175, 62, 48),
+            warning: Color::Rgb(254, 128, 25),
+            unknown: Color::Rgb(124, 111, 100),
+            row_failure: Color::Rgb(60, 34, 30),
+            row_running: Color::Rgb(58, 48, 22),
+            row_queued: Color::Rgb(40, 46, 46),
+            row_idle: Color::Rgb(40, 40, 40),
+        }
+    }
+
+    /// No hue at all. For screenshots, e-ink, projectors, and anyone whose
+    /// terminal already carries the colour scheme they want.
+    pub fn mono() -> Self {
+        let g = |v: u8| Color::Rgb(v, v, v);
+        Self {
+            surface: g(24),
+            surface_alt: g(38),
+            overlay: g(16),
+            border: g(70),
+            border_dim: g(50),
+            text_bright: g(245),
+            text: g(200),
+            text_muted: g(140),
+            text_faint: g(105),
+            text_ghost: g(75),
+            select_bg: g(60),
+            select_bg_dim: g(46),
+            primary: g(235),
+            accent: g(225),
+            accent_dim: g(150),
+            info: g(180),
+            success: g(215),
+            success_dim: g(140),
+            failure: g(250),
+            failure_dim: g(160),
+            warning: g(230),
+            unknown: g(110),
+            row_failure: g(48),
+            row_running: g(40),
+            row_queued: g(32),
+            row_idle: g(24),
         }
     }
 }
@@ -720,6 +1300,11 @@ pub struct AppState {
     /// Multi-repo dashboard rows, in configured order.
     pub repos: Vec<RepoCard>,
     pub repo_cursor: usize,
+    /// Repos marked on the dashboard, by spec. Only ever fed to the batch —
+    /// marking is inert until a batch is started, so it can't surprise anyone.
+    pub repo_marks: HashSet<String>,
+    /// The batch commit in progress, if any.
+    pub batch: Option<BatchCommit>,
     /// Open fuzzy finder, if any. Rendered as an overlay above the current view.
     pub finder: Option<Finder>,
     /// Working-tree view for the repo we drilled into from the dashboard.
@@ -743,6 +1328,19 @@ pub struct AppState {
     pub help_scroll: u16,
     /// Directory the workspace scan was rooted at, when running outside a repo.
     pub workspace_root: Option<PathBuf>,
+    /// Ticks between polls, and the tick the last one went out on.
+    ///
+    /// Only the header reads these, to say when the next refresh lands. A
+    /// dashboard that silently refreshes every few seconds gives you no way to
+    /// tell "nothing has changed" from "nothing has been fetched yet".
+    pub poll_ticks: u64,
+    pub last_poll_tick: u64,
+    /// Jobs and steps of the in-flight run on each dashboard row, keyed by repo.
+    ///
+    /// The row itself can only say *that* CI is going; this is what lets the
+    /// strip at the bottom say which workflow and which step. Entries are
+    /// dropped the moment a run settles, so the strip appears and clears itself.
+    pub run_progress: HashMap<String, RunDetail>,
 }
 
 impl AppState {
@@ -809,6 +1407,8 @@ impl AppState {
             watch_seen_running: HashSet::new(),
             repos: Vec::new(),
             repo_cursor: 0,
+            repo_marks: HashSet::new(),
+            batch: None,
             finder: None,
             git_view: None,
             git_ops: HashMap::new(),
@@ -818,7 +1418,23 @@ impl AppState {
             show_help: false,
             help_scroll: 0,
             workspace_root: None,
+            poll_ticks: 50,
+            last_poll_tick: 0,
+            run_progress: HashMap::new(),
         }
+    }
+
+    /// Dashboard rows with CI in flight, in the order the table lists them.
+    ///
+    /// Table order rather than "most recently started" so a row and its strip
+    /// entry stay in the same relative place — a list that reshuffles itself
+    /// every poll is unreadable at a glance.
+    pub fn active_progress(&self) -> Vec<(&RepoCard, &RunDetail)> {
+        self.repos
+            .iter()
+            .filter_map(|c| self.run_progress.get(&c.spec).map(|d| (c, d)))
+            .filter(|(_, d)| !d.run.status.is_terminal())
+            .collect()
     }
 
     pub fn switch_view(&mut self, v: View) {
@@ -840,11 +1456,6 @@ impl AppState {
     pub fn current_op(&self) -> Option<&GitOp> {
         let spec = &self.git_view.as_ref()?.spec;
         self.git_ops.get(spec)
-    }
-
-    pub fn current_op_mut(&mut self) -> Option<&mut GitOp> {
-        let spec = self.git_view.as_ref()?.spec.clone();
-        self.git_ops.get_mut(&spec)
     }
 
     /// Whether a commit or push is still running for `spec`.
@@ -1060,7 +1671,7 @@ impl AppState {
             return Vec::new();
         }
         let cursor = self.log_line_cursor as usize;
-        let cursor_bg = Style::default().bg(Color::Rgb(35, 42, 58));
+        let cursor_bg = Style::default().bg(self.theme.surface_alt);
         let current_match_src = self
             .log_search_match_idx
             .and_then(|i| self.log_search_matches.get(i).copied());
@@ -1081,7 +1692,7 @@ impl AppState {
                 if let (Some(needle), Some(src)) = (needle.as_deref(), current_match_src)
                     && self.log_rendered_src.get(row) == Some(&src)
                 {
-                    out = highlight_line(out, needle, true);
+                    out = highlight_line(out, needle, true, &self.theme);
                 }
                 if row == cursor {
                     out = out.style(cursor_bg);
@@ -1178,7 +1789,7 @@ impl AppState {
             .filter(|q| !q.is_empty())
             .map(|q| q.to_lowercase());
 
-        let time_style = Style::default().fg(Color::Rgb(80, 80, 80));
+        let time_style = Style::default().fg(self.theme.text_ghost);
 
         let header_to_group: HashMap<usize, usize> = self.log_groups.iter().enumerate()
             .map(|(gi, g)| (g.header_line, gi))
@@ -1249,7 +1860,7 @@ impl AppState {
                     let plural = if n == 1 { "line" } else { "lines" };
                     return Line::from(Span::styled(
                         format!("  ⋯ {n} {plural} hidden — ↵ to show ⋯"),
-                        Style::default().fg(Color::Rgb(105, 105, 135)).italic(),
+                        Style::default().fg(self.theme.text_faint).italic(),
                     ));
                 }
                 let l = &lines[src_idx];
@@ -1261,7 +1872,7 @@ impl AppState {
                 let title = content.strip_prefix("##[group]")
                     .or_else(|| content.strip_prefix("##[section]"))
                     .unwrap_or(content);
-                let title_style = Style::default().fg(Color::Cyan).bold();
+                let title_style = Style::default().fg(self.theme.primary).bold();
                 let arrow = if is_collapsed { "▶ " } else { "▾ " };
                 let mut spans = vec![];
                 if let Some(ts) = mk_time() { spans.push(ts); }
@@ -1271,32 +1882,32 @@ impl AppState {
             } else if let Some(cmd) = content.strip_prefix("##[command]") {
                 let mut spans = vec![];
                 if let Some(ts) = mk_time() { spans.push(ts); }
-                spans.push(Span::styled("▶ ", Style::default().fg(Color::Green).bold()));
-                spans.extend(ansi_line_to_spans(cmd, Style::default().fg(Color::White)));
+                spans.push(Span::styled("▶ ", Style::default().fg(self.theme.success).bold()));
+                spans.extend(ansi_line_to_spans(cmd, Style::default().fg(self.theme.text_bright)));
                 Line::from(spans)
             } else if let Some(msg) = content.strip_prefix("##[error]") {
-                let s = Style::default().fg(Color::Red).bold();
+                let s = Style::default().fg(self.theme.failure).bold();
                 let mut spans = vec![];
                 if let Some(ts) = mk_time() { spans.push(ts); }
                 spans.push(Span::styled("✗ ", s));
                 spans.extend(ansi_line_to_spans(msg, s));
                 Line::from(spans)
             } else if let Some(msg) = content.strip_prefix("##[warning]") {
-                let s = Style::default().fg(Color::Yellow);
+                let s = Style::default().fg(self.theme.warning);
                 let mut spans = vec![];
                 if let Some(ts) = mk_time() { spans.push(ts); }
                 spans.push(Span::styled("⚠ ", s.bold()));
                 spans.extend(ansi_line_to_spans(msg, s));
                 Line::from(spans)
             } else if let Some(msg) = content.strip_prefix("##[debug]") {
-                let s = Style::default().fg(Color::DarkGray);
+                let s = Style::default().fg(self.theme.text_faint);
                 let mut spans = vec![];
                 if let Some(ts) = mk_time() { spans.push(ts); }
                 spans.push(Span::styled("# ", s));
                 spans.extend(ansi_line_to_spans(msg, s));
                 Line::from(spans)
             } else if let Some(msg) = content.strip_prefix("##[notice]") {
-                let s = Style::default().fg(Color::Cyan);
+                let s = Style::default().fg(self.theme.primary);
                 let mut spans = vec![];
                 if let Some(ts) = mk_time() { spans.push(ts); }
                 spans.push(Span::styled("ℹ ", s));
@@ -1314,19 +1925,19 @@ impl AppState {
                 };
                 let trimmed_lower = plain.trim_start().to_lowercase();
                 let base = if trimmed_lower.starts_with("error") || trimmed_lower.starts_with("failed") {
-                    Style::default().fg(Color::Red)
+                    Style::default().fg(self.theme.failure)
                 } else if trimmed_lower.starts_with("warn") {
-                    Style::default().fg(Color::Yellow)
+                    Style::default().fg(self.theme.warning)
                 } else if trimmed_lower.starts_with('=') && trimmed_lower.len() > 3
                     && trimmed_lower[..4].chars().all(|c| c == '=')
                 {
-                    Style::default().fg(Color::Yellow).bold()
+                    Style::default().fg(self.theme.warning).bold()
                 } else if trimmed_lower.starts_with('-') && trimmed_lower.len() > 3
                     && trimmed_lower[..4].chars().all(|c| c == '-')
                 {
-                    Style::default().fg(Color::Rgb(100, 100, 100))
+                    Style::default().fg(self.theme.text_faint)
                 } else {
-                    Style::default().fg(Color::Rgb(200, 200, 200))
+                    Style::default().fg(self.theme.text)
                 };
                 let mut spans = vec![];
                 if let Some(ts) = mk_time() { spans.push(ts); }
@@ -1335,7 +1946,7 @@ impl AppState {
             };
 
                 match needle_lower.as_deref() {
-                    Some(needle) => highlight_line(line, needle, false),
+                    Some(needle) => highlight_line(line, needle, false, &self.theme),
                     None => line,
                 }
             })
@@ -1644,16 +2255,17 @@ fn apply_sgr(params: &str, current: Style, default: Style) -> Style {
     s
 }
 
-pub fn highlight_line(line: Line<'static>, needle: &str, current: bool) -> Line<'static> {
+pub fn highlight_line(
+    line: Line<'static>,
+    needle: &str,
+    current: bool,
+    theme: &Theme,
+) -> Line<'static> {
     if needle.is_empty() {
         return line;
     }
-    let hit_bg = if current {
-        Color::Rgb(220, 200, 60)
-    } else {
-        Color::Rgb(120, 90, 30)
-    };
-    let hit_fg = Color::Black;
+    let hit_bg = if current { theme.accent } else { theme.accent_dim };
+    let hit_fg = theme.surface;
 
     let mut out: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
     for span in line.spans {
@@ -1737,6 +2349,269 @@ mod tests {
 
     fn section(label: &'static str, text: &str) -> crate::git::DiffSection {
         crate::git::DiffSection { label, text: text.to_string() }
+    }
+
+    /// A batch over three repos, already past the message box.
+    fn batch_of(n: usize) -> BatchCommit {
+        let items = (0..n)
+            .map(|i| BatchItem::new(format!("acme/r{i}"), PathBuf::from(format!("/tmp/r{i}"))))
+            .collect();
+        let mut b = BatchCommit::new(items, 0);
+        b.input = None;
+        b.message = "fix: bump deps".into();
+        b.phase = BatchPhase::Committing;
+        b
+    }
+
+    /// Run the queue to a standstill, answering each repo with `answer`.
+    fn drive(b: &mut BatchCommit, answer: impl Fn(&str) -> Result<String, String>) {
+        while let Some(i) = b.advance(0) {
+            let spec = b.items[i].spec.clone();
+            let a = answer(&spec);
+            b.record(&spec, a);
+        }
+    }
+
+    #[test]
+    fn the_batch_commits_one_repo_at_a_time_then_asks_about_pushing() {
+        let mut b = batch_of(3);
+        // Only ever one repo in flight: that is what makes a failure readable.
+        let first = b.advance(0).unwrap();
+        assert_eq!(b.items[first].state, ItemState::Running);
+        assert_eq!(
+            b.items.iter().filter(|i| i.state == ItemState::Running).count(),
+            1
+        );
+        b.record("acme/r0", Ok("abc1234".into()));
+        drive(&mut b, |_| Ok("def5678".into()));
+
+        assert_eq!(b.tally().committed, 3);
+        assert_eq!(b.items[0].sha.as_deref(), Some("abc1234"));
+        // Pushing is a separate decision, never a consequence of committing.
+        assert_eq!(b.phase, BatchPhase::AskPush);
+        assert_eq!(b.tally().pushed, 0);
+    }
+
+    #[test]
+    fn a_failed_hook_pauses_the_batch_instead_of_moving_on() {
+        let mut b = batch_of(3);
+        b.advance(0);
+        b.record("acme/r0", Err("pre-commit hook failed".into()));
+
+        assert_eq!(b.phase, BatchPhase::Paused);
+        // The two untouched repos must still be untouched: starting the next one
+        // would scroll the output that explains the failure off the screen.
+        assert_eq!(b.items[1].state, ItemState::Queued);
+        assert_eq!(b.items[2].state, ItemState::Queued);
+        assert_eq!(b.advance(0), None, "a paused batch starts nothing");
+        // …and asking is not answering: winding the pause up to Done here would
+        // throw away the retry/skip decision the pause exists to wait for.
+        assert_eq!(b.phase, BatchPhase::Paused);
+    }
+
+    #[test]
+    fn a_push_with_nothing_to_do_still_reports_the_commit_that_landed() {
+        let mut b = batch_of(1);
+        drive(&mut b, |_| Ok("abc1234".into()));
+        b.phase = BatchPhase::Pushing;
+        b.advance(0);
+        // What the push worker says when it finds a detached HEAD: the commit is
+        // real and on disk, there is just nowhere to push it to.
+        b.record_nothing("acme/r0", "detached HEAD".into());
+
+        // The repo must stop being pushable or the queue would hand it back
+        // forever — but a summary saying "0 committed" would send the user away
+        // believing nothing happened.
+        assert!(!b.items[0].ready_to_push());
+        assert_eq!(b.items[0].sha.as_deref(), Some("abc1234"));
+        assert_eq!(b.tally().committed, 1);
+        // …and counted once: one repo cannot be both "1 committed" and "1 had
+        // nothing to do" in a summary the user reads as a headcount.
+        assert_eq!(b.tally().nothing, 0);
+        assert_eq!(b.advance(0), None);
+        assert_eq!(b.phase, BatchPhase::Done);
+    }
+
+    #[test]
+    fn skip_leaves_the_failure_on_the_record_and_carries_on() {
+        let mut b = batch_of(3);
+        b.advance(0);
+        b.record("acme/r0", Err("pytest failed".into()));
+        b.skip();
+
+        assert_eq!(b.phase, BatchPhase::Committing);
+        drive(&mut b, |_| Ok("abc1234".into()));
+        // Skipping is not forgetting: the repo that failed still says so.
+        assert!(matches!(b.items[0].state, ItemState::Failed(_)));
+        assert_eq!(b.tally().failed, 1);
+        assert_eq!(b.tally().committed, 2);
+    }
+
+    #[test]
+    fn retry_reruns_the_commit_that_failed() {
+        let mut b = batch_of(2);
+        b.advance(0);
+        b.record("acme/r0", Err("pytest failed".into()));
+        b.retry();
+
+        assert_eq!(b.phase, BatchPhase::Committing);
+        assert_eq!(b.advance(0), Some(0), "the same repo goes again");
+        b.record("acme/r0", Ok("abc1234".into()));
+        assert_eq!(b.items[0].state, ItemState::Committed);
+    }
+
+    #[test]
+    fn a_failed_push_retries_the_push_not_the_commit() {
+        let mut b = batch_of(1);
+        drive(&mut b, |_| Ok("abc1234".into()));
+        b.phase = BatchPhase::Pushing;
+        b.advance(0);
+        b.record("acme/r0", Err("pre-push hook failed".into()));
+        assert_eq!(b.phase, BatchPhase::Paused);
+
+        b.retry();
+        // Re-committing would find nothing to commit and look like a new bug;
+        // the commit is already on disk and only the push is outstanding.
+        assert_eq!(b.items[0].state, ItemState::Committed);
+        assert_eq!(b.advance(0), Some(0));
+        assert_eq!(b.phase, BatchPhase::Pushing);
+    }
+
+    #[test]
+    fn a_repo_that_committed_before_a_push_failed_still_says_so() {
+        let mut b = batch_of(1);
+        drive(&mut b, |_| Ok("abc1234".into()));
+        b.phase = BatchPhase::Pushing;
+        b.advance(0);
+        b.record("acme/r0", Err("no upstream".into()));
+        // Losing the sha would report the repo as untouched when it has a commit
+        // sitting on it — the one thing you must know before walking away.
+        assert_eq!(b.items[0].sha.as_deref(), Some("abc1234"));
+    }
+
+    #[test]
+    fn stopping_the_batch_leaves_earlier_commits_alone() {
+        let mut b = batch_of(3);
+        b.advance(0);
+        b.record("acme/r0", Ok("abc1234".into()));
+        b.advance(0);
+        b.abort();
+        // The repo in flight still reports what it did — a hook that has already
+        // run cannot be undone, so pretending otherwise would be a lie.
+        b.record("acme/r1", Ok("def5678".into()));
+
+        assert_eq!(b.phase, BatchPhase::Done, "an abort is not a pause");
+        assert_eq!(b.tally().committed, 2);
+        assert_eq!(b.items[2].state, ItemState::Queued);
+        assert_eq!(b.tally().untouched, 1);
+        assert_eq!(b.advance(0), None);
+    }
+
+    #[test]
+    fn a_batch_with_nothing_to_commit_never_asks_about_pushing() {
+        let mut b = batch_of(2);
+        while let Some(i) = b.advance(0) {
+            let spec = b.items[i].spec.clone();
+            b.record_nothing(&spec, "working tree is clean".into());
+        }
+        assert_eq!(b.phase, BatchPhase::Done);
+        assert_eq!(b.tally().nothing, 2);
+    }
+
+    #[test]
+    fn pushing_only_touches_what_the_batch_committed() {
+        let mut b = batch_of(3);
+        b.advance(0);
+        b.record("acme/r0", Ok("abc1234".into()));
+        b.advance(0);
+        b.record("acme/r1", Err("pytest failed".into()));
+        b.skip();
+        b.advance(0);
+        b.record_nothing("acme/r2", "working tree is clean".into());
+        b.advance(0);
+        assert_eq!(b.phase, BatchPhase::AskPush);
+
+        b.phase = BatchPhase::Pushing;
+        let mut pushed = Vec::new();
+        while let Some(i) = b.advance(0) {
+            let spec = b.items[i].spec.clone();
+            pushed.push(spec.clone());
+            b.record(&spec, Ok("pushed main".into()));
+        }
+        // The failed repo has no commit and the clean one has no change; pushing
+        // either would be pushing something the batch did not make.
+        assert_eq!(pushed, vec!["acme/r0"]);
+        assert_eq!(b.phase, BatchPhase::Done);
+        assert_eq!(b.tally().pushed, 1);
+    }
+
+    #[test]
+    fn every_shipped_theme_defines_every_token() {
+        // A palette that forgot a token would inherit whatever `Default` had —
+        // one stray midnight blue in the middle of gruvbox, and no compiler
+        // error, since they are all just `Color`.
+        for name in Theme::NAMES {
+            let mut t = Theme::by_name(name).unwrap_or_else(|| panic!("{name} missing"));
+            for token in Theme::TOKENS {
+                assert!(t.slot(token).is_some(), "{name} has no {token}");
+            }
+        }
+        assert!(Theme::by_name("nope").is_none());
+        // Case and stray whitespace come from a hand-edited config file.
+        assert!(Theme::by_name(" GruvBox ").is_some());
+    }
+
+    #[test]
+    fn a_colour_override_that_cannot_work_says_so() {
+        let mut t = Theme::midnight();
+        let cfg = HashMap::from([
+            ("accent".to_string(), "#ff8800".to_string()),
+            ("text".to_string(), "00ff00".to_string()),
+            ("acsent".to_string(), "#ff8800".to_string()),
+            ("failure".to_string(), "red".to_string()),
+        ]);
+        let rejected = t.apply_overrides(&cfg);
+
+        assert_eq!(t.accent, Color::Rgb(255, 136, 0));
+        assert_eq!(t.text, Color::Rgb(0, 255, 0), "the # is optional");
+        // A typo and a bad value are both reported: silently ignoring either is
+        // indistinguishable from the whole setting not working.
+        assert_eq!(
+            rejected,
+            vec![
+                "acsent (unknown colour)".to_string(),
+                "failure = \"red\" (not #rrggbb)".to_string(),
+            ]
+        );
+        assert_eq!(t.failure, Theme::midnight().failure, "left alone");
+    }
+
+    #[test]
+    fn degrading_a_palette_keeps_its_colours_apart() {
+        let mut t = Theme::midnight();
+        t.degrade_to_256();
+        // The point of choosing the indexed colour ourselves is that shades
+        // meant to differ still differ; a terminal rounding them itself is what
+        // collapses a five-step text ramp into two.
+        let ramp = [t.text_bright, t.text, t.text_muted, t.text_faint, t.text_ghost];
+        for (i, c) in ramp.iter().enumerate() {
+            assert!(matches!(c, Color::Indexed(_)), "{i} not degraded");
+            assert!(!ramp[i + 1..].contains(c), "step {i} collapsed into a later one");
+        }
+        // Status colours must not land on the same cell either.
+        assert_ne!(t.success, t.failure);
+        assert_ne!(t.warning, t.accent_dim);
+    }
+
+    #[test]
+    fn a_grey_degrades_to_the_grey_ramp_not_the_colour_cube() {
+        // The cube's nearest neighbour to a near-grey is usually tinted, which
+        // is how a neutral border turns faintly purple on a 256-colour term.
+        assert!((232..=255).contains(&rgb_to_xterm256(120, 120, 122)));
+        assert_eq!(rgb_to_xterm256(0, 0, 0), 16);
+        assert_eq!(rgb_to_xterm256(255, 255, 255), 231);
+        // …and a colour that is actually coloured still goes to the cube.
+        assert!(rgb_to_xterm256(228, 110, 110) < 232);
     }
 
     fn op_with(raw: &[&str]) -> GitOp {
@@ -1961,7 +2836,7 @@ mod tests {
         st.log_line_cursor = 3;
         let rows = st.decorate_visible(0, 6);
         assert_eq!(rows.len(), 6);
-        let cursor_bg = Some(Color::Rgb(35, 42, 58));
+        let cursor_bg = Some(Theme::default().surface_alt);
         for (i, line) in rows.iter().enumerate() {
             assert_eq!(
                 line.style.bg == cursor_bg,
@@ -1977,7 +2852,7 @@ mod tests {
         st.log_line_cursor = 12;
         // Viewport starts at 10, so the cursor is the third row drawn.
         let rows = st.decorate_visible(10, 5);
-        let cursor_bg = Some(Color::Rgb(35, 42, 58));
+        let cursor_bg = Some(Theme::default().surface_alt);
         assert_eq!(rows[2].style.bg, cursor_bg);
         assert_ne!(rows[0].style.bg, cursor_bg);
     }
