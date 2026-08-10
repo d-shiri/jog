@@ -134,6 +134,10 @@ pub struct GitOp {
     pub scroll: Option<usize>,
     /// Lines dropped off the front to stay under `MAX_OP_LINES`.
     pub dropped: usize,
+    /// The last line is unterminated — `pre-commit` printing `pytest....` with
+    /// the verdict still to come. The next pushed line replaces it rather than
+    /// stacking under it, the way a terminal would overwrite the same row.
+    last_partial: bool,
 }
 
 impl GitOp {
@@ -147,6 +151,7 @@ impl GitOp {
             started_tick,
             scroll: None,
             dropped: 0,
+            last_partial: false,
         }
     }
 
@@ -160,13 +165,24 @@ impl GitOp {
         }
     }
 
-    pub fn push_line(&mut self, text: String) {
+    pub fn push_line(&mut self, text: String, partial: bool) {
         let (errors, warns) = classify_log_severity(std::slice::from_ref(&text));
-        self.lines.push(OpLine {
+        let line = OpLine {
             text,
             error: !errors.is_empty(),
             warn: !warns.is_empty(),
-        });
+        };
+        // A partial line's successor is the same line — grown, or finished.
+        // Replacing keeps `pytest....` and `pytest....Passed` from both
+        // appearing, one above the other.
+        if self.last_partial
+            && let Some(last) = self.lines.last_mut()
+        {
+            *last = line;
+        } else {
+            self.lines.push(line);
+        }
+        self.last_partial = partial;
         if self.lines.len() > MAX_OP_LINES {
             let excess = self.lines.len() - MAX_OP_LINES;
             self.lines.drain(..excess);
@@ -1726,7 +1742,7 @@ mod tests {
     fn op_with(raw: &[&str]) -> GitOp {
         let mut op = GitOp::new("commit", Some("pre-commit".into()), 0);
         for l in raw {
-            op.push_line((*l).to_string());
+            op.push_line((*l).to_string(), false);
         }
         op
     }
@@ -1747,6 +1763,26 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_line_is_replaced_by_its_own_completion() {
+        let mut op = GitOp::new("commit", None, 0);
+        op.push_line("ruff format...Passed".into(), false);
+        // pre-commit names the running step before it finishes; the pane must
+        // show it now, not after pytest is done.
+        op.push_line("pytest".into(), true);
+        op.push_line("pytest....".into(), true);
+        assert_eq!(op.lines.len(), 2);
+        assert_eq!(op.lines[1].text, "pytest....");
+        // The verdict arrives as the completed line, overwriting the draft —
+        // one row, like a terminal, not the draft with the verdict under it.
+        op.push_line("pytest....Passed".into(), false);
+        assert_eq!(op.lines.len(), 2);
+        assert_eq!(op.lines[1].text, "pytest....Passed");
+        // And the next line goes below it, not over it.
+        op.push_line("done".into(), false);
+        assert_eq!(op.lines.len(), 3);
+    }
+
+    #[test]
     fn a_running_op_follows_the_tail_until_scrolled() {
         let mut op = op_with(&["one", "two", "three", "four"]);
         // No explicit scroll: show the newest lines, since that is where a
@@ -1755,7 +1791,7 @@ mod tests {
         op.scroll_by(-1, 2);
         assert_eq!(op.scroll_offset(2), 1);
         // …and new output no longer drags the view along.
-        op.push_line("five".into());
+        op.push_line("five".into(), false);
         assert_eq!(op.scroll_offset(2), 1);
         op.scroll_to_bottom();
         assert_eq!(op.scroll_offset(2), 3);
@@ -1786,10 +1822,10 @@ mod tests {
     fn dropping_old_lines_keeps_a_pinned_scroll_pointing_at_the_same_text() {
         let mut op = GitOp::new("commit", None, 0);
         for i in 0..MAX_OP_LINES {
-            op.push_line(format!("line {i}"));
+            op.push_line(format!("line {i}"), false);
         }
         op.scroll = Some(10);
-        op.push_line("overflow".into());
+        op.push_line("overflow".into(), false);
         assert_eq!(op.lines.len(), MAX_OP_LINES);
         assert_eq!(op.dropped, 1);
         // Line 10 shifted down to index 9, and the offset has to shift with it

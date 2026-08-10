@@ -6,7 +6,7 @@
 //! keeps the binary free of a libgit2 dependency.
 
 use anyhow::{Context, Result, anyhow};
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -211,15 +211,25 @@ fn last_line(s: &str) -> String {
 /// the only description of what went wrong. `Command::output()` would hold all
 /// of that until the process exits and then let the caller drop it.
 ///
-/// stdout and stderr are merged: hooks write to both, interleaved, and the
-/// distinction is not one the reader cares about. `stdin` is `null` — a hook
+/// stdout and stderr are merged — into one OS pipe, the way `2>&1` merges them
+/// on a terminal: hooks write to both, interleaved, and the distinction is not
+/// one the reader cares about, but the *order* is. `stdin` is `null` — a hook
 /// that reads from stdin would otherwise be handed the terminal the TUI is
 /// reading keystrokes from, and the two would race for the user's typing.
+///
+/// `on_line` gets `(text, partial)`. A partial line is one the process has
+/// written but not yet finished — `pre-commit` prints `pytest.......` the
+/// moment a step *starts* and only appends `Passed\n` when it ends, so for a
+/// slow step the unterminated head of the line is the entire progress report.
+/// A partial is always superseded by the next call, which carries the same
+/// line grown longer (still partial) or completed (not).
 fn git_streaming(
     dir: &Path,
     args: &[&str],
-    on_line: &mut dyn FnMut(String),
+    on_line: &mut dyn FnMut(String, bool),
 ) -> Result<(bool, Vec<String>)> {
+    let (reader, writer) = std::io::pipe().context("create output pipe")?;
+    let writer2 = writer.try_clone().context("clone output pipe")?;
     let mut child = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -229,35 +239,22 @@ fn git_streaming(
         // line by line; asking them not to is cheaper and more reliable.
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(writer)
+        .stderr(writer2)
         .spawn()
         .with_context(|| format!("run git {}", args.join(" ")))?;
-
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let mut pumps = Vec::new();
-    for pipe in [
-        child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
-        child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let tx = tx.clone();
-        pumps.push(std::thread::spawn(move || pump_lines(pipe, &tx)));
-    }
-    // The receive loop below ends when every sender is gone, so the original
-    // must not outlive the clones handed to the pumps.
-    drop(tx);
+    // `spawn` dropped the parent's copies of the write end, so `reader` hits
+    // EOF when the child (and anything it handed the pipe to) exits.
 
     let mut collected = Vec::new();
-    for line in rx {
-        collected.push(line.clone());
-        on_line(line);
-    }
-    for p in pumps {
-        let _ = p.join();
-    }
+    pump_lines(reader, &mut |text, partial| {
+        // Partials are progress, not record: each is superseded by the finished
+        // line, which is the one an error message should quote.
+        if !partial {
+            collected.push(text.clone());
+        }
+        on_line(text, partial);
+    });
 
     let status = child
         .wait()
@@ -265,29 +262,56 @@ fn git_streaming(
     Ok((status.success(), collected))
 }
 
-/// Forward one pipe's output line by line.
+/// Forward the pipe's output as lines, without waiting for lines to end.
 ///
-/// Reads bytes rather than `BufRead::lines()` because a hook's output is not
-/// guaranteed to be UTF-8 and one bad byte should not truncate the log. Lines
-/// rewritten in place with `\r` — every test runner's progress bar — are
-/// reported as their final state, which is what the same output would have
-/// looked like on a terminal.
-fn pump_lines(reader: impl Read, tx: &std::sync::mpsc::Sender<String>) {
-    let mut reader = BufReader::new(reader);
-    let mut buf = Vec::new();
+/// `read_until(b'\n')` would be simpler, but it sits on an unterminated line
+/// forever — and `pre-commit`'s unterminated line is the name of the step
+/// currently running. So this reads whatever bytes are available, emits every
+/// completed line as `partial = false`, and emits the unterminated tail as
+/// `partial = true` whenever it has changed.
+///
+/// Reads bytes rather than text because a hook's output is not guaranteed to
+/// be UTF-8 and one bad byte should not truncate the log. Lines rewritten in
+/// place with `\r` — every test runner's progress bar — are reported as their
+/// latest state, which is what the same output would have looked like on a
+/// terminal.
+fn pump_lines(mut reader: impl Read, emit: &mut dyn FnMut(String, bool)) {
+    // What a terminal would show for one line's bytes: text after the last
+    // carriage return, i.e. the state the line was last rewritten to.
+    fn rendered(bytes: &[u8]) -> String {
+        let text = String::from_utf8_lossy(bytes);
+        let text = text.trim_end_matches(['\n', '\r']);
+        text.rsplit('\r').next().unwrap_or(text).to_string()
+    }
+
+    let mut acc: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut last_partial = String::new();
     loop {
-        buf.clear();
-        match std::io::BufRead::read_until(&mut reader, b'\n', &mut buf) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {
-                let text = String::from_utf8_lossy(&buf);
-                let text = text.trim_end_matches(['\n', '\r']);
-                let text = text.rsplit('\r').next().unwrap_or(text);
-                if tx.send(text.to_string()).is_err() {
-                    return;
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                acc.extend_from_slice(&chunk[..n]);
+                while let Some(pos) = acc.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = acc.drain(..=pos).collect();
+                    emit(rendered(&line), false);
+                    last_partial.clear();
+                }
+                if !acc.is_empty() {
+                    let text = rendered(&acc);
+                    // Don't repeat an unchanged tail: a chunk that ends exactly
+                    // on a newline boundary hasn't grown the partial line.
+                    if text != last_partial {
+                        last_partial = text.clone();
+                        emit(text, true);
+                    }
                 }
             }
         }
+    }
+    // A process can exit mid-line; the tail is real output, not progress.
+    if !acc.is_empty() {
+        emit(rendered(&acc), false);
     }
 }
 
@@ -434,7 +458,11 @@ pub fn unstage(dir: &Path, path: &str) -> Result<()> {
 /// Streams rather than buffers: `on_line` sees the `pre-commit` hook's output
 /// while it is still running, so a test suite that takes a minute reports its
 /// progress instead of looking like a hang.
-pub fn commit(dir: &Path, message: &str, on_line: &mut dyn FnMut(String)) -> Result<String> {
+pub fn commit(
+    dir: &Path,
+    message: &str,
+    on_line: &mut dyn FnMut(String, bool),
+) -> Result<String> {
     let (ok, lines) = git_streaming(dir, &["commit", "-m", message], on_line)?;
     let text = lines.join("\n");
     if !ok {
@@ -460,7 +488,7 @@ pub fn push(
     dir: &Path,
     branch: &str,
     has_upstream: bool,
-    on_line: &mut dyn FnMut(String),
+    on_line: &mut dyn FnMut(String, bool),
 ) -> Result<String> {
     let args: Vec<&str> = if has_upstream {
         vec!["push"]
@@ -699,7 +727,12 @@ mod tests {
         );
 
         let mut seen = Vec::new();
-        let summary = commit(&dir, "with hook", &mut |l| seen.push(l)).unwrap();
+        let summary = commit(&dir, "with hook", &mut |l, partial| {
+            if !partial {
+                seen.push(l);
+            }
+        })
+        .unwrap();
 
         // Both streams, in one sequence: hooks write to whichever they like and
         // the reader does not care which.
@@ -723,7 +756,7 @@ mod tests {
 
         let start = Instant::now();
         let mut early_at = None;
-        commit(&dir, "live", &mut |l| {
+        commit(&dir, "live", &mut |l, _| {
             if l == "early" {
                 early_at = Some(start.elapsed());
             }
@@ -746,6 +779,51 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn the_step_currently_running_is_visible_before_it_finishes() {
+        use std::time::{Duration, Instant};
+        let dir = staged_repo("hook-partial");
+        // How `pre-commit` reports a step: name and dots the moment it starts,
+        // no newline; the verdict — and the newline — only when it ends.
+        install_hook(
+            &dir,
+            "pre-commit",
+            "#!/bin/sh\nprintf 'pytest...................'\nsleep 1\nprintf 'Passed\\n'\nexit 0\n",
+        );
+
+        let start = Instant::now();
+        let mut partial_at = None;
+        let mut final_line = None;
+        commit(&dir, "partial", &mut |l, partial| {
+            if partial && l.starts_with("pytest") && partial_at.is_none() {
+                partial_at = Some(start.elapsed());
+            }
+            if !partial && l.starts_with("pytest") {
+                final_line = Some(l);
+            }
+        })
+        .unwrap();
+        let total = start.elapsed();
+
+        // The step's name must show up while the step is still running — that
+        // unterminated line is the only sign of what the wait is for.
+        let at = partial_at.expect("the running step's name never arrived");
+        assert!(total >= Duration::from_millis(900), "hook exited too fast to tell: {total:?}");
+        assert!(
+            at < Duration::from_millis(500),
+            "step name took {at:?} of a {total:?} hook — the running step was invisible"
+        );
+        // And once the step ends, the completed line supersedes the partial.
+        assert_eq!(
+            final_line.as_deref(),
+            Some("pytest...................Passed"),
+            "the finished line should arrive whole"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn a_failing_hook_aborts_the_commit_and_keeps_its_output() {
         let dir = staged_repo("hook-fail");
         install_hook(
@@ -755,7 +833,12 @@ mod tests {
         );
 
         let mut seen = Vec::new();
-        let err = commit(&dir, "blocked", &mut |l| seen.push(l)).unwrap_err();
+        let err = commit(&dir, "blocked", &mut |l, partial| {
+            if !partial {
+                seen.push(l);
+            }
+        })
+        .unwrap_err();
 
         // The one-line message names the hook — the detail is in the output the
         // caller just collected, which is the whole reason it is collected.
@@ -783,7 +866,12 @@ mod tests {
         );
 
         let mut seen = Vec::new();
-        commit(&dir, "progress", &mut |l| seen.push(l)).unwrap();
+        commit(&dir, "progress", &mut |l, partial| {
+            if !partial {
+                seen.push(l);
+            }
+        })
+        .unwrap();
 
         assert!(
             seen.iter().any(|l| l == "100% done"),

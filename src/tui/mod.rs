@@ -52,7 +52,7 @@ pub enum AppEvent {
     /// Live output from a running commit/push — mostly hook output. Batched
     /// rather than one event per line: every event redraws, and a pytest run
     /// would otherwise repaint the screen a few thousand times.
-    GitOpOutput(String, Vec<String>),
+    GitOpOutput(String, Vec<(String, bool)>),
     /// Which hook, if any, the command that just started will run. Resolved off
     /// the UI thread, so it names the pane a moment after it opens.
     GitOpStarted(String, Option<String>),
@@ -460,8 +460,8 @@ async fn event_loop(
                     }
                     AppEvent::GitOpOutput(spec, lines) => {
                         if let Some(op) = state.git_ops.get_mut(&spec) {
-                            for line in lines {
-                                op.push_line(line);
+                            for (line, partial) in lines {
+                                op.push_line(line, partial);
                             }
                         }
                     }
@@ -2431,7 +2431,7 @@ fn spawn_git_op_streaming<F>(
     hook: &'static str,
     op: F,
 ) where
-    F: FnOnce(&std::path::Path, &mut dyn FnMut(String)) -> anyhow::Result<String>
+    F: FnOnce(&std::path::Path, &mut dyn FnMut(String, bool)) -> anyhow::Result<String>
         + Send
         + 'static,
 {
@@ -2458,7 +2458,8 @@ fn spawn_git_op_streaming<F>(
         let installed = crate::git::hook_path(&path, hook).map(|_| hook.to_string());
         let _ = tx.send(AppEvent::GitOpStarted(spec.clone(), installed));
         let mut batch = LineBatch::new(spec.clone(), tx.clone());
-        let result = op(&path, &mut |line| batch.push(line)).map_err(|e| format!("{e:#}"));
+        let result =
+            op(&path, &mut |line, partial| batch.push(line, partial)).map_err(|e| format!("{e:#}"));
         batch.flush();
         let _ = tx.send(AppEvent::GitOpDone(spec, result));
     });
@@ -2473,7 +2474,7 @@ fn spawn_git_op_streaming<F>(
 struct LineBatch {
     spec: String,
     tx: mpsc::UnboundedSender<AppEvent>,
-    buf: Vec<String>,
+    buf: Vec<(String, bool)>,
     /// `None` until the first flush, so the very first line goes out at once.
     last_flush: Option<std::time::Instant>,
 }
@@ -2488,8 +2489,16 @@ impl LineBatch {
         }
     }
 
-    fn push(&mut self, line: String) {
-        self.buf.push(line);
+    fn push(&mut self, line: String, partial: bool) {
+        // Consecutive partials are drafts of the same line; only the newest
+        // matters, so a growing progress line doesn't inflate the batch.
+        if let Some(last) = self.buf.last_mut()
+            && last.1
+        {
+            *last = (line, partial);
+        } else {
+            self.buf.push((line, partial));
+        }
         let due = self
             .last_flush
             .is_none_or(|t| t.elapsed() >= Duration::from_millis(100));

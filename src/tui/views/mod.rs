@@ -998,13 +998,34 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
             Style::default().fg(Color::DarkGray),
         ))
     } else if gv.entries().is_empty() {
-        Line::from(vec![
-            Span::styled("✓ clean", Style::default().fg(theme.success).bold()),
-            Span::styled(
-                "   nothing to commit",
-                Style::default().fg(theme.secondary),
-            ),
-        ])
+        // "Nothing to commit" is only the whole truth when there is also
+        // nothing to push — a clean tree sitting ahead of upstream is mid-task,
+        // and this line is the only place the view says what the next step is.
+        let ahead = gv.status.as_ref().map(|s| s.ahead).unwrap_or(0);
+        if ahead > 0 {
+            Line::from(vec![
+                Span::styled("✓ clean", Style::default().fg(theme.success).bold()),
+                Span::styled(
+                    format!(
+                        "   ↑{ahead} commit{} not pushed",
+                        if ahead == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(theme.accent).bold(),
+                ),
+                Span::styled(
+                    format!("   {} pushes", state.keymap.git_push),
+                    Style::default().fg(theme.secondary),
+                ),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("✓ clean", Style::default().fg(theme.success).bold()),
+                Span::styled(
+                    "   nothing to commit",
+                    Style::default().fg(theme.secondary),
+                ),
+            ])
+        }
     } else {
         Line::from(vec![
             Span::styled(
@@ -2645,7 +2666,7 @@ mod tests {
             "FAILED tests/test_api.py::test_login",
             "assert 1 == 2",
         ] {
-            op.push_line(l.into());
+            op.push_line(l.into(), false);
         }
         op.finished = true;
         op.failed = true;
@@ -2664,7 +2685,7 @@ mod tests {
     fn a_running_hook_says_what_it_is_and_how_long_it_has_been() {
         let mut op = GitOp::new("commit", Some("pre-commit".into()), 0);
         for i in 0..40 {
-            op.push_line(format!("collecting test {i}"));
+            op.push_line(format!("collecting test {i}"), false);
         }
         let mut st = state_with_op(op);
         st.tick_count = 123; // 12.3s in
@@ -2678,11 +2699,47 @@ mod tests {
     }
 
     #[test]
+    fn a_clean_tree_ahead_of_upstream_says_so_instead_of_nothing_to_commit() {
+        let mut st = AppState::new(
+            "acme/api".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        let mut gv = crate::app::state::GitView::new(
+            "acme/api".into(),
+            std::path::PathBuf::from("/tmp/acme-api"),
+            true,
+        );
+        // The state right after a commit: nothing left to stage, but the
+        // commit only exists locally.
+        gv.status = Some(crate::git::parse_status(
+            "## main...origin/main [ahead 1]\0",
+        ));
+        st.git_view = Some(gv);
+        st.view = View::GitStatus;
+        let out = draw_changes(&st, 80, 14);
+
+        // "Nothing to commit" reads as "done" — but the work isn't visible to
+        // anyone until it is pushed, and this line has to say that.
+        assert!(out.contains("↑1 commit not pushed"), "got:\n{out}");
+        assert!(out.contains("P pushes"), "got:\n{out}");
+        assert!(!out.contains("nothing to commit"), "got:\n{out}");
+
+        // Once upstream has it, clean means clean.
+        st.git_view.as_mut().unwrap().status =
+            Some(crate::git::parse_status("## main...origin/main\0"));
+        let out = draw_changes(&st, 80, 14);
+        assert!(out.contains("nothing to commit"), "got:\n{out}");
+    }
+
+    #[test]
     #[ignore = "visual check: cargo test show_changes -- --ignored --nocapture"]
     fn show_changes() {
         let mut running = GitOp::new("commit", Some("pre-commit".into()), 0);
         for l in ["ruff.....Passed", "pyright..", "collecting tests…"] {
-            running.push_line(l.into());
+            running.push_line(l.into(), false);
         }
         let mut st = state_with_op(running);
         st.tick_count = 87;
@@ -2696,7 +2753,7 @@ mod tests {
             "src/api.py:41:12 - error: \"user_id\" is not defined",
             "1 error, 0 warnings",
         ] {
-            failed.push_line(l.into());
+            failed.push_line(l.into(), false);
         }
         failed.finished = true;
         failed.failed = true;
