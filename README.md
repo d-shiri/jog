@@ -1,6 +1,15 @@
 # jog
 
-A terminal UI for browsing and triggering GitHub Actions workflows.
+One screen for every repo you're working in: what the working tree looks like,
+what CI is doing, and everything in between.
+
+- **Working tree** — stage, unstage, diff, commit and push, per repo or across
+  several at once, with `pre-commit` hook output on screen while it runs.
+- **CI** — trigger workflows, watch runs step by step, read logs with the errors
+  already found, rerun or cancel.
+- **Several repos at a time** — one dashboard with each repo's branch, dirty
+  files, latest run and run history; it keeps polling all of them, so a failure
+  anywhere finds you.
 
 ![The jog dashboard: every repo's CI, working tree and run history on one screen](./images/dashboard.png)
 
@@ -129,6 +138,28 @@ The order matters: `workflow_dispatch` runs against the **remote**, so a commit
 that hasn't been pushed won't be the code CI builds. Commit → push → trigger.
 `jog` never pushes on its own; `P` is always an explicit keystroke.
 
+## One commit message, several repos
+
+A change that spans four repos otherwise costs four trips: in, stage, commit,
+type the message again, push, out. On the dashboard, `Space` marks the repos and
+`C` commits all of them with one message.
+
+They go **one at a time**, not in parallel — `git add -A`, then commit, with that
+repo's hook output on screen while it runs. A hook that fails stops the whole
+batch there and waits:
+
+| Key | Action |
+|-----|--------|
+| `r` | retry this repo |
+| `s` | skip it and carry on |
+| `c` | open its working tree to fix it — `Esc` comes back to the pause |
+| `Esc` | stop; repos already committed keep their commits |
+
+Nothing is pushed as a side effect. When the last commit lands the batch reports
+what it did and asks: `P` pushes every repo it committed, `Esc` finishes.
+
+The per-repo flow above is untouched — this is a second path, not a replacement.
+
 ## Watching a pre-commit hook
 
 A repo with a `pre-commit` hook doesn't take 40 milliseconds to commit, it takes
@@ -230,7 +261,8 @@ view you're in floats to the top.
 | View      | Keys |
 |-----------|------|
 | Global    | `?` help · `q` quit · `Esc` back · `j`/`k` move · `Enter` open · `Ctrl-P` find · `H` repos · `y` yank |
-| Repos     | `Enter` open repo · `c` review changes · `o` open in browser |
+| Repos     | `Enter` open repo · `c` review changes · `Space` mark · `C` commit marked · `o` open in browser |
+| Batch commit | `r` retry · `s` skip · `c` open the failed repo · `P` push all · `Esc` stop |
 | Changes   | `d`/`Enter` diff the file · `Space` stage/unstage · `a` stage all · `c` commit · `P` push · `t` run CI · `r` refresh |
 | Hook output | `j`/`k` scroll · `e`/`E` next/prev error · `g`/`G` top/tail · `y` yank · `Esc` dismiss |
 | Diff      | `j`/`k` scroll · `d`/`u` page · `g`/`G` top/bottom · `n`/`p` next/prev file · `Space` stage/unstage |
