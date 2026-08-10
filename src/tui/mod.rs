@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Timelike;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -267,10 +267,31 @@ async fn event_loop(
 
         tokio::select! {
             maybe_evt = events.next() => {
-                if let Some(Ok(Event::Key(key))) = maybe_evt
-                    && key.kind == KeyEventKind::Press
-                    && let Some(action) = handle_key(state, key, &mut provider, &tx, &km).await
-                    && let AppEvent::Quit = action { return Ok(()) }
+                match maybe_evt {
+                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        if let Some(action) = handle_key(state, key, &mut provider, &tx, &km).await
+                            && let AppEvent::Quit = action { return Ok(()) }
+                    }
+                    // The wheel is the same gesture as ↑/↓, three rows per
+                    // notch. Routed through handle_key so whatever the arrow
+                    // keys drive in the current view — hook output, a diff, a
+                    // log, a list — the wheel drives too.
+                    Some(Ok(Event::Mouse(m))) => {
+                        let code = match m.kind {
+                            MouseEventKind::ScrollDown => Some(KeyCode::Down),
+                            MouseEventKind::ScrollUp => Some(KeyCode::Up),
+                            _ => None,
+                        };
+                        if let Some(code) = code {
+                            for _ in 0..3 {
+                                let key = KeyEvent::new(code, KeyModifiers::NONE);
+                                // ↑/↓ never map to Quit, so the action is moot.
+                                let _ = handle_key(state, key, &mut provider, &tx, &km).await;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
             Some(app_evt) = rx.recv() => {
                 match app_evt {
