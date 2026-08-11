@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{Local, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -16,6 +16,7 @@ use crate::app::state::{
     AppState, BatchPhase, DetailItem, GitOp, ItemState, Theme, View, build_detail_items,
 };
 use crate::history::HistoryEntry;
+use crate::provider::github::{ApiFault, CRITICAL_PERCENT};
 use crate::provider::{Run, Status};
 
 pub fn render(f: &mut Frame, state: &AppState) {
@@ -49,6 +50,7 @@ pub fn render(f: &mut Frame, state: &AppState) {
     if state.view == View::GitStatus {
         render_commit_overlay(f, area, state);
     }
+    render_push_prompt(f, area, state);
     render_finder_overlay(f, area, state);
     // Drawn last so it sits above every other overlay.
     render_help_overlay(f, area, state);
@@ -58,9 +60,9 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     let sep = || Span::styled("  ›  ", Style::default().fg(theme.border_dim));
     let crumb: Vec<Span> = match state.view {
-        View::Repos => vec![
-            Span::styled("Repos", Style::default().fg(theme.primary).bold()),
-        ],
+        // The panel below is titled "Repos" and counts them. Saying it twice
+        // one line apart spends the width that the tallies now use.
+        View::Repos => Vec::new(),
         View::GitStatus => vec![
             Span::styled("Repos", Style::default().fg(theme.text_muted)),
             sep(),
@@ -157,7 +159,7 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(" ⚡ ", Style::default().fg(theme.accent)),
         Span::styled("jog", Style::default().fg(theme.text_bright).bold()),
         Span::styled(
-            format!(" v{}", env!("CARGO_PKG_VERSION")),
+            format!(" {}", env!("CARGO_PKG_VERSION")),
             Style::default().fg(theme.text_faint),
         ),
         Span::styled("  ·  ", dot),
@@ -166,7 +168,7 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     // (and its branch) would be arbitrary. Show where we're scanning instead.
     match (&state.workspace_root, state.view) {
         (Some(root), View::Repos | View::GitStatus | View::GitDiff) => spans.push(Span::styled(
-            format!("{}", root.display()),
+            short_path(root),
             Style::default().fg(theme.text_bright),
         )),
         _ => {
@@ -181,19 +183,17 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
             ));
         }
     }
-    spans.push(Span::styled("  ·  ", dot));
-    spans.extend(crumb);
-    let line = Line::from(spans);
-    f.render_widget(
-        Paragraph::new(line).style(Style::default().bg(theme.surface)),
-        area,
-    );
+    if !crumb.is_empty() {
+        spans.push(Span::styled("  ·  ", dot));
+        spans.extend(crumb);
+    }
 
     // The right two thirds of the header were empty on every terminal wider
     // than the ones jog was first written on. What belongs there is the state
     // you'd otherwise have to guess at: when the next refresh lands, and what
     // time it is — a run that "finished 3m ago" means nothing without it.
-    let right = Line::from(vec![
+    let mut right = quota_spans(state);
+    right.extend([
         Span::styled(poll_clock(state), Style::default().fg(theme.text_faint)),
         Span::styled("   ", Style::default()),
         Span::styled(
@@ -202,7 +202,135 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         ),
         Span::raw(" "),
     ]);
-    f.render_widget(Paragraph::new(right).right_aligned(), area);
+
+    // The gap between the two is the widest empty space on the screen, and what
+    // belongs in it is the answer to "is anything wrong right now" — which the
+    // dashboard's own title bar can only give you while you are looking at the
+    // dashboard. Dropped rather than overlapped when the terminal is too narrow
+    // to hold all three: a collision reads as a bug, an absence reads as a
+    // small window.
+    let mid = workspace_tallies(state);
+    let width = |v: &[Span]| v.iter().map(|s| s.width()).sum::<usize>();
+    let mid_w = width(&mid);
+    if mid_w > 0 && width(&spans) + mid_w + width(&right) + 6 <= area.width as usize {
+        spans.push(Span::raw("    "));
+        spans.extend(mid);
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.surface)),
+        area,
+    );
+    f.render_widget(Paragraph::new(Line::from(right)).right_aligned(), area);
+}
+
+/// The workspace at a glance: how CI stands, and how much is uncommitted.
+///
+/// The same figures the dashboard's title bar used to carry, moved up a line so
+/// they survive walking into a run's logs — which is exactly when a second repo
+/// going red is easiest to miss.
+fn workspace_tallies(state: &AppState) -> Vec<Span<'static>> {
+    let theme = &state.theme;
+    let t = Tallies::of(state);
+    if state.repos.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![
+        Span::styled(format!("✓{}", t.ok), Style::default().fg(theme.success)),
+        Span::styled(format!("  ✗{}", t.fail), Style::default().fg(theme.failure)),
+    ];
+    if t.busy > 0 {
+        out.push(Span::styled(
+            format!("  ⏵{}", t.busy),
+            Style::default().fg(theme.warning).bold(),
+        ));
+    }
+    if t.broken > 0 {
+        out.push(Span::styled(
+            format!("  !{}", t.broken),
+            Style::default().fg(theme.failure).bold(),
+        ));
+    }
+    // Files, not repos: "3 repos have changes" is the number you already know
+    // from the column, and it does not tell you which way the afternoon went.
+    let dirty: usize = state
+        .repos
+        .iter()
+        .filter_map(|c| c.git.as_ref())
+        .map(|g| g.staged_count() + g.unstaged_count())
+        .sum();
+    if dirty > 0 {
+        out.push(Span::styled(
+            format!("   ◆{dirty} uncommitted"),
+            Style::default().fg(theme.accent),
+        ));
+    }
+    out
+}
+
+/// A path short enough for a header: home-relative, and no deeper than the two
+/// directories that actually distinguish it.
+///
+/// The full path is the same forty characters on every screen and answers a
+/// question nobody asks twice; the tail is what says which checkout you are in.
+fn short_path(p: &std::path::Path) -> String {
+    let full = p.display().to_string();
+    let shown = match dirs::home_dir().map(|h| h.display().to_string()) {
+        Some(home) if !home.is_empty() && full.starts_with(&home) => {
+            format!("~{}", &full[home.len()..])
+        }
+        _ => full,
+    };
+    let parts: Vec<&str> = shown.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 3 {
+        return shown;
+    }
+    format!("…/{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+}
+
+/// The API budget, as a share spent.
+///
+/// In the corner because it is not what you came to look at — right up until it
+/// is the only thing that matters, and by then a number you have to go and ask
+/// for is a number nobody asked for. The colour does the work: quiet while
+/// there is room, warming as it fills, red at the point where the useful move
+/// is to quit and let the hour run out.
+fn quota_spans(state: &AppState) -> Vec<Span<'static>> {
+    let theme = &state.theme;
+    let Some(q) = state.quota else {
+        return Vec::new();
+    };
+    let pct = q.percent();
+    let color = quota_color(theme, pct);
+    let mut style = Style::default().fg(color);
+    if q.is_critical() {
+        style = style.bold();
+    }
+    let mut spans = vec![Span::styled(format!("API {pct}%"), style)];
+    // The reset clock only once it is the answer to a question you now have:
+    // below the line it is noise, above it it is how long to stay away.
+    if q.is_critical() {
+        spans.push(Span::styled(
+            format!(" · till {}", q.reset.with_timezone(&Local).format("%H:%M")),
+            Style::default().fg(color),
+        ));
+    }
+    spans.push(Span::styled("   ", Style::default()));
+    spans
+}
+
+/// Quiet, then yellow, then red — reaching full red exactly where the alarm is.
+///
+/// A ramp rather than three steps: the number that matters is not 90, it is
+/// whether the last few polls moved it a lot, and a colour that is already
+/// halfway to red says that without arithmetic.
+fn quota_color(theme: &Theme, pct: u32) -> Color {
+    const CALM: u32 = 50;
+    if pct < CALM {
+        return theme.text_faint;
+    }
+    let t = (pct - CALM) as f64 / (CRITICAL_PERCENT - CALM) as f64;
+    mix(theme.warning, theme.failure, t)
 }
 
 /// A quarter-turn clock face counting down to the next poll.
@@ -235,6 +363,34 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     let km = &state.keymap;
     let editing = state.trigger_prompt.as_ref().map(|p| p.editing).unwrap_or(false);
+
+    // The push question owns the keyboard the same way, and its keys are not
+    // the working tree's.
+    if state.push_prompt.is_some() {
+        let spans = vec![
+            Span::raw(" "),
+            Span::styled("↵", Style::default().fg(theme.text_bright).bold()),
+            Span::raw(" "),
+            Span::styled("take the highlighted answer", Style::default().fg(theme.text_muted)),
+            Span::raw("  "),
+            Span::styled("y/n", Style::default().fg(theme.text_bright).bold()),
+            Span::raw(" "),
+            Span::styled("answer outright", Style::default().fg(theme.text_muted)),
+            Span::raw("  "),
+            Span::styled("←/→", Style::default().fg(theme.text_bright).bold()),
+            Span::raw(" "),
+            Span::styled("switch", Style::default().fg(theme.text_muted)),
+            Span::raw("  "),
+            Span::styled("Esc", Style::default().fg(theme.text_bright).bold()),
+            Span::raw(" "),
+            Span::styled("not now", Style::default().fg(theme.text_muted)),
+        ];
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.surface)),
+            area,
+        );
+        return;
+    }
 
     // The finder overlay owns the keyboard while it's up, so advertise its keys
     // instead of the view's.
@@ -553,36 +709,95 @@ fn render_empty(f: &mut Frame, area: Rect, theme: &Theme, glyph: &str, what: &st
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), box_area);
 }
 
-fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
-    let theme = &state.theme;
-    let (ok, fail, busy, broken) =
-        state.repos.iter().fold((0u32, 0u32, 0u32, 0u32), |(o, f, r, b), c| {
+/// The forge a row lives on, as one dim glyph before its name.
+///
+/// Dim on purpose: it is a label, not a status, and the row already has two
+/// columns whose job is to be noticed. A checkout with no remote we recognise
+/// gets blank space of the same width, so the names stay in one column —
+/// ragged left edges are harder to read down than a repeated mark.
+///
+/// Only GitHub today. `remote` is set from an origin the GitHub provider could
+/// parse, so its presence is the whole test; a second forge would add its glyph
+/// here and nothing else would move.
+fn forge_span(card: &crate::app::state::RepoCard, state: &AppState, theme: &Theme) -> Span<'static> {
+    if state.forge_icon.is_empty() {
+        return Span::raw("");
+    }
+    match card.remote {
+        Some(_) => Span::styled(
+            format!("{} ", state.forge_icon),
+            Style::default().fg(theme.text_faint),
+        ),
+        None => Span::raw(" ".repeat(state.forge_icon.chars().count() + 1)),
+    }
+}
+
+/// How the watched repos stand: the four numbers the header carries.
+#[derive(Debug, Clone, Copy, Default)]
+struct Tallies {
+    ok: u32,
+    fail: u32,
+    busy: u32,
+    /// Rows that could not be fetched at all — a state of jog, not of CI.
+    broken: u32,
+}
+
+impl Tallies {
+    fn of(state: &AppState) -> Self {
+        state.repos.iter().fold(Self::default(), |mut t, c| {
             if c.error.is_some() {
-                return (o, f, r, b + 1);
+                t.broken += 1;
+                return t;
             }
             match c.latest_status() {
-                Some(Status::Success) => (o + 1, f, r, b),
-                Some(Status::Failure) => (o, f + 1, r, b),
-                Some(Status::Running) | Some(Status::Queued) => (o, f, r + 1, b),
-                _ => (o, f, r, b),
+                Some(Status::Success) => t.ok += 1,
+                Some(Status::Failure) => t.fail += 1,
+                Some(Status::Running) | Some(Status::Queued) => t.busy += 1,
+                _ => {}
             }
-        });
-    // Panel name on the left, what the panel amounts to on the right.
-    let mut tallies = vec![
-        Span::styled(format!("✓{ok}"), Style::default().fg(theme.success)),
-        Span::styled(format!("  ✗{fail}"), Style::default().fg(theme.failure)),
-    ];
-    if busy > 0 {
-        tallies.push(Span::styled(
-            format!("  ⏵{busy}"),
-            Style::default().fg(theme.warning).bold(),
-        ));
+            t
+        })
     }
-    if broken > 0 {
-        tallies.push(Span::styled(
-            format!("  !{broken}"),
-            Style::default().fg(theme.failure).bold(),
-        ));
+}
+
+/// The one reason every broken row is broken, worded for a header.
+///
+/// `None` when the failures disagree — then no single line is true of all of
+/// them and the rows have to speak for themselves.
+fn shared_fault_detail(state: &AppState) -> Option<String> {
+    let mut errs = state.repos.iter().filter_map(|c| c.error.as_ref());
+    let first = errs.next()?;
+    if !errs.all(|e| e.fault == first.fault && e.text == first.text) {
+        return None;
+    }
+    let detail = match first.fault {
+        // A wait is only bad news until you know how long it is.
+        ApiFault::RateLimited => match state.quota.map(|q| q.reset).filter(|t| *t > Utc::now()) {
+            Some(t) => format!(
+                "rate limited · retry {}",
+                t.with_timezone(&Local).format("%H:%M")
+            ),
+            None => format!("rate limited · {}", ApiFault::RateLimited.detail()),
+        },
+        // Nothing canned to add — the message already is the specific one.
+        ApiFault::Other => first.text.clone(),
+        fault => format!("{} · {}", fault.label(), fault.detail()),
+    };
+    Some(truncate(&detail, 60))
+}
+
+fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
+    // The counts themselves live in the header now, where they outlive this
+    // view. What stays here is what only makes sense next to the rows.
+    let mut tallies: Vec<Span> = Vec::new();
+    // Eight rows saying "rate limited" are eight copies of one fact. The rows
+    // keep the label; the title bar, which has the width for it, says what to
+    // do about it — or when it stops being true.
+    if Tallies::of(state).broken > 0
+        && let Some(detail) = shared_fault_detail(state)
+    {
+        tallies.push(Span::styled(detail, Style::default().fg(theme.failure)));
     }
     // What a batch commit would take, up where the eye already is — the marks
     // are otherwise a column you have to scan for.
@@ -800,6 +1015,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
             // row costs the width the name needs.
             let shown = groups.short_name(&card.spec);
             let name_cell = Cell::from(Line::from(vec![
+                forge_span(card, state, theme),
                 Span::styled(shown, name_style),
                 if active {
                     Span::styled("  ●", Style::default().fg(theme.accent))
@@ -817,7 +1033,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                     local_cell(card),
                     changes_cell(card),
                     Cell::from(Span::styled(
-                        truncate(err, 46),
+                        truncate(&err.text, 46),
                         Style::default().fg(theme.failure),
                     )),
                 ]
@@ -1218,7 +1434,12 @@ fn render_activity_strip(
     let rows: Vec<Row> = entries
         .iter()
         .take(shown)
-        .map(|(card, detail)| {
+        .enumerate()
+        .map(|(i, (card, detail))| {
+            // Entries are grouped by repo, so a second line for the same repo is
+            // a second workflow on it. Dimming the repeated name says that
+            // without repeating it at full weight, which reads as two rows.
+            let repeat = i > 0 && entries[i - 1].0.spec == card.spec;
             let run = &detail.run;
             let running_job = detail.jobs.iter().find(|j| j.status == Status::Running);
 
@@ -1299,10 +1520,17 @@ fn render_activity_strip(
                     glyph,
                     Style::default().fg(theme.warning).bold(),
                 )),
-                Cell::from(Span::styled(
-                    truncate(&card.spec, 24),
-                    Style::default().fg(theme.text_bright).bold(),
-                )),
+                Cell::from(if repeat {
+                    Span::styled(
+                        truncate(&card.spec, 24),
+                        Style::default().fg(theme.text_ghost),
+                    )
+                } else {
+                    Span::styled(
+                        truncate(&card.spec, 24),
+                        Style::default().fg(theme.text_bright).bold(),
+                    )
+                }),
                 Cell::from(Line::from(vec![
                     Span::styled(
                         truncate(&run.display_title, 24),
@@ -2318,6 +2546,75 @@ fn render_commit_overlay(f: &mut Frame, area: Rect, state: &AppState) {
             "  ↵ commit · Esc cancel",
             Style::default().fg(theme.text_faint),
         )),
+    ];
+
+    f.render_widget(Clear, popup);
+    f.render_widget(block, popup);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The push question, centred over whatever raised it.
+///
+/// Two buttons rather than a key hint: the answer is a decision, and a decision
+/// wants something to point at. Yes is pre-selected, so the whole exchange is
+/// one Enter — the same key that finished the commit message a moment ago.
+fn render_push_prompt(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
+    let Some(p) = state.push_prompt.as_ref() else {
+        return;
+    };
+
+    let dialog_w = 46u16.min(area.width);
+    let dialog_h = 6u16.min(area.height);
+    let x = area.x + area.width.saturating_sub(dialog_w) / 2;
+    let y = area.y + area.height.saturating_sub(dialog_h) / 2;
+    let popup = Rect { x, y, width: dialog_w, height: dialog_h };
+
+    let accent = theme.accent;
+    let block = Block::default()
+        .title(Span::styled(" Push? ", Style::default().fg(accent).bold()))
+        .title_alignment(ratatui::layout::Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent));
+    let inner = block.inner(popup);
+
+    // A first push creates the remote branch. That is a different act from
+    // adding to one that exists, and worth saying before it happens.
+    let what = if p.has_upstream {
+        format!("committed — push {} to origin?", p.branch)
+    } else {
+        format!("committed — publish {} to origin?", p.branch)
+    };
+    let button = |label: &str, selected: bool| {
+        if selected {
+            Span::styled(
+                format!("  {label}  "),
+                Style::default().bg(accent).fg(theme.surface).bold(),
+            )
+        } else {
+            Span::styled(format!("  {label}  "), Style::default().fg(theme.text_muted))
+        }
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(
+            truncate(&what, inner.width as usize),
+            Style::default().fg(theme.text_bright),
+        ))
+        .centered(),
+        Line::from(""),
+        Line::from(vec![
+            button("Yes", p.yes),
+            Span::raw("   "),
+            button("No", !p.yes),
+        ])
+        .centered(),
+        Line::from(Span::styled(
+            "↵ take it · ←/→ switch · Esc not now",
+            Style::default().fg(theme.text_faint),
+        ))
+        .centered(),
     ];
 
     f.render_widget(Clear, popup);
@@ -3616,6 +3913,7 @@ fn relative_styled(t: chrono::DateTime<Utc>, theme: &Theme) -> (String, Style) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::github::ApiError;
     use chrono::TimeZone;
 
     /// Draw the Logs pane into an off-screen terminal and return it as text,
@@ -3760,6 +4058,69 @@ mod tests {
         st.git_view = Some(gv);
         st.view = View::GitStatus;
         st
+    }
+
+    /// A budget `pct` spent, refilling at `reset`.
+    fn quota_at(pct: u32, reset: chrono::DateTime<Utc>) -> crate::provider::github::Quota {
+        crate::provider::github::Quota { limit: 100, used: pct, reset }
+    }
+
+    /// The push question over an open working tree, as it is drawn.
+    fn push_prompt_screen(has_upstream: bool) -> (String, ratatui::buffer::Buffer) {
+        let mut st = state_with_op(GitOp::new("commit", None, 0));
+        st.git_ops.clear();
+        st.push_prompt = Some(crate::app::state::PushPrompt {
+            spec: "acme/api".into(),
+            branch: "main".into(),
+            has_upstream,
+            yes: true,
+        });
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 14)).unwrap();
+        term.draw(|f| render(f, &st)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, buf)
+    }
+
+    /// Background of the first cell of `word`, wherever it is on screen.
+    fn bg_of(buf: &ratatui::buffer::Buffer, word: &str) -> Color {
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if let Some(i) = row.find(word) {
+                return buf[(i as u16, y)].bg;
+            }
+        }
+        panic!("{word} is not on screen");
+    }
+
+    #[test]
+    fn a_landed_commit_puts_the_push_question_in_the_middle_of_the_screen() {
+        let (text, buf) = push_prompt_screen(true);
+        assert!(text.contains("Push?"), "{text}");
+        assert!(text.contains("push main to origin?"), "{text}");
+        // Yes is the answer wearing the highlight, so Enter is visibly safe —
+        // a default you have to read the hint line to learn is not a default.
+        let theme = Theme::default();
+        assert_eq!(bg_of(&buf, "Yes"), theme.accent);
+        assert_ne!(bg_of(&buf, "No"), theme.accent);
+        // The keys on offer are the box's, not the working tree's underneath.
+        assert!(text.contains("Esc") && !text.contains("stage"), "{text}");
+    }
+
+    #[test]
+    fn a_first_push_says_it_is_creating_the_branch() {
+        // "push main" and "publish main" are different acts, and only one of
+        // them puts a new branch on the remote for everyone else to see.
+        let (text, _) = push_prompt_screen(false);
+        assert!(text.contains("publish main to origin?"), "{text}");
     }
 
     #[test]
@@ -3955,7 +4316,7 @@ mod tests {
 
         st.run_progress.insert(
             "muufree/backend".into(),
-            crate::provider::RunDetail {
+            vec![crate::provider::RunDetail {
                 run: st.repos[0].runs[0].clone(),
                 jobs: vec![a_job(
                     "build",
@@ -3966,14 +4327,14 @@ mod tests {
                         ("Push image", Status::Queued),
                     ],
                 )],
-            },
+            }],
         );
         st.run_progress.insert(
             "muufree/cms".into(),
-            crate::provider::RunDetail {
+            vec![crate::provider::RunDetail {
                 run: st.repos[1].runs[0].clone(),
                 jobs: Vec::new(),
-            },
+            }],
         );
         st
     }
@@ -4007,6 +4368,34 @@ mod tests {
         // 1:42 in — a deploy that has been going too long has to be visible.
         assert!(out.contains("1:42"), "got:\n{out}");
         assert!(out.contains("2 in flight"), "got:\n{out}");
+    }
+
+    #[test]
+    fn a_repo_running_two_workflows_gets_a_line_for_each() {
+        // One push commonly starts CI and a deploy at once. A strip that names
+        // only the first says "1 in flight" while the repo's Actions tab says
+        // two, and the run you are actually waiting on can be the hidden one.
+        let mut st = dashboard_with_live_ci();
+        let second = a_run(11, "CI for Backend", Status::Running, 61);
+        st.repos[0].runs.push(second.clone());
+        st.run_progress.get_mut("muufree/backend").unwrap().push(
+            crate::provider::RunDetail {
+                run: second,
+                jobs: vec![a_job("test (3.13)", &[("Run tests with pytest", Status::Running)])],
+            },
+        );
+
+        let out = draw_repos(&st, 150, 16);
+        assert!(out.contains("3 in flight"), "got:\n{out}");
+        assert!(out.contains("Deploy to Stage"), "got:\n{out}");
+        assert!(out.contains("CI for Backend"), "got:\n{out}");
+        // Both lines carry the repo they belong to; the second is just quieter.
+        let strip: String = out
+            .lines()
+            .skip_while(|l| !l.contains("in flight"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(strip.matches("muufree/backend").count(), 2, "got:\n{out}");
     }
 
     #[test]
@@ -4348,6 +4737,198 @@ mod tests {
             st.repos[2].changed_tick = None;
             row_bg(&st, "muufree/backend")
         });
+    }
+
+    /// Every row turned away by the same exhausted quota.
+    fn dashboard_out_of_quota() -> AppState {
+        let mut st = dashboard_with_live_ci();
+        st.run_progress.clear();
+        for card in st.repos.iter_mut() {
+            card.runs.clear();
+            card.error = Some(ApiError {
+                fault: ApiFault::RateLimited,
+                text: ApiFault::RateLimited.label().into(),
+            });
+        }
+        st
+    }
+
+    /// The header line of the dashboard, as drawn.
+    fn draw_header(state: &AppState, w: u16) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 1)).unwrap();
+        term.draw(|f| render_header(f, f.area(), state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect()
+    }
+
+    #[test]
+    fn the_api_budget_sits_in_the_corner_and_warms_as_it_fills() {
+        let theme = Theme::default();
+        // Quiet while there is room: this is not what you came to look at.
+        assert_eq!(quota_color(&theme, 0), theme.text_faint);
+        assert_eq!(quota_color(&theme, 49), theme.text_faint);
+        // Then a ramp, arriving at full red exactly where the alarm goes off,
+        // so the colour and the sound are saying the same thing.
+        assert_eq!(quota_color(&theme, 50), theme.warning);
+        assert_eq!(quota_color(&theme, CRITICAL_PERCENT), theme.failure);
+        assert_eq!(quota_color(&theme, 100), theme.failure);
+        let mid = quota_color(&theme, 70);
+        assert_ne!(mid, theme.warning);
+        assert_ne!(mid, theme.failure);
+    }
+
+    #[test]
+    fn the_reset_clock_shows_up_only_once_it_is_the_question() {
+        let mut st = dashboard_with_live_ci();
+        st.quota = Some(quota_at(40, Utc::now() + chrono::Duration::minutes(23)));
+        let calm = draw_header(&st, 120);
+        assert!(calm.contains("API 40%"), "{calm}");
+        assert!(!calm.contains("till"), "a clock you have no use for is noise: {calm}");
+
+        // Past the line the number stops being trivia and becomes a plan: this
+        // is how long to stay out of jog.
+        let at = Local::now() + chrono::Duration::minutes(23);
+        st.quota = Some(quota_at(94, Utc::now() + chrono::Duration::minutes(23)));
+        let hot = draw_header(&st, 120);
+        assert!(hot.contains("API 94%"), "{hot}");
+        assert!(hot.contains(&format!("till {}", at.format("%H:%M"))), "{hot}");
+    }
+
+    #[test]
+    fn a_budget_we_have_not_read_yet_shows_nothing_rather_than_zero() {
+        let st = dashboard_with_live_ci();
+        assert!(st.quota.is_none());
+        // "API 0%" would be a lie about a number we do not have, and the most
+        // reassuring possible one.
+        assert!(!draw_header(&st, 120).contains("API"));
+    }
+
+    #[test]
+    fn every_repo_wears_the_mark_of_the_forge_it_lives_on() {
+        let mut st = dashboard_with_live_ci();
+        st.repos[2].remote = None; // a checkout with no GitHub origin
+        let out = draw_repos(&st, 150, 12);
+        let line = |name: &str| {
+            out.lines()
+                .find(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("{name} is not on screen"))
+                .to_string()
+        };
+        assert!(line("backend").contains(crate::app::state::DEFAULT_FORGE_ICON));
+        assert!(!line("website").contains(crate::app::state::DEFAULT_FORGE_ICON));
+        // The row without a mark still starts where the others do — a ragged
+        // left edge is harder to read down a list than a repeated glyph.
+        // Counted in columns, not bytes: the glyph is three bytes wide and one
+        // column, which is the whole reason it lines up at all.
+        let col = |name: &str| {
+            let l = line(name);
+            l[..l.find(name).unwrap()].chars().count()
+        };
+        assert_eq!(col("backend"), col("website"));
+    }
+
+    #[test]
+    fn a_terminal_without_the_font_can_turn_the_marks_off() {
+        let mut st = dashboard_with_live_ci();
+        st.forge_icon = String::new();
+        let out = draw_repos(&st, 150, 12);
+        assert!(!out.contains(crate::app::state::DEFAULT_FORGE_ICON));
+        // And the width it was taking goes back to the names.
+        let with_icon = draw_repos(&dashboard_with_live_ci(), 150, 12);
+        let col = |s: &str| {
+            let l = s.lines().find(|l| l.contains("backend")).unwrap();
+            l[..l.find("muufree").unwrap()].chars().count()
+        };
+        assert!(col(&out) < col(&with_icon));
+    }
+
+    /// A dashboard scanned out of a deep workspace path, one repo dirty.
+    fn workspace_dashboard() -> AppState {
+        let mut st = dashboard_with_live_ci();
+        st.workspace_root = Some(std::path::PathBuf::from("/data/repos/muufree/github"));
+        st.repos[1].git = Some(crate::git::parse_status("## main\0M  a.rs\0 M b.rs\0 M c.rs\0"));
+        st
+    }
+
+    #[test]
+    fn the_header_carries_how_the_workspace_stands() {
+        let out = draw_header(&workspace_dashboard(), 130);
+        // The counts the dashboard's title bar used to hold — up a line, so
+        // they are still there when you are three views deep in a run's logs
+        // and a second repo goes red behind you.
+        assert!(out.contains("✓1"), "{out}");
+        assert!(out.contains("⏵2"), "{out}");
+        assert!(out.contains("◆3 uncommitted"), "{out}");
+        // And the dashboard no longer says the same numbers one line below.
+        let full = draw_repos(&workspace_dashboard(), 130, 10);
+        let title = full.lines().find(|l| l.contains("Repos  3")).unwrap();
+        assert!(!title.contains("✓1"), "said twice, one line apart: {title}");
+    }
+
+    #[test]
+    fn the_header_gives_up_the_middle_before_it_collides() {
+        // Narrow enough that all three blocks cannot coexist. Dropping the
+        // middle reads as a small window; overlapping it reads as a bug.
+        let out = draw_header(&workspace_dashboard(), 78);
+        assert!(!out.contains("uncommitted"), "{out}");
+        assert!(out.contains("12"), "the clock and the path survive: {out}");
+        assert!(out.contains("github"), "{out}");
+    }
+
+    #[test]
+    fn a_deep_path_keeps_only_the_part_that_says_which_checkout() {
+        let p = std::path::Path::new("/data/repos/muufree/github");
+        assert_eq!(short_path(p), "…/muufree/github");
+        // Short enough to be worth saying in full.
+        assert_eq!(short_path(std::path::Path::new("/srv/code")), "/srv/code");
+        // Home is a prefix everyone already knows the expansion of.
+        if let Some(home) = dirs::home_dir() {
+            let deep = home.join("a/b/c/d");
+            assert_eq!(short_path(&deep), "…/c/d");
+            assert_eq!(short_path(&home.join("work")), "~/work");
+        }
+    }
+
+    #[test]
+    fn a_broken_row_shows_the_cause_not_the_call_that_hit_it() {
+        let out = draw_repos(&dashboard_out_of_quota(), 150, 12);
+        // The whole complaint: the cell is ~20 columns wide, so spending them
+        // on the call we made ("list all repo runs: Gi…") says nothing at all.
+        assert!(out.contains("rate limited"), "{out}");
+        assert!(!out.contains("list all repo runs"), "{out}");
+    }
+
+    #[test]
+    fn one_shared_cause_is_stated_once_with_the_clock_attached() {
+        let mut st = dashboard_out_of_quota();
+        st.quota = Some(quota_at(40, Utc::now() + chrono::Duration::minutes(12)));
+        let at = Local::now() + chrono::Duration::minutes(12);
+        let out = draw_repos(&st, 150, 12);
+        // Three rows can only repeat "rate limited". The header is where there
+        // is room to say when it stops being true.
+        assert!(
+            out.contains(&format!("retry {}", at.format("%H:%M"))),
+            "{out}"
+        );
+
+        // A reset that has already passed is worse than none — it dates the
+        // screen to a moment that is over.
+        st.quota = Some(quota_at(40, Utc::now() - chrono::Duration::minutes(1)));
+        assert!(!draw_repos(&st, 150, 12).contains("retry"));
+    }
+
+    #[test]
+    fn rows_that_broke_differently_get_no_shared_headline() {
+        let mut st = dashboard_out_of_quota();
+        st.repos[1].error = Some(ApiError {
+            fault: ApiFault::NotFound,
+            text: ApiFault::NotFound.label().into(),
+        });
+        // No one line is true of all three, so the header stays at the count
+        // and lets the rows disagree in their own cells.
+        assert!(shared_fault_detail(&st).is_none());
+        let out = draw_repos(&st, 150, 12);
+        assert!(out.contains("rate limited") && out.contains("not found"), "{out}");
     }
 
     #[test]

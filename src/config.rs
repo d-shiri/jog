@@ -43,6 +43,17 @@ pub struct UiConfig {
     /// Empty means use the bundled fail sound.
     #[serde(default)]
     pub fail_sound: String,
+    /// Glyph drawn to the left of every repo that lives on GitHub.
+    ///
+    /// Unset uses the bundled Nerd Font mark; set it to `""` to turn the icons
+    /// off, or to any string of your own — a terminal without a patched font
+    /// draws the default as an empty box.
+    #[serde(default)]
+    pub github_icon: Option<String>,
+    /// Sound file played when the GitHub API budget is nearly spent.
+    /// Empty means use the bundled quota alarm.
+    #[serde(default)]
+    pub quota_sound: String,
     /// Which finished runs to announce: `always`, `failure`, or `never`.
     #[serde(default = "default_notify")]
     pub notify: String,
@@ -72,6 +83,8 @@ impl Default for UiConfig {
             favorites: Vec::new(),
             complete_sound: String::new(),
             fail_sound: String::new(),
+            quota_sound: String::new(),
+            github_icon: None,
             notify: default_notify(),
             notify_sound: true,
             notify_desktop: true,

@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+
 use ratatui::text::{Line, Span};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 
@@ -9,6 +10,7 @@ use rayon::prelude::*;
 use crate::config::KeymapConfig;
 use crate::git::RepoStatus;
 use crate::history::History;
+use crate::provider::github::{ApiError, Quota};
 use crate::provider::{Run, RunDetail, Status, Workflow};
 
 
@@ -49,6 +51,33 @@ pub enum View {
     Diff,
     /// One message committed across several repos, one repo at a time.
     BatchCommit,
+}
+
+/// GitHub's mark, as a Nerd Font glyph. Overridable, because a terminal without
+/// a patched font draws it as a box — see `ui.github_icon`.
+pub const DEFAULT_FORGE_ICON: &str = "\u{f09b}";
+
+/// The question a landed commit raises: push it?
+///
+/// A commit nobody pushed is invisible to CI and to everyone else, so the answer
+/// is almost always yes — which is why it should cost one keystroke you are
+/// already reaching for rather than one you have to remember.
+#[derive(Debug, Clone)]
+pub struct PushPrompt {
+    /// Repo the commit landed in.
+    pub spec: String,
+    /// Branch the push would go to, captured when the commit landed.
+    ///
+    /// The prompt carries this rather than re-reading the working tree because
+    /// the status refresh a commit triggers is still in flight when the question
+    /// appears: asking then would find the pre-commit ahead count and conclude
+    /// there is nothing to push, one keystroke after there demonstrably is.
+    pub branch: String,
+    /// False when this branch has never been pushed — the push would create it,
+    /// which is worth saying out loud before it happens.
+    pub has_upstream: bool,
+    /// The highlighted answer. Starts on yes; Enter takes it.
+    pub yes: bool,
 }
 
 /// The working-tree view for one local checkout: stage, commit, push, then hand
@@ -605,7 +634,7 @@ pub struct RepoCard {
     pub path: Option<PathBuf>,
     pub runs: Vec<Run>,
     /// Set when the last fetch for this repo failed (bad name, no access, …).
-    pub error: Option<String>,
+    pub error: Option<ApiError>,
     pub loaded: bool,
     /// Working-tree state, refreshed alongside the run list. Only ever `Some`
     /// for rows with a local checkout.
@@ -662,14 +691,16 @@ impl RepoCard {
         self.runs.first().map(|r| r.status)
     }
 
-    /// The newest run that hasn't settled yet — what the activity strip follows.
+    /// Every run that hasn't settled yet — what the activity strip follows.
     ///
-    /// Not just `runs.first()`: a repo can push a new commit while an older run
-    /// is still going, and the freshly *queued* one is the one worth watching.
-    pub fn active_run(&self) -> Option<&Run> {
+    /// All of them, not just the newest: one push commonly starts several
+    /// workflows (CI, a deploy, a review bot), and reporting only the first
+    /// would have the strip say "one run" while the repo's Actions tab says
+    /// three.
+    pub fn active_runs(&self) -> impl Iterator<Item = &Run> {
         self.runs
             .iter()
-            .find(|r| matches!(r.status, Status::Running | Status::Queued))
+            .filter(|r| matches!(r.status, Status::Running | Status::Queued))
     }
 
     /// Counts across the loaded runs: (success, failure, in-flight).
@@ -1292,6 +1323,11 @@ pub struct AppState {
     pub needs_clear: bool,
     pub trigger_prompt: Option<TriggerPrompt>,
     pub keymap: KeymapConfig,
+    /// Glyph marking which forge a repo lives on, drawn to the left of every
+    /// row that has one. Empty hides the column's worth of width entirely —
+    /// the default is a Nerd Font glyph, and a terminal without one would
+    /// otherwise show a box where the logo should be.
+    pub forge_icon: String,
     pub history: History,
     pub theme: Theme,
     /// Run IDs we have seen in a non-terminal state during this Watch session.
@@ -1300,6 +1336,18 @@ pub struct AppState {
     /// Multi-repo dashboard rows, in configured order.
     pub repos: Vec<RepoCard>,
     pub repo_cursor: usize,
+    /// What is left of the hour's API budget, re-read once per poll.
+    ///
+    /// Every view spends from the same bucket, so this is read on the poll tick
+    /// rather than per view: the number is only a warning if it keeps counting
+    /// while you are off reading logs.
+    pub quota: Option<Quota>,
+    /// A quota read is in flight. Every dashboard row fails in the same tick, so
+    /// without this the one question gets asked once per repo.
+    pub quota_pending: bool,
+    /// The alarm has already sounded for this hour's budget. Cleared when the
+    /// quota resets, so the next hour can raise it again — and only once.
+    pub quota_alarmed: bool,
     /// Repos marked on the dashboard, by spec. Only ever fed to the batch —
     /// marking is inert until a batch is started, so it can't surprise anyone.
     pub repo_marks: HashSet<String>,
@@ -1309,6 +1357,9 @@ pub struct AppState {
     pub finder: Option<Finder>,
     /// Working-tree view for the repo we drilled into from the dashboard.
     pub git_view: Option<GitView>,
+    /// The push question a landed commit raised. Owns the keyboard while it is
+    /// up, like the message box it follows.
+    pub push_prompt: Option<PushPrompt>,
     /// Running and failed commits/pushes, keyed by repo.
     ///
     /// Held here rather than on `GitView` so a hook's output outlives the view
@@ -1335,12 +1386,17 @@ pub struct AppState {
     /// tell "nothing has changed" from "nothing has been fetched yet".
     pub poll_ticks: u64,
     pub last_poll_tick: u64,
-    /// Jobs and steps of the in-flight run on each dashboard row, keyed by repo.
+    /// Jobs and steps of the in-flight runs on each dashboard row, keyed by
+    /// repo.
     ///
     /// The row itself can only say *that* CI is going; this is what lets the
-    /// strip at the bottom say which workflow and which step. Entries are
-    /// dropped the moment a run settles, so the strip appears and clears itself.
-    pub run_progress: HashMap<String, RunDetail>,
+    /// strip at the bottom say which workflow and which step. A repo can have
+    /// several workflows going at once — a push fans out to CI, a deploy, and a
+    /// review bot — so this is a list per repo, not a single run: collapsing
+    /// them would leave the strip claiming one workflow is the whole story.
+    /// Entries are dropped the moment a run settles, so the strip appears and
+    /// clears itself.
+    pub run_progress: HashMap<String, Vec<RunDetail>>,
 }
 
 impl AppState {
@@ -1402,15 +1458,20 @@ impl AppState {
             needs_clear: false,
             trigger_prompt: None,
             keymap,
+            forge_icon: DEFAULT_FORGE_ICON.to_string(),
             history,
             theme: Theme::default(),
             watch_seen_running: HashSet::new(),
             repos: Vec::new(),
             repo_cursor: 0,
+            quota: None,
+            quota_pending: false,
+            quota_alarmed: false,
             repo_marks: HashSet::new(),
             batch: None,
             finder: None,
             git_view: None,
+            push_prompt: None,
             git_ops: HashMap::new(),
             git_diff: None,
             last_diff_viewport_height: Cell::new(0),
@@ -1424,15 +1485,18 @@ impl AppState {
         }
     }
 
-    /// Dashboard rows with CI in flight, in the order the table lists them.
+    /// Runs in flight across the dashboard, in the order the table lists their
+    /// rows — and, within a row, the order the repo's run list gives.
     ///
     /// Table order rather than "most recently started" so a row and its strip
-    /// entry stay in the same relative place — a list that reshuffles itself
-    /// every poll is unreadable at a glance.
+    /// entries stay in the same relative place — a list that reshuffles itself
+    /// every poll is unreadable at a glance. A repo running two workflows
+    /// contributes two entries; that is the point.
     pub fn active_progress(&self) -> Vec<(&RepoCard, &RunDetail)> {
         self.repos
             .iter()
-            .filter_map(|c| self.run_progress.get(&c.spec).map(|d| (c, d)))
+            .filter_map(|c| self.run_progress.get(&c.spec).map(|ds| (c, ds)))
+            .flat_map(|(c, ds)| ds.iter().map(move |d| (c, d)))
             .filter(|(_, d)| !d.run.status.is_terminal())
             .collect()
     }

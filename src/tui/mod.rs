@@ -20,13 +20,15 @@ use tokio::sync::mpsc;
 use rayon::prelude::*;
 
 use crate::app::state::{
-    AppState, BatchCommit, BatchPhase, DetailItem, Finder, FinderKind, GitOp, RepoCard, Theme,
-    TriggerPrompt, View, build_detail_items,
+    AppState, BatchCommit, BatchPhase, DetailItem, Finder, FinderKind, GitOp, PushPrompt, RepoCard,
+    Theme, TriggerPrompt, View, build_detail_items,
 };
 use crate::config::KeymapConfig;
 use crate::config::{Config, NotifyMode};
 use crate::history::History;
-use crate::provider::github::{GitHubProvider, RepoSpec, current_branch};
+use crate::provider::github::{
+    ApiError, ApiFault, GitHubProvider, Quota, RepoSpec, classify_error, current_branch,
+};
 use crate::provider::{Provider, Run, RunDetail, Status, Step, Workflow};
 
 mod motion;
@@ -42,7 +44,10 @@ pub enum AppEvent {
     /// Recent runs for one row of the multi-repo dashboard.
     RepoCardLoaded(String, Vec<Run>),
     /// A dashboard row could not be fetched (typo, no access, network).
-    RepoCardFailed(String, String),
+    RepoCardFailed(String, ApiError),
+    /// What is left of the hour's API budget. `None` when even that could not
+    /// be read — the meter goes blank rather than lying about a stale figure.
+    QuotaLoaded(Option<Quota>),
     /// Jobs and steps of the run currently in flight on one dashboard row —
     /// what the activity strip needs to name the step, not just the workflow.
     RepoProgressLoaded(String, RunDetail),
@@ -100,6 +105,9 @@ pub async fn run(
     );
 
     state.log_focus_context = config.ui.log_focus_context;
+    if let Some(icon) = config.ui.github_icon.clone() {
+        state.forge_icon = icon;
+    }
     resolve_theme(&mut state, &config);
     state.workspace_root = opts.workspace_root.clone();
     state.repos = if opts.workspace.is_empty() {
@@ -517,6 +525,13 @@ async fn event_loop(
                         state.pending = state.pending.saturating_sub(1);
                     }
                     AppEvent::RepoCardFailed(spec, err) => {
+                        // "rate limited" alone leaves the one question it raises
+                        // unanswered, and the rejection doesn't carry the clock.
+                        // Re-read rather than trust the last poll's figure:
+                        // being turned away is itself news about the budget.
+                        if err.fault == ApiFault::RateLimited {
+                            spawn_quota_probe(&provider, state, &tx);
+                        }
                         if let Some(card) = state.repos.iter_mut().find(|c| c.spec == spec) {
                             card.error = Some(err);
                             card.loaded = true;
@@ -527,19 +542,32 @@ async fn event_loop(
                         state.run_progress.remove(&spec);
                         state.pending = state.pending.saturating_sub(1);
                     }
+                    AppEvent::QuotaLoaded(q) => {
+                        // Cleared even when the answer is `None`: a read that
+                        // failed must not wedge the flag and mute every retry.
+                        state.quota_pending = false;
+                        if let Some(q) = q
+                            && record_quota(state, q)
+                        {
+                            play_quota_alarm(&config);
+                        }
+                    }
                     AppEvent::RepoProgressLoaded(spec, detail) => {
-                        // Only fold in detail for the run the row is still
-                        // waiting on: a push during the fetch means this answer
+                        // Only fold in detail for a run the row is still waiting
+                        // on: a push during the fetch means this answer
                         // describes a run that has already been superseded.
-                        let current = state
-                            .run_progress
-                            .get(&spec)
-                            .is_some_and(|d| d.run.id == detail.run.id);
-                        if current {
+                        if let Some(ds) = state.run_progress.get_mut(&spec)
+                            && let Some(i) = ds.iter().position(|d| d.run.id == detail.run.id)
+                        {
                             if detail.run.status.is_terminal() {
-                                state.run_progress.remove(&spec);
+                                ds.remove(i);
                             } else {
-                                state.run_progress.insert(spec, detail);
+                                ds[i] = detail;
+                            }
+                            // Never leave an empty list behind: the strip asks
+                            // whether the key is there at all.
+                            if ds.is_empty() {
+                                state.run_progress.remove(&spec);
                             }
                         }
                     }
@@ -591,6 +619,10 @@ async fn event_loop(
                             gv.busy = false;
                         }
                         let viewport = state.last_op_viewport_height.get().max(1) as usize;
+                        // Read before the entry is removed below: what the op
+                        // was is the difference between a commit worth offering
+                        // to push and a `git add` that changed nothing outside.
+                        let verb = state.git_ops.get(&spec).map(|o| o.verb.clone());
                         let had_op = match state.git_ops.entry(spec.clone()) {
                             std::collections::hash_map::Entry::Occupied(mut e) => {
                                 if failed {
@@ -635,6 +667,9 @@ async fn event_loop(
                             Err(err) => state.set_status(err),
                         }
                         state.pending = state.pending.saturating_sub(1);
+                        if !failed && verb.as_deref() == Some("commit") {
+                            offer_push(state, &spec);
+                        }
                         // The working tree moved; re-read it.
                         if let Some(gv) = state.git_view.as_ref() {
                             let (spec, path) = (gv.spec.clone(), gv.path.clone());
@@ -687,6 +722,11 @@ async fn event_loop(
                 if now.duration_since(last_poll) >= poll_interval {
                     last_poll = now;
                     state.last_poll_tick = state.tick_count;
+                    // Outside the view match below: every view spends from the
+                    // same bucket, and a meter that stops moving when you walk
+                    // into the logs is worse than none — that is exactly where
+                    // the budget goes.
+                    spawn_quota_probe(&provider, state, &tx);
                     // The finder holds indices into the list it was opened over.
                     // Refreshing that list underneath it would shift every index,
                     // so Enter would commit to whatever slid into the slot.
@@ -761,6 +801,12 @@ async fn handle_key(
         && state.git_view.as_ref().is_some_and(|g| g.commit_input.is_some())
     {
         handle_commit_input(state, key, tx);
+        return None;
+    }
+    // The push question the commit just raised, likewise: it is on screen
+    // because it is the next thing to decide.
+    if state.push_prompt.is_some() {
+        handle_push_prompt(state, key, tx);
         return None;
     }
     // Same for the one message a batch commit is about to apply everywhere.
@@ -2231,6 +2277,100 @@ fn open_git_view_for_paused(state: &mut AppState, tx: &mpsc::UnboundedSender<App
 ///
 /// This is the step that makes a commit visible to CI: `workflow_dispatch` runs
 /// against the remote, so triggering before pushing would run the *old* code.
+/// Ask, the moment a commit lands, whether to push it.
+///
+/// Committing and pushing are one intention split across two keys, and the
+/// second one is the one that gets forgotten — a repo sitting one commit ahead
+/// is invisible to CI and to everyone else. So the question comes to you, with
+/// yes already selected.
+fn offer_push(state: &mut AppState, spec: &str) {
+    // Only for the repo on screen. A batch walks repos you are not looking at
+    // and asks its own push question once, at the end.
+    if state.batch.is_some() {
+        return;
+    }
+    let Some(gv) = state.git_view.as_ref().filter(|g| g.spec == spec) else {
+        return;
+    };
+    let Some(status) = gv.status.as_ref() else {
+        return;
+    };
+    // `push --set-upstream origin HEAD` while detached would create a remote
+    // branch literally named `HEAD`, so there is no push here to offer.
+    if status.detached {
+        return;
+    }
+    // Somewhere to push to: either git already knows one, or the row was
+    // scanned from a GitHub remote. Without either, yes would only produce an
+    // error, and a dialog whose default answer fails is worse than no dialog.
+    let known_remote = state
+        .repos
+        .iter()
+        .any(|c| c.spec == spec && c.remote.is_some());
+    if !status.has_upstream && !known_remote {
+        return;
+    }
+    state.push_prompt = Some(PushPrompt {
+        spec: spec.to_string(),
+        branch: status.branch.clone(),
+        has_upstream: status.has_upstream,
+        yes: true,
+    });
+}
+
+/// Enter takes the highlighted answer, ←/→ move between them, Esc means no.
+fn handle_push_prompt(state: &mut AppState, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+    let set_yes = |state: &mut AppState, yes: bool| {
+        if let Some(p) = state.push_prompt.as_mut() {
+            p.yes = yes;
+        }
+    };
+    match key.code {
+        // The answer named outright, without walking to it first.
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            set_yes(state, true);
+            accept_push_prompt(state, tx);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => state.push_prompt = None,
+        KeyCode::Enter => accept_push_prompt(state, tx),
+        KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Char('h')
+        | KeyCode::Char('l') => {
+            let yes = state.push_prompt.as_ref().is_some_and(|p| p.yes);
+            set_yes(state, !yes);
+        }
+        // Everything else is swallowed: the box is a question, and a keystroke
+        // meant for the screen behind it would answer something else instead.
+        _ => {}
+    }
+}
+
+/// Push what the prompt was raised about, or drop it if the answer was no.
+fn accept_push_prompt(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
+    let Some(p) = state.push_prompt.take() else {
+        return;
+    };
+    if !p.yes {
+        return;
+    }
+    // The push runs through the open working-tree view, so a view that has
+    // moved on means this answer is about a repo that is no longer in front of
+    // it — drop it rather than push the wrong one.
+    if state.git_view.as_ref().is_none_or(|g| g.spec != p.spec) {
+        return;
+    }
+    // Not `push_current`: that re-reads a working tree whose refresh is still in
+    // flight, and would find the ahead count from before the commit landed.
+    let (branch, has_upstream) = (p.branch.clone(), p.has_upstream);
+    state.set_status(format!("pushing {branch}…"));
+    spawn_git_op_streaming(state, tx, "push", "pre-push", move |dir, out| {
+        crate::git::push(dir, &branch, has_upstream, out)
+    });
+}
+
 fn push_current(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
     let Some(gv) = state.git_view.as_ref() else {
         return;
@@ -2805,19 +2945,68 @@ fn spawn_fetch_repo_cards(
         tokio::spawn(async move {
             let evt = match p.list_repo_runs(20).await {
                 Ok(runs) => AppEvent::RepoCardLoaded(label, runs),
-                // `{:#}` walks the anyhow chain — the outermost context alone is
-                // just "list all repo runs", which tells the user nothing.
-                Err(e) => AppEvent::RepoCardFailed(label, format!("{e:#}")),
+                // Not `{e:#}`: that chain reads outermost-first, so a cell wide
+                // enough for three words spends them on "list all repo runs".
+                Err(e) => AppEvent::RepoCardFailed(label, classify_error(&e)),
             };
             let _ = tx2.send(evt);
         });
     }
 }
 
-/// Follow the in-flight run on one dashboard row down to its jobs and steps.
+/// Take a new budget reading, and say whether it is worth making a noise about.
+///
+/// The alarm is once per hour's budget, not once per poll: a warning that
+/// repeats every few seconds is one you turn off, and then it is not a warning.
+/// It re-arms when the quota resets, because a dashboard left open all day would
+/// otherwise get exactly one warning in the morning.
+fn record_quota(state: &mut AppState, q: Quota) -> bool {
+    let alarm = q.is_critical() && !state.quota_alarmed;
+    state.quota_alarmed = q.is_critical();
+    state.quota = Some(q);
+    if alarm {
+        state.set_status(format!(
+            "{}% of the GitHub API budget spent — quit jog until {} to keep the rest",
+            q.percent(),
+            q.reset.with_timezone(&chrono::Local).format("%H:%M")
+        ));
+    }
+    alarm
+}
+
+/// Re-read the API budget: what the header meter shows, and what tells a
+/// rate-limited dashboard how long it will stay that way.
+///
+/// Free of the budget it reports, but not of a round trip — so it goes out once
+/// per poll, never once per row.
+fn spawn_quota_probe(
+    provider: &Arc<GitHubProvider>,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    if state.quota_pending {
+        return;
+    }
+    state.quota_pending = true;
+    let (p, tx) = (provider.clone(), tx.clone());
+    tokio::spawn(async move {
+        let _ = tx.send(AppEvent::QuotaLoaded(p.quota().await.ok()));
+    });
+}
+
+/// How many concurrent runs one dashboard row is followed down to its steps.
+///
+/// Every tracked run costs a request per poll, and the strip has room for four
+/// lines in total — a repo that fans a push out across a twenty-leg matrix must
+/// not spend the API budget on rows nobody can see.
+const MAX_TRACKED_RUNS: usize = 4;
+
+/// Follow the in-flight runs on one dashboard row down to their jobs and steps.
 ///
 /// The row itself can only say *that* CI is going. This is what lets the strip
-/// at the bottom name the workflow and the step it is on right now.
+/// at the bottom name the workflows and the steps they are on right now — all
+/// of them: a push that starts CI and a deploy is two runs, and following only
+/// one leaves the other invisible until it fails.
 ///
 /// Deliberately outside the `pending` counter: it is decoration over the row,
 /// and a repo whose detail fetch is slow or broken must not pause the poll that
@@ -2828,43 +3017,46 @@ fn sync_repo_progress(
     spec: &str,
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
-    let target = state
-        .repos
-        .iter()
-        .find(|c| c.spec == spec)
-        .and_then(|c| c.active_run().cloned().map(|r| (r, c.remote.clone())));
-    let Some((run, remote)) = target else {
+    let target = state.repos.iter().find(|c| c.spec == spec).map(|c| {
+        (c.active_runs().take(MAX_TRACKED_RUNS).cloned().collect::<Vec<_>>(), c.remote.clone())
+    });
+    let Some((runs, remote)) = target else { return };
+    if runs.is_empty() {
         // Nothing in flight anymore — dropping the entry is what makes the
         // strip clear itself the moment the last run lands.
         state.run_progress.remove(spec);
         return;
-    };
+    }
 
     // Show what the row already knows immediately; the steps land a poll later.
     // Without this a run would sit invisible until its first detail response.
-    match state.run_progress.get_mut(spec) {
-        Some(d) if d.run.id == run.id => d.run = run.clone(),
-        _ => {
-            state.run_progress.insert(
-                spec.to_string(),
-                RunDetail { run: run.clone(), jobs: Vec::new() },
-            );
-        }
-    }
+    // Rebuilt rather than patched so a run that has settled since the last poll
+    // drops out even while its siblings keep going.
+    let previous = state.run_progress.remove(spec).unwrap_or_default();
+    let details = runs
+        .iter()
+        .map(|run| match previous.iter().find(|d| d.run.id == run.id) {
+            Some(d) => RunDetail { run: run.clone(), jobs: d.jobs.clone() },
+            None => RunDetail { run: run.clone(), jobs: Vec::new() },
+        })
+        .collect();
+    state.run_progress.insert(spec.to_string(), details);
 
     let Some(remote) = remote else { return };
     let Ok(rspec) = RepoSpec::parse(&remote) else {
         return;
     };
-    let p = provider.for_repo(rspec);
-    let (label, run_id, tx) = (spec.to_string(), run.id, tx.clone());
-    tokio::spawn(async move {
-        // A failure here is silent on purpose: the row still reports the run,
-        // and a toast per poll per repo would bury every other message.
-        if let Ok(detail) = p.get_run(run_id).await {
-            let _ = tx.send(AppEvent::RepoProgressLoaded(label, detail));
-        }
-    });
+    for run in runs {
+        let p = provider.for_repo(rspec.clone());
+        let (label, run_id, tx) = (spec.to_string(), run.id, tx.clone());
+        tokio::spawn(async move {
+            // A failure here is silent on purpose: the row still reports the
+            // run, and a toast per poll per repo would bury every other message.
+            if let Ok(detail) = p.get_run(run_id).await {
+                let _ = tx.send(AppEvent::RepoProgressLoaded(label, detail));
+            }
+        });
+    }
 }
 
 /// Read a checkout's working-tree state off-thread.
@@ -3450,6 +3642,7 @@ fn play_sound(path: &str) {
 const FINISHED_SOUND: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/finished.mp3"));
 const FAIL_SOUND: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fail.mp3"));
+const QUOTA_SOUND: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/quota.wav"));
 
 /// Play the appropriate notification sound for a finished run: the fail sound
 /// on failure/cancellation, otherwise the completion sound.
@@ -3475,6 +3668,21 @@ fn play_op_failed_sound(config: &Config) {
         return;
     }
     play_terminal_sound(Status::Failure, config);
+}
+
+/// The API budget is nearly gone.
+///
+/// Its own sound rather than the CI fail one: this is not a run that broke, it
+/// is a warning that the next few minutes of watching will cost you the rest of
+/// the hour — and the two call for opposite reactions. A failure asks you to
+/// look; this asks you to leave.
+fn play_quota_alarm(config: &Config) {
+    if config.ui.notify_mode() == NotifyMode::Never || !config.ui.notify_sound {
+        return;
+    }
+    if let Some(path) = sound_path(&config.ui.quota_sound, QUOTA_SOUND, "quota.wav") {
+        play_sound(&path);
+    }
 }
 
 /// Track a run across polls and announce it exactly once, when it transitions
@@ -3587,6 +3795,118 @@ mod tests {
         st.repos.push(RepoCard::new("acme/remote-only".into()));
         st.view = View::Repos;
         st
+    }
+
+    fn quota(used: u32) -> Quota {
+        Quota { limit: 100, used, reset: chrono::Utc::now() + chrono::Duration::minutes(20) }
+    }
+
+    #[test]
+    fn the_quota_alarm_sounds_once_per_budget_not_once_per_poll() {
+        let mut st = dashboard();
+        assert!(!record_quota(&mut st, quota(89)), "under the line is not news");
+        assert!(record_quota(&mut st, quota(90)), "crossing it is");
+        // Polls keep landing every few seconds. An alarm that fires on each one
+        // is an alarm you silence, and then it is not an alarm.
+        assert!(!record_quota(&mut st, quota(93)));
+        assert!(!record_quota(&mut st, quota(100)));
+
+        // The hour turns over and the budget refills: the next time it fills up
+        // is a new fact, and a dashboard left open all day should hear about it.
+        assert!(!record_quota(&mut st, quota(2)));
+        assert!(record_quota(&mut st, quota(97)));
+    }
+
+    #[test]
+    fn the_alarm_says_what_to_do_about_it() {
+        let mut st = dashboard();
+        record_quota(&mut st, quota(91));
+        let msg = st.status_msg.clone().unwrap_or_default();
+        // Not "rate limit warning": the number alone leaves you looking for the
+        // action, and the action is to stop feeding the meter.
+        assert!(msg.contains("91%"), "{msg}");
+        assert!(msg.contains("quit jog"), "{msg}");
+    }
+
+    /// The working tree of `acme/api`, open, on a branch with an upstream.
+    fn open_working_tree(header: &str) -> AppState {
+        let mut st = dashboard();
+        st.view = View::GitStatus;
+        let mut gv = crate::app::state::GitView::new(
+            "acme/api".into(),
+            std::path::PathBuf::from("/tmp/acme/api"),
+            true,
+        );
+        gv.status = Some(crate::git::parse_status(header));
+        st.git_view = Some(gv);
+        st
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn a_landed_commit_asks_about_pushing_with_yes_already_chosen() {
+        let mut st = open_working_tree("## main...origin/main\0");
+        offer_push(&mut st, "acme/api");
+        let p = st.push_prompt.as_ref().expect("a commit raises the question");
+        assert_eq!(p.branch, "main");
+        // The whole point of the box: Enter alone finishes the job, without a
+        // second key you have to remember on the way out of the commit.
+        assert!(p.yes);
+    }
+
+    #[test]
+    fn the_push_question_can_be_declined_and_stays_declined() {
+        let (_g, tx) = ((), mpsc::unbounded_channel::<AppEvent>().0);
+        let mut st = open_working_tree("## main...origin/main\0");
+
+        offer_push(&mut st, "acme/api");
+        handle_push_prompt(&mut st, press(KeyCode::Esc), &tx);
+        assert!(st.push_prompt.is_none());
+        assert!(!st.op_running("acme/api"), "Esc means not now, not later");
+
+        // …and arrowing over to No and taking it is the same answer.
+        offer_push(&mut st, "acme/api");
+        handle_push_prompt(&mut st, press(KeyCode::Right), &tx);
+        assert_eq!(st.push_prompt.as_ref().map(|p| p.yes), Some(false));
+        handle_push_prompt(&mut st, press(KeyCode::Enter), &tx);
+        assert!(st.push_prompt.is_none());
+        assert!(!st.op_running("acme/api"));
+    }
+
+    #[test]
+    fn nothing_to_push_to_means_nothing_to_ask() {
+        // Detached: `push --set-upstream origin HEAD` would create a remote
+        // branch called `HEAD`, so there is no sane yes to offer.
+        let mut st = open_working_tree("## HEAD (no branch)\0");
+        offer_push(&mut st, "acme/api");
+        assert!(st.push_prompt.is_none());
+
+        // A batch asks its own push question once, at the end — one box per
+        // repo would be a queue of dialogs to click through.
+        let mut st = open_working_tree("## main...origin/main\0");
+        st.repo_marks.insert("acme/api".into());
+        start_batch_commit(&mut st);
+        offer_push(&mut st, "acme/api");
+        assert!(st.push_prompt.is_none());
+    }
+
+    #[test]
+    fn the_question_takes_the_keyboard_while_it_is_up() {
+        let (_g, tx) = ((), mpsc::unbounded_channel::<AppEvent>().0);
+        let mut st = open_working_tree("## main...origin/main\0");
+        offer_push(&mut st, "acme/api");
+
+        // `c` behind the box means "commit"; while the box is up it must mean
+        // nothing at all, or answering one question starts another.
+        handle_push_prompt(&mut st, press(KeyCode::Char('c')), &tx);
+        assert!(st.push_prompt.is_some());
+        assert!(
+            st.git_view.as_ref().is_some_and(|g| g.commit_input.is_none()),
+            "a key aimed at the screen behind the box must not reach it"
+        );
     }
 
     #[test]

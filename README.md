@@ -252,6 +252,21 @@ notify_desktop = true    # raise an OS notification
 only announced if `jog` saw it in flight first, so starting up never fires a
 burst of notifications for runs that finished hours ago.
 
+## The API budget
+
+The header carries how much of the hour's GitHub API budget is spent — `API 46%`
+in the top right, dim while there is room, warming through yellow as it fills.
+
+At 90% it turns red, adds the time the budget refills (`API 92% · till 11:36`),
+and plays its own alarm once, distinct from the CI sounds: a full bucket is not
+a broken build, and the useful reaction is the opposite one — quit `jog` and let
+the hour run out rather than spend the rest of it polling.
+
+The reading is refreshed on every poll from `/rate_limit`, which is exempt from
+the limit it reports, so watching the meter costs nothing against it. It is
+shared: every `gh` command and every other tool on the same token draws from the
+same bucket, which is usually how it gets emptied without you noticing.
+
 ## Default keys (TUI)
 
 Press **`?`** anywhere in the TUI for the full reference. It reads your actual
@@ -285,10 +300,12 @@ poll_interval_ms = 5000
 favorites = ["ci.yml", "deploy.yml"]   # pinned to the top of the list
 complete_sound = "/usr/share/sounds/freedesktop/stereo/complete.oga"  # set to "" to disable
 fail_sound = ""                        # empty uses the bundled sound
+quota_sound = ""                       # alarm when the API budget is nearly spent
 notify = "always"                      # "always" · "failure" · "never"
 notify_sound = true
 notify_desktop = true
 log_focus_context = 2                  # context lines kept around each error in focus mode
+# github_icon = ""                    # hide the per-repo forge mark (default: the Nerd Font GitHub logo)
 
 [provider]
 kind = "github"

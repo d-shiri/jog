@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use futures::stream::StreamExt;
 use octocrab::Octocrab;
 use octocrab::models::workflows as gh_workflows;
@@ -91,6 +92,168 @@ pub fn current_branch() -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Why an API call failed, in the only terms a dashboard row has room for.
+///
+/// Sorting a failure into a kind first is what lets the row stay two words wide
+/// while the panel header spells the same thing out with the fix attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiFault {
+    /// Quota spent. Nothing to fix — the clock fixes it.
+    RateLimited,
+    /// Token missing, expired, or revoked.
+    BadCredentials,
+    /// Authenticated but not allowed: missing scope, or SSO not authorized.
+    Denied,
+    /// No such repo — or none this token is allowed to see.
+    NotFound,
+    /// GitHub is down, or we are.
+    Unreachable,
+    /// Anything else. Carries its own wording instead of a canned one.
+    Other,
+}
+
+impl ApiFault {
+    /// Two words: what fits in a table cell.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate limited",
+            Self::BadCredentials => "bad credentials",
+            Self::Denied => "access denied",
+            Self::NotFound => "not found",
+            Self::Unreachable => "github unreachable",
+            Self::Other => "failed",
+        }
+    }
+
+    /// The same failure with the fix attached, for somewhere with room for it.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::RateLimited => "GitHub API quota spent",
+            Self::BadCredentials => "run `gh auth login`, or set GITHUB_TOKEN",
+            Self::Denied => "token lacks access — check its scopes and SSO",
+            Self::NotFound => "no such repo, or the token can't see it",
+            Self::Unreachable => "GitHub or the network is not answering",
+            Self::Other => "",
+        }
+    }
+}
+
+/// What is left of the token's hourly API budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quota {
+    pub limit: u32,
+    pub used: u32,
+    /// When `used` goes back to zero.
+    pub reset: DateTime<Utc>,
+}
+
+impl Quota {
+    /// Share of the hour's budget already spent, 0.0–1.0.
+    pub fn spent(&self) -> f64 {
+        if self.limit == 0 {
+            return 0.0;
+        }
+        (self.used as f64 / self.limit as f64).clamp(0.0, 1.0)
+    }
+
+    /// The same as whole percent, which is what the header shows.
+    pub fn percent(&self) -> u32 {
+        (self.spent() * 100.0).round() as u32
+    }
+
+    /// Close enough to the ceiling that the next few polls could hit it.
+    ///
+    /// The threshold exists to be acted on: at nine tenths spent the useful
+    /// move is to quit jog and stop feeding the meter, which is only possible
+    /// if you are told before the wall rather than at it.
+    pub fn is_critical(&self) -> bool {
+        self.percent() >= CRITICAL_PERCENT
+    }
+}
+
+/// Where the quota readout turns red and the alarm sounds.
+pub const CRITICAL_PERCENT: u32 = 90;
+
+/// A failed API call, reduced to something a row can show.
+#[derive(Debug, Clone)]
+pub struct ApiError {
+    pub fault: ApiFault,
+    /// What the row prints. Short by construction.
+    pub text: String,
+}
+
+/// Sort an API failure into a kind and word it for a narrow column.
+///
+/// anyhow renders a chain outermost-first, so `{e:#}` in a table cell shows the
+/// call we made — `list all repo runs: GitHub: API rate limit exceed…` — and
+/// truncates away the answer. The row already names the repo and the column
+/// already means "latest run", so the call is the one part worth dropping.
+pub fn classify_error(err: &anyhow::Error) -> ApiError {
+    if let Some(gh) = err.chain().find_map(|c| c.downcast_ref::<octocrab::Error>()) {
+        return classify_octocrab(gh);
+    }
+    // Not an API failure at all (unparseable remote, git, io). The innermost
+    // cause is the specific one; the layers above only say where it surfaced.
+    let root = err.chain().last().map(|c| c.to_string()).unwrap_or_default();
+    ApiError {
+        fault: ApiFault::Other,
+        text: first_line(&root, "failed"),
+    }
+}
+
+fn classify_octocrab(err: &octocrab::Error) -> ApiError {
+    let (fault, message) = match err {
+        octocrab::Error::GitHub { source, .. } => (
+            fault_for(source.status_code.as_u16(), &source.message),
+            source.message.clone(),
+        ),
+        // Nothing came back at all: DNS, TLS, a dropped socket.
+        octocrab::Error::Http { .. }
+        | octocrab::Error::Hyper { .. }
+        | octocrab::Error::Service { .. }
+        | octocrab::Error::Uri { .. } => (ApiFault::Unreachable, String::new()),
+        other => (ApiFault::Other, other.to_string()),
+    };
+    let text = match fault {
+        ApiFault::Other => first_line(&message, "failed"),
+        f => f.label().to_string(),
+    };
+    ApiError { fault, text }
+}
+
+/// What a status line and an error body add up to.
+///
+/// GitHub answers both quota kinds with 403 and only the prose tells them
+/// apart: "API rate limit exceeded" for the hourly budget, "You have exceeded a
+/// secondary rate limit" for bursts. Both are wait-it-out, and neither is the
+/// permissions problem the bare status code would suggest.
+fn fault_for(status: u16, message: &str) -> ApiFault {
+    if message.to_lowercase().contains("rate limit") {
+        return ApiFault::RateLimited;
+    }
+    match status {
+        401 => ApiFault::BadCredentials,
+        403 | 429 => ApiFault::Denied,
+        404 => ApiFault::NotFound,
+        500..=599 => ApiFault::Unreachable,
+        _ => ApiFault::Other,
+    }
+}
+
+/// First line of `s`, or `fallback` when there isn't one worth showing.
+///
+/// GitHub errors carry a paragraph — the request id, a support address, a link
+/// to the terms of service. None of it survives a table cell, and the first
+/// sentence is the only part that ever said anything.
+fn first_line(s: &str, fallback: &str) -> String {
+    let line = s.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        fallback.to_string()
+    } else {
+        line.to_string()
+    }
+}
+
 pub struct GitHubProvider {
     crab: Arc<Octocrab>,
     repo: RepoSpec,
@@ -137,6 +300,26 @@ impl GitHubProvider {
             .context("get repo")?;
         repo.default_branch
             .ok_or_else(|| anyhow!("repo has no default branch"))
+    }
+
+    /// How much of this token's hourly API budget is left.
+    ///
+    /// Worth asking on a schedule rather than only after a refusal: `/rate_limit`
+    /// is exempt from the limit it reports, so watching the number costs nothing
+    /// against it — and a number you can watch fall is the only warning you get
+    /// before every row goes red at once. It is also the only way to learn the
+    /// reset time, since octocrab hands back the error body of a rejected call,
+    /// not the `X-RateLimit-Reset` header it came with.
+    pub async fn quota(&self) -> Result<Quota> {
+        let limits = self.crab.ratelimit().get().await.context("get rate limit")?;
+        let core = limits.resources.core;
+        let reset = DateTime::from_timestamp(core.reset as i64, 0)
+            .ok_or_else(|| anyhow!("rate limit reset out of range"))?;
+        Ok(Quota {
+            limit: core.limit as u32,
+            used: core.used as u32,
+            reset,
+        })
     }
 
     /// Raw text of a file in the repo's default branch.
@@ -480,6 +663,40 @@ mod tests {
         let r = parse_remote_url("git@github.com:foo/bar.git").unwrap();
         assert_eq!(r.owner, "foo");
         assert_eq!(r.repo, "bar");
+    }
+
+    #[test]
+    fn rate_limit_beats_the_status_code() {
+        // Both quota kinds arrive as 403, which on its own reads as a
+        // permissions problem and sends you off to re-check token scopes.
+        let msg = "API rate limit exceeded for user ID 44789851. If you reach out …";
+        assert_eq!(fault_for(403, msg), ApiFault::RateLimited);
+        assert_eq!(
+            fault_for(403, "You have exceeded a secondary rate limit"),
+            ApiFault::RateLimited
+        );
+        assert_eq!(fault_for(403, "Resource not accessible"), ApiFault::Denied);
+        assert_eq!(fault_for(401, "Bad credentials"), ApiFault::BadCredentials);
+        assert_eq!(fault_for(404, "Not Found"), ApiFault::NotFound);
+        assert_eq!(fault_for(502, "Bad gateway"), ApiFault::Unreachable);
+    }
+
+    #[test]
+    fn keeps_the_cause_not_the_call() {
+        // What the dashboard used to show: "list all repo runs: …", with the
+        // part that named the cause truncated off the end.
+        let err = anyhow!("no decodable content at .github/workflows/ci.yml")
+            .context("get contents of ci.yml")
+            .context("list all repo runs");
+        let api = classify_error(&err);
+        assert_eq!(api.fault, ApiFault::Other);
+        assert_eq!(api.text, "no decodable content at .github/workflows/ci.yml");
+    }
+
+    #[test]
+    fn drops_the_paragraph_github_attaches() {
+        let err = anyhow!("Server Error\nDocumentation URL: https://docs.github.com/…");
+        assert_eq!(classify_error(&err).text, "Server Error");
     }
 
     #[test]

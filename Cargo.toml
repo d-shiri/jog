@@ -1,6 +1,6 @@
 [package]
 name = "jog"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 license = "MIT"
 description = "A terminal UI for git and GitHub Actions across several repos: stage, commit, push, trigger and watch CI."
