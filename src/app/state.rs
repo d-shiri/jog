@@ -1374,6 +1374,13 @@ pub struct AppState {
     pub last_diff_viewport_height: Cell<u16>,
     /// Rows the hook-output pane last drew, for the same reason.
     pub last_op_viewport_height: Cell<u16>,
+    /// High-water mark of in-flight fetches in the current burst, and the tick
+    /// the burst began. The mark is what lets the header count replies down as
+    /// "fetching 3/8" instead of spinning blind, and the tick is how it can say
+    /// a fetch has been dragging. `Cell` because the header tracks the burst in
+    /// the act of drawing it; reset to zero the moment the burst drains.
+    pub fetch_hwm: Cell<usize>,
+    pub fetch_started_tick: Cell<u64>,
     /// Keybinding reference overlay.
     pub show_help: bool,
     pub help_scroll: u16,
@@ -1476,6 +1483,8 @@ impl AppState {
             git_diff: None,
             last_diff_viewport_height: Cell::new(0),
             last_op_viewport_height: Cell::new(0),
+            fetch_hwm: Cell::new(0),
+            fetch_started_tick: Cell::new(0),
             show_help: false,
             help_scroll: 0,
             workspace_root: None,

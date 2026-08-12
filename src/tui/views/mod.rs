@@ -449,16 +449,47 @@ fn quota_color(theme: &Theme, pct: u32) -> Color {
 /// A glyph rather than a number of seconds: the exact figure is never the
 /// question, only whether what is on screen was fetched recently — and a
 /// countdown you can read at a glance answers that without being read.
+///
+/// One fixed template — a glyph column and a right-aligned seconds field — so
+/// every character position keeps one role and nothing in the corner ever
+/// shifts. A fetch swaps the draining clock face for a spinner and changes
+/// nothing else: the countdown to the next poll stays up, because it stays
+/// true. Only a fetch that drags past a few seconds takes over the number
+/// field — progress ("3/8") or elapsed time — which is exactly when the
+/// anomaly *should* displace the routine.
 fn poll_clock(state: &AppState) -> String {
     const FACES: [&str; 4] = ["◴", "◵", "◶", "◷"];
-    if state.pending > 0 {
-        // Mid-fetch: spin rather than count down to something already happening.
-        return format!("{} fetching", FACES[(state.tick_count / 3 % 4) as usize]);
-    }
+    // Not the countdown faces: spinning and draining on the same glyphs would
+    // leave nothing to say which state the corner is in.
+    const SPINNER: [&str; 4] = ["⠋", "⠙", "⠸", "⠴"];
+    // Git mutations parked in hooks sit in `pending` too, but they fetch
+    // nothing — counting them here would blame the provider for a slow
+    // pre-commit hook.
+    let in_hooks = state.git_ops.values().filter(|o| !o.finished).count();
+    let inflight = state.pending.saturating_sub(in_hooks);
     let elapsed = state.tick_count.saturating_sub(state.last_poll_tick);
     let left = state.poll_ticks.saturating_sub(elapsed);
+    if inflight > 0 {
+        if state.fetch_hwm.get() == 0 {
+            state.fetch_started_tick.set(state.tick_count);
+        }
+        let total = state.fetch_hwm.get().max(inflight);
+        state.fetch_hwm.set(total);
+        let spin = SPINNER[(state.tick_count / 3 % 4) as usize];
+        let secs = state.tick_count.saturating_sub(state.fetch_started_tick.get()) / 10;
+        if secs >= 3 {
+            let field = if total > 1 {
+                format!("{}/{total}", total - inflight)
+            } else {
+                format!("{secs}s")
+            };
+            return format!("{spin} {field:>4}");
+        }
+        return format!("{spin} {:>3}s", left.div_ceil(10));
+    }
+    state.fetch_hwm.set(0);
     let quarter = ((left * 4) / state.poll_ticks.max(1)).min(3) as usize;
-    format!("{} {}s", FACES[3 - quarter], left.div_ceil(10))
+    format!("{} {:>3}s", FACES[3 - quarter], left.div_ceil(10))
 }
 
 pub(super) fn display_key(s: &str) -> &str {
