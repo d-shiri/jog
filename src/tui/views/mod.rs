@@ -187,41 +187,138 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         spans.push(Span::styled("  ·  ", dot));
         spans.extend(crumb);
     }
-
-    // The right two thirds of the header were empty on every terminal wider
-    // than the ones jog was first written on. What belongs there is the state
-    // you'd otherwise have to guess at: when the next refresh lands, and what
-    // time it is — a run that "finished 3m ago" means nothing without it.
-    let mut right = quota_spans(state);
-    right.extend([
-        Span::styled(poll_clock(state), Style::default().fg(theme.text_faint)),
-        Span::styled("   ", Style::default()),
-        Span::styled(
-            chrono::Local::now().format("%H:%M").to_string(),
+    // The dashboard no longer wears a frame saying "Repos 8", so the total comes
+    // up here — next to the directory it counts, which is what it is about. The
+    // tallies do not cover it: a checkout that has never run CI lands in none of
+    // the four, and "7 of 8" is a different sentence from "7".
+    if state.view == View::Repos && !state.repos.is_empty() {
+        spans.push(Span::styled("  ·  ", dot));
+        spans.push(Span::styled(
+            format!("{} repos", state.repos.len()),
             Style::default().fg(theme.text_muted),
-        ),
-        Span::raw(" "),
-    ]);
-
-    // The gap between the two is the widest empty space on the screen, and what
-    // belongs in it is the answer to "is anything wrong right now" — which the
-    // dashboard's own title bar can only give you while you are looking at the
-    // dashboard. Dropped rather than overlapped when the terminal is too narrow
-    // to hold all three: a collision reads as a bug, an absence reads as a
-    // small window.
-    let mid = workspace_tallies(state);
-    let width = |v: &[Span]| v.iter().map(|s| s.width()).sum::<usize>();
-    let mid_w = width(&mid);
-    if mid_w > 0 && width(&spans) + mid_w + width(&right) + 6 <= area.width as usize {
-        spans.push(Span::raw("    "));
-        spans.extend(mid);
+        ));
     }
+
+    // The right corner is for the state of the machinery rather than of the
+    // work: how the workspace stands, how much API budget is left, when the
+    // next refresh lands, and what time it is — a run that "finished 3m ago"
+    // means nothing without the last of those.
+    let width = |v: &[Span]| v.iter().map(|s| s.width()).sum::<usize>();
+    let left_w = width(&spans);
+    let tally = workspace_tallies(state);
+    let dirty = uncommitted_span(state);
+    let tail = {
+        let mut t = quota_spans(state);
+        t.extend([
+            Span::styled(poll_clock(state), Style::default().fg(theme.text_faint)),
+            Span::styled("   ", Style::default()),
+            Span::styled(
+                chrono::Local::now().format("%H:%M").to_string(),
+                Style::default().fg(theme.text_muted),
+            ),
+            Span::raw(" "),
+        ]);
+        t
+    };
+    // Shed from the least load-bearing end inwards rather than letting the two
+    // ends meet in the middle: an overlap reads as a bug, a missing figure reads
+    // as a small window.
+    let total = area.width as usize;
+    let mut right: Vec<Span> = Vec::new();
+    for part in [&tally, &dirty] {
+        if left_w + width(&right) + width(part) + width(&tail) + 2 <= total {
+            right.extend(part.iter().cloned());
+        }
+    }
+    right.extend(tail);
+    let right_w = width(&right);
 
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.surface)),
         area,
     );
+
+    // The widest empty space on the screen sat between the two, and what belongs
+    // in it is whatever is happening right now — which otherwise only exists in
+    // a strip along the bottom of one view. Centred in the gap the two ends
+    // leave rather than on the screen, so a long path shifts it along instead of
+    // pushing it off; dropped whole the moment the gap will not hold it.
+    const GUTTER: usize = 3;
+    let mid = now_playing(state);
+    let mid_w = width(&mid);
+    let gap_start = left_w + GUTTER;
+    let gap_end = total.saturating_sub(right_w + GUTTER);
+    if mid_w > 0 && gap_end > gap_start && gap_end - gap_start >= mid_w {
+        let x = gap_start + (gap_end - gap_start - mid_w) / 2;
+        let slot = Rect {
+            x: area.x + x as u16,
+            width: mid_w as u16,
+            ..area
+        };
+        f.render_widget(Paragraph::new(Line::from(mid)), slot);
+    }
     f.render_widget(Paragraph::new(Line::from(right)).right_aligned(), area);
+}
+
+/// What is happening right now, for the middle of the header.
+///
+/// One line, and only ever one: a header that grows a list is a header you have
+/// to read. Trouble outranks progress — a run in flight is worth knowing about,
+/// but not while eight rows cannot be fetched at all.
+fn now_playing(state: &AppState) -> Vec<Span<'static>> {
+    let theme = &state.theme;
+    if Tallies::of(state).broken > 0
+        && let Some(detail) = shared_fault_detail(state)
+    {
+        return vec![
+            Span::styled("⚠ ", Style::default().fg(theme.failure).bold()),
+            Span::styled(detail, Style::default().fg(theme.failure)),
+        ];
+    }
+    let live = state.active_progress();
+    let Some((card, detail)) = live.first() else {
+        return Vec::new();
+    };
+    // The owner is the same for nearly every row and is already in the path; the
+    // name is the part that says which one.
+    let name = card.spec.rsplit('/').next().unwrap_or(&card.spec).to_string();
+    let mut out = vec![
+        Span::styled(
+            format!("{} ", animated_glyph(Status::Running, state.tick_count)),
+            Style::default().fg(theme.warning).bold(),
+        ),
+        Span::styled(name, Style::default().fg(theme.text_bright).bold()),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            truncate(&detail.run.display_title, 28),
+            Style::default().fg(theme.text_muted),
+        ),
+        Span::styled(
+            format!("  {}", compact_elapsed(detail.run.created_at)),
+            Style::default().fg(theme.text_faint),
+        ),
+    ];
+    if live.len() > 1 {
+        out.push(Span::styled(
+            format!("  +{}", live.len() - 1),
+            Style::default().fg(theme.text_faint),
+        ));
+    }
+    out
+}
+
+/// How long something has been going, in as few characters as say it.
+///
+/// No "ago": this is a stopwatch on something still running, not a timestamp.
+fn compact_elapsed(t: chrono::DateTime<Utc>) -> String {
+    let secs = (Utc::now() - t).num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
 }
 
 /// The workspace at a glance: how CI stands, and how much is uncommitted.
@@ -235,37 +332,51 @@ fn workspace_tallies(state: &AppState) -> Vec<Span<'static>> {
     if state.repos.is_empty() {
         return Vec::new();
     }
+    // A zero is the absence of a thing, not an instance of it. Painting `✗0` in
+    // failure red puts a red mark in the corner of a workspace where nothing is
+    // wrong, and a colour that means "this counter exists" teaches you to stop
+    // reading the colour.
+    let count = |n: u32, text: String, on: Color, strong: bool| {
+        let mut style = Style::default().fg(if n == 0 { theme.text_faint } else { on });
+        if strong && n > 0 {
+            style = style.bold();
+        }
+        Span::styled(text, style)
+    };
     let mut out = vec![
-        Span::styled(format!("✓{}", t.ok), Style::default().fg(theme.success)),
-        Span::styled(format!("  ✗{}", t.fail), Style::default().fg(theme.failure)),
+        count(t.ok, format!("✓{}", t.ok), theme.success, false),
+        count(t.fail, format!("  ✗{}", t.fail), theme.failure, false),
     ];
     if t.busy > 0 {
-        out.push(Span::styled(
-            format!("  ⏵{}", t.busy),
-            Style::default().fg(theme.warning).bold(),
-        ));
+        out.push(count(t.busy, format!("  ⏵{}", t.busy), theme.warning, true));
     }
     if t.broken > 0 {
-        out.push(Span::styled(
-            format!("  !{}", t.broken),
-            Style::default().fg(theme.failure).bold(),
-        ));
+        out.push(count(t.broken, format!("  !{}", t.broken), theme.failure, true));
     }
-    // Files, not repos: "3 repos have changes" is the number you already know
-    // from the column, and it does not tell you which way the afternoon went.
+    out.push(Span::styled("   ", Style::default()));
+    out
+}
+
+/// How much work is sitting uncommitted across the workspace.
+///
+/// Files, not repos: "3 repos have changes" is the number you already know from
+/// the column, and it does not tell you which way the afternoon went. Kept apart
+/// from the tallies because it is the widest thing in the corner and so the
+/// first that a narrow terminal should lose.
+fn uncommitted_span(state: &AppState) -> Vec<Span<'static>> {
     let dirty: usize = state
         .repos
         .iter()
         .filter_map(|c| c.git.as_ref())
         .map(|g| g.staged_count() + g.unstaged_count())
         .sum();
-    if dirty > 0 {
-        out.push(Span::styled(
-            format!("   ◆{dirty} uncommitted"),
-            Style::default().fg(theme.accent),
-        ));
+    if dirty == 0 {
+        return Vec::new();
     }
-    out
+    vec![Span::styled(
+        format!("◆{dirty} uncommitted   "),
+        Style::default().fg(state.theme.accent),
+    )]
 }
 
 /// A path short enough for a header: home-relative, and no deeper than the two
@@ -618,6 +729,15 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         spans.push(Span::styled(*desc, Style::default().fg(theme.text_muted)));
     }
 
+    // What a batch commit would take, sitting beside the key that would take it
+    // — the marks are otherwise a column you have to scan for.
+    if state.view == View::Repos && !state.repo_marks.is_empty() {
+        spans.push(Span::styled(
+            format!("   ◆ {} marked", state.repo_marks.len()),
+            Style::default().fg(theme.accent).bold(),
+        ));
+    }
+
     if state.pending > 0 {
         spans.push(Span::styled(
             format!("  {}", Motion::new(state.tick_count).spinner()),
@@ -788,51 +908,39 @@ fn shared_fault_detail(state: &AppState) -> Option<String> {
 
 fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
-    // The counts themselves live in the header now, where they outlive this
-    // view. What stays here is what only makes sense next to the rows.
-    let mut tallies: Vec<Span> = Vec::new();
-    // Eight rows saying "rate limited" are eight copies of one fact. The rows
-    // keep the label; the title bar, which has the width for it, says what to
-    // do about it — or when it stops being true.
-    if Tallies::of(state).broken > 0
-        && let Some(detail) = shared_fault_detail(state)
-    {
-        tallies.push(Span::styled(detail, Style::default().fg(theme.failure)));
-    }
-    // What a batch commit would take, up where the eye already is — the marks
-    // are otherwise a column you have to scan for.
-    if !state.repo_marks.is_empty() {
-        tallies.push(Span::styled(
-            format!("   ◆ {} marked", state.repo_marks.len()),
-            Style::default().fg(theme.accent).bold(),
-        ));
-    }
-    let name = format!("Repos  {}", state.repos.len());
 
     // Anything mid-flight gets its own strip along the bottom. It is given room
     // only when the table can still show a useful number of rows — the list is
     // the view, and a live panel that squeezes it out defeats the point.
     let live = state.active_progress();
     let strip_rows = live.len().min(4) as u16;
-    let (area, strip_area) = if strip_rows == 0 || area.height < strip_rows + 9 {
+    let (area, strip_area) = if strip_rows == 0 || area.height < strip_rows + 7 {
         (area, None)
     } else {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(7), Constraint::Length(strip_rows + 2)])
+            .constraints([Constraint::Min(5), Constraint::Length(strip_rows + 2)])
             .split(area);
         (chunks[0], Some(chunks[1]))
     };
-
-    let blk = panel(&name, tallies, theme, theme.primary);
-    let inner = blk.inner(area);
-    f.render_widget(blk, area);
 
     if let Some(sa) = strip_area {
         render_activity_strip(f, sa, state, &live);
     }
 
-    if inner.height < 2 {
+    // No frame. The header one line up already names the directory and counts
+    // what is in it, so a rounded box titled "Repos 8" spent two rows and two
+    // columns restating it — and the rows are the view. What the border also
+    // carried now lives where it keeps working after you leave: the shared
+    // fault in the header, the marked count in the footer beside the key that
+    // acts on it. Only the side margin survives, so names never touch the edge.
+    let inner = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(2),
+        ..area
+    };
+
+    if inner.height < 2 || inner.width < 8 {
         return;
     }
 
@@ -854,7 +962,10 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
     let cols = Columns::for_width(inner.width);
     let spark_w = cols.spark_w;
 
-    let hdr = Style::default().fg(theme.text_muted);
+    // Faint rather than muted: a column head is read once, when you are learning
+    // the table, and never again. At the same weight as the data it labels it
+    // competes with it on every glance after that.
+    let hdr = Style::default().fg(theme.text_faint);
     let mut header_cells = vec![
         Cell::from(""),
         Cell::from(""),
@@ -867,7 +978,10 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         header_cells.push(Cell::from(Span::styled("Ran on", hdr)));
     }
     if cols.updated {
-        header_cells.push(Cell::from(Span::styled("Updated", hdr)));
+        // Over a right-aligned column, so the label sits over its own digits.
+        header_cells.push(Cell::from(
+            Line::from(Span::styled("Updated", hdr)).right_aligned(),
+        ));
     }
     if cols.recent {
         header_cells.push(Cell::from(Span::styled("Recent runs", hdr)));
@@ -998,7 +1112,10 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                         Span::styled(" ╌╌╌", Style::default().fg(theme.border_dim)),
                     ])),
                 ])
-                .style(Style::default().bg(theme.row_idle)),
+                // A band rather than a dashed rule doing all the work: the
+                // heading is the one row that is not a repo, and a change of
+                // ground says that before the eye has read anything.
+                .style(Style::default().bg(mix(theme.row_idle, theme.overlay, 0.6))),
             );
         }
         row_of.push(rows.len());
@@ -1040,7 +1157,12 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                 .into_iter()
                 .chain(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")))
                 .collect::<Vec<_>>())
-                .style(Style::default().bg(row_bg_for_status(Status::Failure, theme))));
+                .style(row_dress(
+                    row_bg_for_status(Status::Failure, theme),
+                    rows.len(),
+                    i == state.repo_cursor,
+                    theme,
+                )));
                 continue;
             }
 
@@ -1060,7 +1182,13 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                 ]
                 .into_iter()
                 .chain(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")))
-                .collect::<Vec<_>>()));
+                .collect::<Vec<_>>())
+                .style(row_dress(
+                    theme.row_idle,
+                    rows.len(),
+                    i == state.repo_cursor,
+                    theme,
+                )));
                 continue;
             }
 
@@ -1075,7 +1203,13 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                 ]
                 .into_iter()
                 .chain(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")))
-                .collect::<Vec<_>>()));
+                .collect::<Vec<_>>())
+                .style(row_dress(
+                    theme.row_idle,
+                    rows.len(),
+                    i == state.repo_cursor,
+                    theme,
+                )));
                 continue;
             }
 
@@ -1091,13 +1225,17 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
 
             let (c_ok, c_fail, c_busy) = card.counts();
             let mut recent = run_sparkline(&card.runs, spark_w, theme);
+            // Numbers line up down the column or they are not worth aligning at
+            // all: the bar strip is padded to its full width so a repo with four
+            // runs does not shift its counts left of a repo with twenty, and the
+            // counts themselves are fixed-width so ✓7 and ✓20 end together.
             recent.push(Span::styled(
-                format!(" ✓{c_ok}"),
+                format!(" ✓{c_ok:<3}"),
                 Style::default().fg(theme.success_dim),
             ));
             if c_fail > 0 {
                 recent.push(Span::styled(
-                    format!(" ✗{c_fail}"),
+                    format!("✗{c_fail:<3}"),
                     Style::default().fg(theme.failure),
                 ));
             }
@@ -1115,6 +1253,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                 ),
                 None => row_bg_for_status(status, theme),
             };
+            let dress = row_dress(bg, rows.len(), i == state.repo_cursor, theme);
 
             Row::new(vec![
                 mark_cell(card),
@@ -1130,11 +1269,13 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
             .into_iter()
             .chain(cols.tail(
                 ran_on_cell(card, &branch),
-                Cell::from(Span::styled(when_text, when_style)),
+                // Right-aligned: "4d ago" over "130d ago" with ragged units is
+                // the most reliable tell that a table was never looked at.
+                Cell::from(Line::from(Span::styled(when_text, when_style)).right_aligned()),
                 Cell::from(sparkline),
             ))
             .collect::<Vec<_>>())
-            .style(Style::default().bg(bg))
+            .style(dress)
         });
     }
 
@@ -1159,13 +1300,17 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(2)
-        .row_highlight_style(
-            Style::default()
-                .bg(theme.select_bg)
-                .fg(theme.text_bright)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
+        // Deliberately empty. `row_highlight_style` paints one flat style over
+        // the entire selected row, so anything set here — a foreground above
+        // all — overwrites the status glyph, the branch, and the clean/dirty
+        // counts of the one repo you are pointing at. The selection is drawn
+        // into the row's own background by `row_dress` instead; all that is
+        // left for the table to do is the marker, which carries its own style.
+        .row_highlight_style(Style::default())
+        .highlight_symbol(Span::styled(
+            "▶ ",
+            Style::default().fg(theme.primary).bold(),
+        ));
 
     let mut ts = TableState::default();
     // Through the map, not directly: every owner heading pushes the rows below
@@ -1173,6 +1318,36 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
     // or a heading — as soon as there were two owners.
     ts.select(row_of.get(state.repo_cursor).copied());
     f.render_stateful_widget(table, inner, &mut ts);
+}
+
+/// The finished background for one dashboard row: its status tint, banded so
+/// consecutive rows are told apart across the full width of the table, then
+/// tinted again if it is the row under the cursor.
+///
+/// All three compose into a single colour rather than one painting over the
+/// next, which is the whole reason the selection can stop erasing the row.
+fn row_dress(base: Color, idx: usize, selected: bool, theme: &Theme) -> Style {
+    let bg = banded(base, idx, theme);
+    let bg = if selected {
+        mix(bg, theme.select_bg, 0.5)
+    } else {
+        bg
+    };
+    Style::default().bg(bg)
+}
+
+/// Every other row lifted a hair off the one above it.
+///
+/// Low enough contrast to be sensed rather than seen: this is for keeping the
+/// eye on one line while it travels eight columns to the right, not for drawing
+/// stripes. On a 256-colour terminal `mix` cannot blend and snaps at the
+/// halfway point, so a band this faint correctly amounts to nothing at all.
+fn banded(bg: Color, idx: usize, theme: &Theme) -> Color {
+    if idx % 2 == 1 {
+        mix(bg, theme.surface_alt, 0.35)
+    } else {
+        bg
+    }
 }
 
 /// Whether the dashboard's rows are worth grouping by owner, and where the
@@ -1272,7 +1447,12 @@ impl Columns {
 fn run_sparkline(runs: &[Run], width: usize, theme: &Theme) -> Vec<Span<'static>> {
     const BARS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
     if runs.is_empty() {
-        return vec![Span::styled("—", Style::default().fg(theme.unknown))];
+        // Padded like any other strip, so "no history" does not shove its count
+        // out of the column every other row keeps it in.
+        return vec![
+            Span::raw(" ".repeat(width.saturating_sub(1))),
+            Span::styled("—", Style::default().fg(theme.unknown)),
+        ];
     }
     // `runs` is newest-first; a history reads left to right.
     let window: Vec<&Run> = runs.iter().take(width).rev().collect();
@@ -1285,19 +1465,24 @@ fn run_sparkline(runs: &[Run], width: usize, theme: &Theme) -> Vec<Span<'static>
     // the full height would invent a shape that isn't there.
     let spread = longest - shortest;
     let flat = longest <= 0.0 || spread / longest < 0.15;
-    window
+    // A row of flat blocks is a bar chart with no time axis — every run looks
+    // equally current, so the strip reads as a pattern rather than as history.
+    // Fading toward the row's ground with age turns the same cells into a
+    // gradient the eye reads as "recent is on the right" without being told.
+    let last = window.len().saturating_sub(1).max(1) as f64;
+    // Failures fade too — a red bar twenty runs back genuinely is old news —
+    // but only half as far, so a bad week stays legible at the left edge.
+    const FADE: f64 = 0.6;
+    let mut spans: Vec<Span<'static>> = window
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let newest = i + 1 == window.len();
-            let color = match r.status {
-                // Successes are the background against which a failure has to
-                // stand out, so they sit back except for the most recent one.
-                Status::Success if newest => theme.success,
-                Status::Success => theme.success_dim,
-                Status::Failure => theme.failure,
-                Status::Running | Status::Queued => theme.warning,
-                _ => theme.unknown,
+            let age = 1.0 - (i as f64 / last);
+            let (color, fade) = match r.status {
+                Status::Success => (theme.success, FADE),
+                Status::Failure => (theme.failure, FADE / 2.0),
+                Status::Running | Status::Queued => (theme.warning, 0.0),
+                _ => (theme.unknown, FADE),
             };
             // A run with no measurable duration still gets a bar: absence of a
             // mark would read as "no run", which is a different fact.
@@ -1306,9 +1491,16 @@ fn run_sparkline(runs: &[Run], width: usize, theme: &Theme) -> Vec<Span<'static>
             } else {
                 (((secs(r) - shortest) / spread) * 7.0).round().clamp(0.0, 7.0) as usize
             };
-            Span::styled(BARS[h], Style::default().fg(color))
+            let style = Style::default().fg(mix(color, theme.row_idle, fade * age));
+            Span::styled(BARS[h], style)
         })
-        .collect()
+        .collect();
+    // Padded to the full column so the counts that follow start at the same x on
+    // every row, whether a repo has four runs of history or twenty.
+    if spans.len() < width {
+        spans.insert(0, Span::raw(" ".repeat(width - spans.len())));
+    }
+    spans
 }
 
 /// How long a row stays lit after its CI moves — one second, which is long
@@ -4540,13 +4732,19 @@ mod tests {
     #[test]
     fn the_dashboard_shows_what_a_batch_would_take() {
         let mut st = dashboard_with_live_ci();
-        let out = draw_repos(&st, 150, 16);
-        assert!(!out.contains("marked"), "unmarked dashboard says nothing");
+        assert!(
+            !draw_footer(&st, 150).contains("marked"),
+            "unmarked dashboard says nothing"
+        );
 
         st.repo_marks.insert("muufree/backend".into());
         st.repo_marks.insert("muufree/cms".into());
+        // Beside the key that would act on them, now that the panel title they
+        // used to sit in is gone.
+        let bar = draw_footer(&st, 150);
+        assert!(bar.contains("◆ 2 marked"), "got:\n{bar}");
+        assert!(bar.contains("commit marked"), "got:\n{bar}");
         let out = draw_repos(&st, 150, 16);
-        assert!(out.contains("◆ 2 marked"), "got:\n{out}");
         // …and which rows they are, not just how many.
         let backend = out.lines().find(|l| l.contains("muufree/backend")).unwrap();
         let website = out.lines().find(|l| l.contains("muufree/website")).unwrap();
@@ -4610,6 +4808,97 @@ mod tests {
             })
             .expect("row on screen");
         buf[(20, y)].bg
+    }
+
+    /// Every cell of the row a repo is on, as (symbol, fg, bg).
+    fn row_cells(state: &AppState, spec: &str) -> Vec<(String, Color, Color)> {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 12)).unwrap();
+        term.draw(|f| render_repos(f, f.area(), state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let y = (0..buf.area.height)
+            .find(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains(spec)
+            })
+            .expect("row on screen");
+        (0..buf.area.width)
+            .map(|x| {
+                let c = &buf[(x, y)];
+                (c.symbol().to_string(), c.fg, c.bg)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_selected_row_still_shows_what_it_is_selected_to_show() {
+        let mut st = dashboard_with_live_ci();
+        st.repos[2].runs = vec![a_run(9, "Deploy", Status::Failure, 60)];
+        let theme = Theme::default();
+        let has_failure_fg = |st: &AppState| {
+            row_cells(st, "muufree/website")
+                .iter()
+                .any(|(_, fg, _)| *fg == theme.failure)
+        };
+        // Unselected, the row shows a red ✗ and a red "Deploy".
+        st.repo_cursor = 0;
+        assert!(has_failure_fg(&st));
+
+        // Selected, it must still. The old highlight painted one flat style over
+        // the whole row, so the single repo you were pointing at was the one
+        // whose status you could not read.
+        st.repo_cursor = 2;
+        assert!(
+            has_failure_fg(&st),
+            "the selection erased the status it was pointing at"
+        );
+        // And it is still visibly selected — the tint lands in the background.
+        let bgs: Vec<_> = row_cells(&st, "muufree/website")
+            .iter()
+            .map(|(_, _, bg)| *bg)
+            .collect();
+        st.repo_cursor = 0;
+        let plain: Vec<_> = row_cells(&st, "muufree/website")
+            .iter()
+            .map(|(_, _, bg)| *bg)
+            .collect();
+        assert_ne!(bgs, plain);
+    }
+
+    #[test]
+    fn every_other_row_sits_a_hair_off_the_one_above_it() {
+        let theme = Theme::default();
+        // Sensed, not seen: the band exists so the eye can hold one line across
+        // eight columns, and a stripe you notice is a stripe that has failed.
+        assert_eq!(banded(theme.row_idle, 0, &theme), theme.row_idle);
+        let odd = banded(theme.row_idle, 1, &theme);
+        assert_ne!(odd, theme.row_idle);
+        let (Color::Rgb(r, g, b), Color::Rgb(br, bg_, bb)) = (odd, theme.row_idle) else {
+            unreachable!("the default theme is true colour")
+        };
+        let step = (r as i32 - br as i32) + (g as i32 - bg_ as i32) + (b as i32 - bb as i32);
+        assert!((1..=24).contains(&step), "a band of {step} is a stripe");
+    }
+
+    #[test]
+    fn the_updated_column_lines_its_units_up() {
+        let mut st = dashboard_with_live_ci();
+        st.run_progress.clear();
+        // Widths that would be ragged if the column were left-aligned.
+        st.repos[0].runs = vec![a_run(1, "CI", Status::Success, 60)];
+        st.repos[0].runs[0].updated_at = Utc::now() - chrono::Duration::days(130);
+        st.repos[1].runs = vec![a_run(2, "CI", Status::Success, 60)];
+        st.repos[1].runs[0].updated_at = Utc::now() - chrono::Duration::days(4);
+
+        let end = |spec: &str| {
+            let cells = row_cells(&st, spec);
+            let text: String = cells.iter().map(|(s, _, _)| s.as_str()).collect();
+            let at = text.find(" ago").expect("an Updated cell") + " ago".len();
+            text[..at].chars().count()
+        };
+        assert_eq!(end("muufree/backend"), end("muufree/cms"));
     }
 
     #[test]
@@ -4687,10 +4976,23 @@ mod tests {
 
         // Oldest on the left, so the recent failures are where the eye lands.
         let colors: Vec<Color> = bars.iter().map(|s| s.style.fg.unwrap()).collect();
-        assert_eq!(&colors[4..], &[theme.failure, theme.failure]);
-        // The newest success is the live one; older ones sit back so a failure
-        // is the only thing shouting.
-        assert_eq!(colors[0], theme.success_dim);
+        // The newest run is drawn at full strength — nothing to fade toward yet.
+        assert_eq!(colors[5], theme.failure);
+        // Both recent failures still read as failures rather than as background.
+        let toward_bg = |c: Color| match (c, theme.row_idle) {
+            (Color::Rgb(r, g, b), Color::Rgb(br, bg_, bb)) => {
+                let d = |x: u8, y: u8| (x as f64 - y as f64).abs();
+                d(r, br) + d(g, bg_) + d(b, bb)
+            }
+            _ => unreachable!("the default theme is true colour"),
+        };
+        assert!(toward_bg(colors[4]) > toward_bg(colors[0]), "{colors:?}");
+        // Older runs recede toward the row's ground, so the strip reads as a
+        // timeline rather than as a pattern: every success in the window is
+        // dimmer than the one to its right.
+        for w in colors[..4].windows(2) {
+            assert!(toward_bg(w[0]) < toward_bg(w[1]), "{colors:?}");
+        }
         // Height is duration: the five-minute run towers over the one-minute ones.
         let glyphs: Vec<&str> = bars.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(glyphs[0], "█", "the longest run in the window");
@@ -4698,7 +5000,12 @@ mod tests {
 
         // A repo with no runs says so rather than drawing a flat line, which
         // would read as "ran, took no time".
-        assert_eq!(run_sparkline(&[], 6, &theme).len(), 1);
+        let none = run_sparkline(&[], 6, &theme);
+        let text: String = none.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text.trim(), "—");
+        // Still the full column wide, so its count sits where every other row
+        // keeps theirs.
+        assert_eq!(text.chars().count(), 6);
 
         // A history where every run took about the same time is flat, and must
         // draw flat. Scaling a 3% spread to full height invents a shape, and an
@@ -4755,8 +5062,17 @@ mod tests {
 
     /// The header line of the dashboard, as drawn.
     fn draw_header(state: &AppState, w: u16) -> String {
+        draw_one_line(w, |f| render_header(f, f.area(), state))
+    }
+
+    /// The footer line, as drawn.
+    fn draw_footer(state: &AppState, w: u16) -> String {
+        draw_one_line(w, |f| render_footer(f, f.area(), state))
+    }
+
+    fn draw_one_line(w: u16, draw: impl FnOnce(&mut Frame)) -> String {
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 1)).unwrap();
-        term.draw(|f| render_header(f, f.area(), state)).unwrap();
+        term.draw(draw).unwrap();
         let buf = term.backend().buffer().clone();
         (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect()
     }
@@ -4852,27 +5168,92 @@ mod tests {
 
     #[test]
     fn the_header_carries_how_the_workspace_stands() {
-        let out = draw_header(&workspace_dashboard(), 130);
+        let out = draw_header(&workspace_dashboard(), 150);
         // The counts the dashboard's title bar used to hold — up a line, so
         // they are still there when you are three views deep in a run's logs
         // and a second repo goes red behind you.
         assert!(out.contains("✓1"), "{out}");
         assert!(out.contains("⏵2"), "{out}");
         assert!(out.contains("◆3 uncommitted"), "{out}");
-        // And the dashboard no longer says the same numbers one line below.
-        let full = draw_repos(&workspace_dashboard(), 130, 10);
-        let title = full.lines().find(|l| l.contains("Repos  3")).unwrap();
-        assert!(!title.contains("✓1"), "said twice, one line apart: {title}");
+        // The total comes up with them: a repo that has never run CI is in none
+        // of the four tallies, so they cannot be added up into it.
+        assert!(out.contains("3 repos"), "{out}");
+    }
+
+    #[test]
+    fn the_dashboard_wears_no_frame_restating_its_own_header() {
+        // Nothing in flight, so the Live strip — which keeps its own frame,
+        // because it is a thing arriving rather than the view itself — is not
+        // on screen to be confused for the table's.
+        let mut st = workspace_dashboard();
+        st.run_progress.clear();
+        let out = draw_repos(&st, 150, 10);
+        // The box was two rows and two columns spent saying what the line above
+        // it already says.
+        assert!(!out.contains("Repos  "), "got:\n{out}");
+        assert!(!out.contains('╭') && !out.contains('╰'), "got:\n{out}");
+        // The first row of the view is the column header, not a border.
+        assert!(out.lines().next().unwrap().contains("Repo "), "got:\n{out}");
+    }
+
+    #[test]
+    fn a_zero_is_not_bad_news() {
+        let mut st = workspace_dashboard();
+        for card in st.repos.iter_mut() {
+            card.runs.clear();
+            card.error = None;
+        }
+        st.run_progress.clear();
+        let theme = Theme::default();
+        let spans = workspace_tallies(&st);
+        let fail = spans
+            .iter()
+            .find(|s| s.content.contains('✗'))
+            .expect("the fail count is always shown");
+        // Painting ✗0 in failure red puts a red mark in the corner of a
+        // workspace where nothing is wrong — and teaches you to stop reading
+        // the colour that is supposed to mean something.
+        assert_eq!(fail.style.fg, Some(theme.text_faint), "{:?}", fail.content);
+        assert_ne!(fail.style.fg, Some(theme.failure));
     }
 
     #[test]
     fn the_header_gives_up_the_middle_before_it_collides() {
-        // Narrow enough that all three blocks cannot coexist. Dropping the
-        // middle reads as a small window; overlapping it reads as a bug.
+        // Narrow enough that all three blocks cannot coexist. Shedding from the
+        // widest, least load-bearing figure inwards reads as a small window;
+        // letting the two ends meet reads as a bug.
         let out = draw_header(&workspace_dashboard(), 78);
         assert!(!out.contains("uncommitted"), "{out}");
-        assert!(out.contains("12"), "the clock and the path survive: {out}");
-        assert!(out.contains("github"), "{out}");
+        let now = Local::now().format("%H:%M").to_string();
+        assert!(out.contains(&now), "the clock survives: {out}");
+        assert!(out.contains("github"), "the path survives: {out}");
+    }
+
+    #[test]
+    fn the_middle_of_the_header_says_what_is_happening_right_now() {
+        let out = draw_header(&workspace_dashboard(), 150);
+        // Two runs in flight: name the first and count the rest, rather than
+        // growing the header into a list.
+        assert!(out.contains("backend"), "{out}");
+        assert!(out.contains("Deploy to Stage"), "{out}");
+        assert!(out.contains("+1"), "{out}");
+
+        // Nothing running, nothing to say — the slot empties rather than
+        // holding a stale line.
+        let mut idle = workspace_dashboard();
+        idle.run_progress.clear();
+        assert!(!draw_header(&idle, 150).contains("Deploy to Stage"));
+    }
+
+    #[test]
+    fn trouble_outranks_progress_in_the_middle() {
+        let mut st = dashboard_out_of_quota();
+        st.quota = Some(quota_at(99, Utc::now() + chrono::Duration::minutes(12)));
+        let at = Local::now() + chrono::Duration::minutes(12);
+        let out = draw_header(&st, 150);
+        // Three rows can only repeat "rate limited". The header is where there
+        // is room to say when it stops being true.
+        assert!(out.contains(&format!("retry {}", at.format("%H:%M"))), "{out}");
     }
 
     #[test]
@@ -4903,18 +5284,18 @@ mod tests {
         let mut st = dashboard_out_of_quota();
         st.quota = Some(quota_at(40, Utc::now() + chrono::Duration::minutes(12)));
         let at = Local::now() + chrono::Duration::minutes(12);
-        let out = draw_repos(&st, 150, 12);
         // Three rows can only repeat "rate limited". The header is where there
         // is room to say when it stops being true.
         assert!(
-            out.contains(&format!("retry {}", at.format("%H:%M"))),
-            "{out}"
+            draw_header(&st, 150).contains(&format!("retry {}", at.format("%H:%M"))),
+            "{}",
+            draw_header(&st, 150)
         );
 
         // A reset that has already passed is worse than none — it dates the
         // screen to a moment that is over.
         st.quota = Some(quota_at(40, Utc::now() - chrono::Duration::minutes(1)));
-        assert!(!draw_repos(&st, 150, 12).contains("retry"));
+        assert!(!draw_header(&st, 150).contains("retry"));
     }
 
     #[test]
@@ -4967,11 +5348,104 @@ mod tests {
         // The list is the view. On a screen too short for both, the strip is
         // the part that yields — losing repo rows to a status panel is worse
         // than not knowing which step a deploy is on.
-        let out = draw_repos(&dashboard_with_live_ci(), 150, 9);
+        let out = draw_repos(&dashboard_with_live_ci(), 150, 7);
         assert!(!out.contains("in flight"), "got:\n{out}");
         for spec in ["muufree/backend", "muufree/cms", "muufree/website"] {
             assert!(out.contains(spec), "{spec} missing from:\n{out}");
         }
+        // And the two rows the frame used to eat now buy the strip its place on
+        // a screen that could not hold both before.
+        let taller = draw_repos(&dashboard_with_live_ci(), 150, 9);
+        assert!(taller.contains("in flight"), "got:\n{taller}");
+        assert!(taller.contains("muufree/website"), "got:\n{taller}");
+    }
+
+    /// What one whole frame costs to build.
+    ///
+    /// ratatui keeps no retained widget tree: every `Row`, `Span` and `String`
+    /// on screen is rebuilt from nothing on every draw, and the cell diff only
+    /// saves terminal writes, not this. So the frame clock multiplies whatever
+    /// this number is — which is the only thing that decides whether jog can
+    /// afford to animate at 30fps.
+    #[test]
+    #[ignore = "measurement: cargo test frame_cost -- --ignored --nocapture"]
+    fn frame_cost() {
+        let mut st = dashboard_with_live_ci();
+        // A workspace the size of a real one, not the three-row fixture.
+        while st.repos.len() < 8 {
+            let n = st.repos.len();
+            let mut card = crate::app::state::RepoCard::new(format!("muufree/repo{n}"));
+            card.git = Some(crate::git::parse_status("## main\0M  a.rs\0 M b.rs\0"));
+            card.loaded = true;
+            card.runs = (0..20)
+                .map(|i| a_run(100 + i, "CodeQL Security Risk", Status::Success, 400))
+                .collect();
+            st.repos.push(card);
+        }
+        st.workspace_root = Some(std::path::PathBuf::from("/data/repos/muufree/github"));
+
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 50)).unwrap();
+        // Warm the buffers so the first-frame allocations are not in the sample.
+        for _ in 0..50 {
+            term.draw(|f| render(f, &st)).unwrap();
+        }
+        const N: u32 = 2000;
+        let t0 = std::time::Instant::now();
+        for i in 0..N {
+            // Vary the animation clock so nothing is trivially cached and the
+            // cell diff has real work to do, as it would on a live screen.
+            st.tick_count = i as u64;
+            term.draw(|f| render(f, &st)).unwrap();
+        }
+        let per = t0.elapsed() / N;
+        println!(
+            "{} repos, 200x50: {:?}/frame → {:.2}% of one core at 10fps, {:.2}% at 30fps",
+            st.repos.len(),
+            per,
+            per.as_secs_f64() * 10.0 * 100.0,
+            per.as_secs_f64() * 30.0 * 100.0,
+        );
+    }
+
+    /// What the colour maths behind a fade costs, against the frame it rides in.
+    ///
+    /// The unit of "make it prettier without animating it" is one `mix()` and
+    /// one `Style` per cell. If a whole screen of that disappears into the frame
+    /// jog is already drawing ten times a second, the effect is free and the
+    /// only question left is whether it looks good.
+    #[test]
+    #[ignore = "measurement: cargo test blend_cost -- --ignored --nocapture"]
+    fn blend_cost() {
+        let theme = Theme::default();
+        const CELLS: u32 = 200 * 50; // a full 200x50 screen
+        const REPS: u32 = 200;
+        let t0 = std::time::Instant::now();
+        let mut sink = 0u32;
+        for r in 0..REPS {
+            for i in 0..CELLS {
+                let t = (i % 100) as f64 / 100.0;
+                let c = mix(theme.success, theme.failure, t);
+                let s = Style::default().fg(c).bg(theme.surface);
+                // Defeat the optimiser without adding measurable work.
+                sink = sink.wrapping_add(s.fg.is_some() as u32).wrapping_add(r);
+            }
+        }
+        let per_screen = t0.elapsed() / REPS;
+        println!(
+            "blend+style, {CELLS} cells: {:?}/screen ({} sink)",
+            per_screen, sink
+        );
+    }
+
+    #[test]
+    #[ignore = "visual check: cargo test show_header -- --ignored --nocapture"]
+    fn show_header() {
+        let st = workspace_dashboard();
+        for w in [150u16, 120, 100, 78] {
+            println!("─── {w} cols ───\n{}", draw_header(&st, w));
+        }
+        println!("─── dashboard, 150×10 ───\n{}", draw_repos(&st, 150, 10));
     }
 
     #[test]
