@@ -275,6 +275,49 @@ fn now_playing(state: &AppState) -> Vec<Span<'static>> {
             Span::styled(detail, Style::default().fg(theme.failure)),
         ];
     }
+    // Your own push outranks the ambient traffic: the ⇡ chip follows it from
+    // "waiting for CI to notice" through the run it spawned, and vanishes the
+    // moment that run settles (which is also when the notification fires).
+    if let Some(w) = state.push_watches.first() {
+        let name = w.spec.rsplit('/').next().unwrap_or(&w.spec).to_string();
+        let mut out = vec![
+            Span::styled("⇡ ", Style::default().fg(theme.accent).bold()),
+            Span::styled(name, Style::default().fg(theme.text_bright).bold()),
+        ];
+        match &w.run {
+            None => {
+                out.push(Span::styled(
+                    "  pushed — waiting for CI ",
+                    Style::default().fg(theme.text_muted),
+                ));
+                out.push(Span::styled(
+                    animated_glyph(Status::Running, state.tick_count),
+                    Style::default().fg(theme.text_faint),
+                ));
+            }
+            Some(run) => {
+                out.push(Span::styled(
+                    format!("  {} ", animated_glyph(run.status, state.tick_count)),
+                    Style::default().fg(theme.warning).bold(),
+                ));
+                out.push(Span::styled(
+                    truncate(&run.display_title, 28),
+                    Style::default().fg(theme.text_muted),
+                ));
+                out.push(Span::styled(
+                    format!("  {}", compact_elapsed(run.created_at)),
+                    Style::default().fg(theme.text_faint),
+                ));
+            }
+        }
+        if state.push_watches.len() > 1 {
+            out.push(Span::styled(
+                format!("  +{}", state.push_watches.len() - 1),
+                Style::default().fg(theme.text_faint),
+            ));
+        }
+        return out;
+    }
     let live = state.active_progress();
     let Some((card, detail)) = live.first() else {
         return Vec::new();
@@ -652,6 +695,14 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             ];
             if state.git_view.as_ref().is_some_and(|g| g.has_ci) {
                 hints.push((display_key(&km.trigger).into(), "run CI"));
+                // The same key, but the honest label: it opens the PR that
+                // exists, or the page that creates the one that doesn't.
+                let label = if state.git_view.as_ref().is_some_and(|g| g.open_pr().is_some()) {
+                    "open PR"
+                } else {
+                    "new PR"
+                };
+                hints.push((display_key(&km.open_browser).into(), label));
             }
             hints.push((display_key(&km.git_refresh).into(), "refresh"));
             hints.push((display_key(&km.back).into(), "back"));
@@ -1862,6 +1913,7 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
                 (k(&km.git_commit), "commit (opens a message prompt)"),
                 (k(&km.git_push), "push — sets upstream on first push"),
                 (k(&km.trigger), "open this repo's workflows to run CI"),
+                (k(&km.open_browser), "open the branch's PR — or the page that creates one"),
                 (k(&km.git_refresh), "re-read the working tree"),
                 (format!("{}/↵", k(&km.git_diff)), "diff the selected file"),
                 (
@@ -1951,6 +2003,29 @@ fn help_section_for(view: View) -> &'static str {
     }
 }
 
+/// Greedy word wrap; every returned line fits `width` (long single words get a
+/// line to themselves rather than being split mid-word).
+fn wrap_words(s: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > width {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     if !state.show_help {
         return;
@@ -1959,7 +2034,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     let current = help_section_for(state.view);
     let mut sections = help_sections(&state.keymap);
     // Float the current view's section to just below Global, so "what can I do
-    // here?" is answered without scrolling.
+    // here?" is answered from the top-left corner, before any reading order.
     if let Some(i) = sections.iter().position(|(t, _)| *t == current)
         && i > 1
     {
@@ -1976,76 +2051,148 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
         .unwrap_or(6)
         .max(6);
 
-    let mut lines: Vec<Line> = Vec::new();
-    for (title, rows) in &sections {
-        let is_current = *title == current;
-        let title_style = if is_current {
-            Style::default().fg(theme.accent).bold()
-        } else {
-            Style::default().fg(theme.primary).bold()
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {title}"), title_style),
+    // Geometry before content: the column width decides where text wraps.
+    // Two columns when the terminal affords them — the reference then fits on
+    // one screen, which is the difference between a card you glance at and a
+    // document you scroll. One column on narrow terminals rather than two
+    // unreadable ones.
+    const GAP: u16 = 3;
+    let dialog_w = area.width.saturating_sub(4).clamp(area.width.min(46), 104);
+    let inner_w = dialog_w.saturating_sub(2);
+    let two_cols = inner_w >= 88;
+    let col_w = if two_cols { (inner_w - GAP) / 2 } else { inner_w };
+    // 1 margin + key cap (key_w + 2) + 2 gap, then the description.
+    let desc_w = (col_w as usize).saturating_sub(key_w + 5).max(16);
+
+    let build = |title: &str, rows: &[(String, &'static str)]| -> Vec<Line<'static>> {
+        let is_current = title == current;
+        let mut out: Vec<Line> = Vec::new();
+        let mut header = vec![Span::styled(
+            format!(" {title} "),
             if is_current {
-                Span::styled("  ← you are here", Style::default().fg(theme.accent))
+                // Inverted chip: "you are here" as a mark, not a sentence.
+                Style::default().bg(theme.accent).fg(theme.surface).bold()
             } else {
-                Span::raw("")
+                Style::default().fg(theme.primary).bold()
             },
-        ]));
-        for (key, desc) in rows {
-            lines.push(Line::from(vec![
-                Span::raw("   "),
-                Span::styled(
-                    format!("{key:>key_w$}"),
-                    Style::default().fg(theme.text_bright).bold(),
-                ),
-                Span::raw("   "),
-                Span::styled(*desc, Style::default().fg(theme.text)),
-            ]));
+        )];
+        if is_current {
+            header.push(Span::styled(
+                " ← you are here",
+                Style::default().fg(theme.accent),
+            ));
         }
-        lines.push(Line::default());
+        out.push(Line::from(header));
+        for (key, desc) in rows {
+            // The binding drawn as a key cap; the current section's caps pick
+            // up the accent so the eye finds its keys first.
+            let cap_style = Style::default()
+                .bg(theme.surface_alt)
+                .fg(if is_current { theme.accent } else { theme.text_bright })
+                .bold();
+            for (i, seg) in wrap_words(desc, desc_w).into_iter().enumerate() {
+                if i == 0 {
+                    out.push(Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled(format!(" {key:>key_w$} "), cap_style),
+                        Span::raw("  "),
+                        Span::styled(seg, Style::default().fg(theme.text)),
+                    ]));
+                } else {
+                    out.push(Line::from(vec![
+                        Span::raw(" ".repeat(key_w + 5)),
+                        Span::styled(seg, Style::default().fg(theme.text)),
+                    ]));
+                }
+            }
+        }
+        out.push(Line::default());
+        out
+    };
+
+    let built: Vec<Vec<Line>> = sections.iter().map(|(t, r)| build(t, r)).collect();
+    let total: usize = built.iter().map(|b| b.len()).sum();
+
+    // Sections flow into the left column, switching to the right at the
+    // boundary that leaves the two closest to level — and never switching
+    // back, so reading order survives and no section splits across the fold.
+    let half = total.div_ceil(2);
+    let mut left: Vec<Line> = Vec::new();
+    let mut right: Vec<Line> = Vec::new();
+    let mut in_right = false;
+    for b in built {
+        if two_cols
+            && !in_right
+            && (left.len() + b.len()).abs_diff(half) > left.len().abs_diff(half)
+        {
+            in_right = true;
+        }
+        if in_right {
+            right.extend(b);
+        } else {
+            left.extend(b);
+        }
+    }
+    while left.last().is_some_and(|l| l.spans.is_empty()) {
+        left.pop();
+    }
+    while right.last().is_some_and(|l| l.spans.is_empty()) {
+        right.pop();
     }
 
-    let total = lines.len() as u16;
-    let dialog_w = (area.width * 78 / 100).max(46).min(area.width);
-    let dialog_h = (total + 3).min(area.height.saturating_sub(2)).max(6);
+    let content_h = left.len().max(right.len()) as u16;
+    let dialog_h = (content_h + 2).min(area.height.saturating_sub(2)).max(8);
     let x = area.x + area.width.saturating_sub(dialog_w) / 2;
     let y = area.y + area.height.saturating_sub(dialog_h) / 2;
     let popup = Rect { x, y, width: dialog_w, height: dialog_h };
 
     let inner_h = dialog_h.saturating_sub(2);
-    let max_scroll = total.saturating_sub(inner_h);
+    let max_scroll = content_h.saturating_sub(inner_h);
     let scroll = state.help_scroll.min(max_scroll);
 
-    let hint = if max_scroll > 0 {
+    let footer = if max_scroll > 0 {
         format!(
-            " jog v{}  —  Keys  ({}–{} of {})  {}/{} scroll · any key closes ",
-            env!("CARGO_PKG_VERSION"),
-            scroll + 1,
-            (scroll + inner_h).min(total),
-            total,
+            " {}/{} scroll · {}–{} of {} · any other key closes ",
             display_key(&state.keymap.down),
             display_key(&state.keymap.up),
+            scroll + 1,
+            (scroll + inner_h).min(content_h),
+            content_h,
         )
     } else {
-        format!(
-            " jog v{}  —  Keys  ·  any key closes ",
-            env!("CARGO_PKG_VERSION")
-        )
+        " any key closes ".to_string()
     };
 
     let block = Block::default()
-        .title(Span::styled(hint, Style::default().fg(theme.accent).bold()))
+        .title(Span::styled(
+            format!(" jog v{} — keys ", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(theme.accent).bold(),
+        ))
         .title_alignment(ratatui::layout::Alignment::Center)
+        .title_bottom(
+            Line::from(Span::styled(footer, Style::default().fg(theme.text_faint))).centered(),
+        )
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.accent));
 
+    let inner = block.inner(popup);
     f.render_widget(Clear, popup);
-    f.render_widget(
-        Paragraph::new(lines).block(block).scroll((scroll, 0)),
-        popup,
-    );
+    f.render_widget(block, popup);
+    if two_cols {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(col_w),
+                Constraint::Length(GAP),
+                Constraint::Length(col_w),
+            ])
+            .split(inner);
+        f.render_widget(Paragraph::new(left).scroll((scroll, 0)), cols[0]);
+        f.render_widget(Paragraph::new(right).scroll((scroll, 0)), cols[2]);
+    } else {
+        f.render_widget(Paragraph::new(left).scroll((scroll, 0)), inner);
+    }
 }
 
 fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
@@ -2168,6 +2315,26 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
             ),
         ])
     };
+    // The branch's PR, on the same glance as the branch itself. Only when one
+    // exists: "no PR" is not information anyone came here for, and the footer
+    // already says which key would make one.
+    let mut summary = summary;
+    if let Some(pr) = gv.open_pr() {
+        summary.spans.push(Span::styled(
+            format!("   PR #{}", pr.number),
+            Style::default().fg(theme.accent).bold(),
+        ));
+        summary.spans.push(Span::styled(
+            format!(" {}", truncate(&pr.title, 36)),
+            Style::default().fg(theme.text_muted),
+        ));
+        if pr.draft {
+            summary.spans.push(Span::styled(
+                " · draft",
+                Style::default().fg(theme.text_faint),
+            ));
+        }
+    }
     f.render_widget(Paragraph::new(summary), chunks[0]);
 
     // ── File list ──────────────────────────────────────────────────────
@@ -2804,7 +2971,12 @@ fn render_push_prompt(f: &mut Frame, area: Rect, state: &AppState) {
 
     // A first push creates the remote branch. That is a different act from
     // adding to one that exists, and worth saying before it happens.
-    let what = if p.has_upstream {
+    let what = if let Some(n) = p.batch_count {
+        format!(
+            "{n} repo{} committed — push them all?",
+            if n == 1 { "" } else { "s" }
+        )
+    } else if p.has_upstream {
         format!("committed — push {} to origin?", p.branch)
     } else {
         format!("committed — publish {} to origin?", p.branch)
@@ -4014,6 +4186,15 @@ fn render_trigger_prompt(f: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(value_display, value_style),
             Span::styled(editing_marker, Style::default().fg(theme.accent)),
         ];
+        if field.recalled {
+            // A prefilled value someone did not notice is how a deploy goes to
+            // yesterday's target — the recall earns its keystroke saved only
+            // if it is visibly a recall.
+            spans.push(Span::styled(
+                "  ↺ last used",
+                Style::default().fg(theme.text_faint),
+            ));
+        }
         if field.required {
             spans.push(Span::styled(
                 "  (required)",
@@ -4297,6 +4478,7 @@ mod tests {
             branch: "main".into(),
             has_upstream,
             yes: true,
+            batch_count: None,
         });
         let mut term =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 14)).unwrap();
@@ -5586,6 +5768,73 @@ mod tests {
                 "{view:?} maps to `{section}`, which is not a help section"
             );
         }
+    }
+
+    /// Draw the help overlay into an off-screen terminal and return it as text.
+    fn draw_help(state: &AppState, w: u16, h: u16) -> String {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_help_overlay(f, f.area(), state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_wide_terminal_gets_the_help_in_two_columns_without_scrolling() {
+        let mut st = AppState::new(
+            "o/r".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        st.view = View::Logs;
+        st.show_help = true;
+        let text = draw_help(&st, 120, 54);
+        // Everything is on screen: nothing left to scroll to, and both the
+        // first and the last section are visible at once.
+        assert!(text.contains("any key closes"), "no scroll footer:\n{text}");
+        assert!(text.contains("Global"));
+        assert!(text.contains("Trigger prompt"));
+        // The current view's section floats to the top and wears the mark.
+        assert!(text.contains("you are here"));
+        let here_line = text.lines().find(|l| l.contains("you are here")).unwrap();
+        assert!(here_line.contains("Logs"), "the mark sits on the open view's section: {here_line}");
+        // Two columns: some row shares a line with content in the right half.
+        let two_col = text.lines().any(|l| {
+            let half = l.len() / 2;
+            l.len() > 60 && !l[..half].trim().is_empty() && !l[half..].trim().is_empty()
+        });
+        assert!(two_col, "expected side-by-side sections:\n{text}");
+    }
+
+    #[test]
+    fn a_narrow_terminal_keeps_one_readable_column_and_can_scroll() {
+        let mut st = AppState::new(
+            "o/r".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        st.view = View::Repos;
+        st.show_help = true;
+        let text = draw_help(&st, 60, 20);
+        assert!(text.contains("scroll"), "a clipped overlay says how to scroll:\n{text}");
+        // Long descriptions wrap instead of running off the dialog edge.
+        assert!(
+            text.lines().all(|l| l.chars().count() <= 60),
+            "no line escapes the terminal:\n{text}"
+        );
     }
 
     #[test]

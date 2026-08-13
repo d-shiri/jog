@@ -29,10 +29,37 @@ pub struct HistoryStep {
     pub status: Status,
 }
 
+/// What actually sits in the history file: the run log, plus the inputs the
+/// user last dispatched each workflow with. One file rather than two because
+/// they live and die together — both are per-repo memory of what CI did.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct HistoryFile {
+    #[serde(default)]
+    entries: Vec<HistoryEntry>,
+    #[serde(default)]
+    dispatch_inputs: HashMap<String, HashMap<String, String>>,
+}
+
+impl HistoryFile {
+    /// Files written before dispatch inputs existed were a bare entry array.
+    /// Read both shapes; write only the new one.
+    fn parse(raw: &str) -> Self {
+        serde_json::from_str::<HistoryFile>(raw)
+            .or_else(|_| {
+                serde_json::from_str::<Vec<HistoryEntry>>(raw).map(|entries| HistoryFile {
+                    entries,
+                    dispatch_inputs: HashMap::new(),
+                })
+            })
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct History {
     path: Option<PathBuf>,
     entries: Vec<HistoryEntry>,
+    dispatch_inputs: HashMap<String, HashMap<String, String>>,
 }
 
 impl History {
@@ -40,13 +67,14 @@ impl History {
         let Some(path) = repo_history_path(owner, repo) else {
             return Self::default();
         };
-        let entries = std::fs::read_to_string(&path)
+        let file = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|raw| serde_json::from_str::<Vec<HistoryEntry>>(&raw).ok())
+            .map(|raw| HistoryFile::parse(&raw))
             .unwrap_or_default();
         Self {
             path: Some(path),
-            entries,
+            entries: file.entries,
+            dispatch_inputs: file.dispatch_inputs,
         }
     }
 
@@ -96,9 +124,34 @@ impl History {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(json) = serde_json::to_string(&self.entries) {
+        let file = HistoryFile {
+            entries: self.entries.clone(),
+            dispatch_inputs: self.dispatch_inputs.clone(),
+        };
+        if let Ok(json) = serde_json::to_string(&file) {
             let _ = std::fs::write(path, json);
         }
+    }
+
+    /// Remember what a workflow was dispatched with, so the next trigger prompt
+    /// starts from the values that were typed last time instead of the YAML
+    /// defaults. Overwrite rather than merge: the last dispatch is the whole
+    /// answer to "what did I use", including fields cleared back to empty.
+    pub fn record_dispatch_inputs(
+        &mut self,
+        workflow_file: &str,
+        inputs: &HashMap<String, String>,
+    ) {
+        self.dispatch_inputs
+            .insert(workflow_file.to_string(), inputs.clone());
+        self.save();
+    }
+
+    pub fn last_dispatch_inputs(
+        &self,
+        workflow_file: &str,
+    ) -> Option<&HashMap<String, String>> {
+        self.dispatch_inputs.get(workflow_file)
     }
 
     /// (failed_count, terminal_count) per step name for the last `n` terminal runs
@@ -193,6 +246,39 @@ mod tests {
                     .collect(),
             }],
         }
+    }
+
+    #[test]
+    fn files_from_before_dispatch_inputs_existed_still_parse() {
+        let mut h = History::default();
+        h.record("a.yml", &detail(1, Status::Success, 1, &[("build", Status::Success)]));
+        // The old format was the bare entry array.
+        let legacy = serde_json::to_string(&h.entries).unwrap();
+        let parsed = HistoryFile::parse(&legacy);
+        assert_eq!(parsed.entries.len(), 1);
+        assert!(parsed.dispatch_inputs.is_empty());
+    }
+
+    #[test]
+    fn dispatch_inputs_survive_the_round_trip() {
+        let mut h = History::default();
+        let inputs: HashMap<String, String> =
+            [("env".to_string(), "prod".to_string())].into_iter().collect();
+        h.record_dispatch_inputs("deploy.yml", &inputs);
+        assert_eq!(
+            h.last_dispatch_inputs("deploy.yml").and_then(|m| m.get("env")),
+            Some(&"prod".to_string())
+        );
+        // And through the file format.
+        let file = HistoryFile {
+            entries: h.entries.clone(),
+            dispatch_inputs: h.dispatch_inputs.clone(),
+        };
+        let parsed = HistoryFile::parse(&serde_json::to_string(&file).unwrap());
+        assert_eq!(
+            parsed.dispatch_inputs.get("deploy.yml").and_then(|m| m.get("env")),
+            Some(&"prod".to_string())
+        );
     }
 
     #[test]

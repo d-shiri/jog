@@ -302,6 +302,37 @@ impl GitHubProvider {
             .ok_or_else(|| anyhow!("repo has no default branch"))
     }
 
+    /// The open pull request this branch is riding, if any.
+    ///
+    /// `head` is qualified with the owner because GitHub matches it as a plain
+    /// branch name otherwise, and someone else's `main` is not this repo's.
+    /// Fork-based PRs therefore go unfound — jog works from the checkout's own
+    /// remote, so that is the right blind spot to have.
+    pub async fn pr_for_branch(&self, branch: &str) -> Result<Option<crate::provider::PrInfo>> {
+        let page = self
+            .crab
+            .pulls(&self.repo.owner, &self.repo.repo)
+            .list()
+            .state(octocrab::params::State::Open)
+            .head(format!("{}:{}", self.repo.owner, branch))
+            .per_page(1)
+            .send()
+            .await
+            .context("list pull requests")?;
+        Ok(page.items.into_iter().next().map(|pr| crate::provider::PrInfo {
+            number: pr.number,
+            title: pr.title.unwrap_or_default(),
+            url: pr
+                .html_url
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| format!(
+                    "https://github.com/{}/{}/pull/{}",
+                    self.repo.owner, self.repo.repo, pr.number
+                )),
+            draft: pr.draft.unwrap_or(false),
+        }))
+    }
+
     /// How much of this token's hourly API budget is left.
     ///
     /// Worth asking on a schedule rather than only after a refusal: `/rate_limit`

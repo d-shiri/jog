@@ -81,6 +81,16 @@ impl Workflow {
     }
 }
 
+/// The open pull request for a branch — as much of it as the git view needs to
+/// say "this branch is already on review" and to open it in a browser.
+#[derive(Debug, Clone)]
+pub struct PrInfo {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub draft: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Run {
     pub id: u64,

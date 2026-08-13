@@ -20,8 +20,8 @@ use tokio::sync::mpsc;
 use rayon::prelude::*;
 
 use crate::app::state::{
-    AppState, BatchCommit, BatchPhase, DetailItem, Finder, FinderKind, GitOp, PushPrompt, RepoCard,
-    Theme, TriggerPrompt, View, build_detail_items,
+    AppState, BatchCommit, BatchPhase, DetailItem, Finder, FinderKind, GitOp, PushPrompt,
+    PushWatch, RepoCard, Theme, TriggerPrompt, View, build_detail_items,
 };
 use crate::config::KeymapConfig;
 use crate::config::{Config, NotifyMode};
@@ -29,7 +29,7 @@ use crate::history::History;
 use crate::provider::github::{
     ApiError, ApiFault, GitHubProvider, Quota, RepoSpec, classify_error, current_branch,
 };
-use crate::provider::{Provider, Run, RunDetail, Status, Step, Workflow};
+use crate::provider::{PrInfo, Provider, Run, RunDetail, Status, Step, Workflow};
 
 mod motion;
 mod views;
@@ -65,6 +65,11 @@ pub enum AppEvent {
     /// Which hook, if any, the command that just started will run. Resolved off
     /// the UI thread, so it names the pane a moment after it opens.
     GitOpStarted(String, Option<String>),
+    /// The open PR for a branch the git view is sitting on: repo spec, the
+    /// branch the question was asked about, and the answer.
+    PrLoaded(String, String, Option<PrInfo>),
+    /// Recent runs of a repo whose push is being followed into CI.
+    PushWatchRuns(String, Vec<Run>),
     /// The active repo changed: new label, default branch, and workflow list.
     RepoSwitched {
         label: String,
@@ -426,8 +431,16 @@ async fn event_loop(
                         // Sound + desktop notification when a run we saw as Running finishes.
                         let label = state.repo_label.clone();
                         announce_if_finished(state, &detail.run, &label, &config);
+                        // A failed run opens with the cursor already on what
+                        // failed: the first broken step is the only row anyone
+                        // opens a red run to see, and Enter from there is its
+                        // log. A green run starts at the top as before.
+                        state.detail_cursor = if detail.run.status.is_failure() {
+                            first_failed_item(&detail).unwrap_or(0)
+                        } else {
+                            0
+                        };
                         state.run_detail = Some(detail);
-                        state.detail_cursor = 0;
                         state.pending = state.pending.saturating_sub(1);
                     }
                     AppEvent::RunPreviewLoaded(run_id, detail) => {
@@ -575,15 +588,41 @@ async fn event_loop(
                         if let Some(card) = state.repos.iter_mut().find(|c| c.spec == spec) {
                             card.git = Some(status.clone());
                         }
+                        let mut ask_pr: Option<(String, String)> = None;
                         if let Some(gv) = state.git_view.as_mut()
                             && gv.spec == spec
                         {
+                            // The branch is known now, so the PR question is
+                            // askable. Once per branch, not once per refresh:
+                            // the answer only moves when the branch does, or
+                            // when a push clears it to force a re-ask.
+                            if gv.has_ci
+                                && !status.detached
+                                && gv.pr.as_ref().is_none_or(|(b, _)| *b != status.branch)
+                            {
+                                gv.pr = Some((status.branch.clone(), None));
+                                ask_pr = Some((gv.spec.clone(), status.branch.clone()));
+                            }
                             // Keep the cursor in range as files leave the list.
                             gv.cursor = gv.cursor.min(status.entries.len().saturating_sub(1));
                             gv.status = Some(status);
                             gv.busy = false;
                         }
+                        if let Some((spec, branch)) = ask_pr {
+                            spawn_fetch_pr(state, &provider, &tx, &spec, &branch);
+                        }
                         state.pending = state.pending.saturating_sub(1);
+                    }
+                    AppEvent::PrLoaded(spec, branch, pr) => {
+                        if let Some(gv) = state.git_view.as_mut()
+                            && gv.spec == spec
+                        {
+                            gv.pr = Some((branch, pr));
+                        }
+                    }
+                    AppEvent::PushWatchRuns(spec, runs) => {
+                        state.pending = state.pending.saturating_sub(1);
+                        settle_push_watch(state, &spec, &runs, &config);
                     }
                     AppEvent::GitDiffLoaded(spec, file, sections) => {
                         // Only fold in a diff that still matches what the view
@@ -670,6 +709,32 @@ async fn event_loop(
                         if !failed && verb.as_deref() == Some("commit") {
                             offer_push(state, &spec);
                         }
+                        if !failed && verb.as_deref() == Some("push") {
+                            // The push is the moment jog's job starts, not
+                            // ends: follow it into CI and announce how that
+                            // goes, whatever view is on screen by then.
+                            start_push_watch(state, &spec);
+                            if let Some(gv) = state.git_view.as_mut()
+                                && gv.spec == spec
+                            {
+                                // A first push publishes the branch, which is
+                                // the moment a PR becomes possible — say so,
+                                // since nothing on GitHub will.
+                                let published = gv
+                                    .status
+                                    .as_ref()
+                                    .is_some_and(|s| !s.has_upstream && !s.detached);
+                                // Whatever the push changed about the PR
+                                // question, ask it again.
+                                gv.pr = None;
+                                if published {
+                                    let key = state.keymap.open_browser.clone();
+                                    state.set_status(format!(
+                                        "branch published — {key} opens a pull request"
+                                    ));
+                                }
+                            }
+                        }
                         // The working tree moved; re-read it.
                         if let Some(gv) = state.git_view.as_ref() {
                             let (spec, path) = (gv.spec.clone(), gv.path.clone());
@@ -752,10 +817,10 @@ async fn event_loop(
                             }
                             View::Runs => {
                                 let has_active = state.runs.iter().any(|r| !r.status.is_terminal());
-                                if has_active {
-                                    if let Some(file) = state.workflow_for_runs.clone() {
-                                        spawn_fetch_runs(provider.clone(), file, tx.clone(), state);
-                                    }
+                                if has_active
+                                    && let Some(file) = state.workflow_for_runs.clone()
+                                {
+                                    spawn_fetch_runs(provider.clone(), file, tx.clone(), state);
                                 }
                             }
                             View::RunDetail => {
@@ -765,14 +830,17 @@ async fn event_loop(
                                     .map(|d| !d.run.status.is_terminal())
                                     .or_else(|| state.selected_run().map(|r| !r.status.is_terminal()))
                                     .unwrap_or(false);
-                                if run_active {
-                                    if let Some(run) = state.selected_run().cloned() {
-                                        spawn_fetch_run_detail(provider.clone(), run.id, tx.clone(), state);
-                                    }
+                                if run_active
+                                    && let Some(run) = state.selected_run().cloned()
+                                {
+                                    spawn_fetch_run_detail(provider.clone(), run.id, tx.clone(), state);
                                 }
                             }
                             _ => {}
                         }
+                        // View-independent: a pushed repo is followed into CI
+                        // even while its owner reads some other repo's logs.
+                        poll_push_watches(state, &provider, &tx);
                     }
                 }
             }
@@ -1020,6 +1088,10 @@ async fn handle_key(
                 let _ = open::that(&url);
                 state.set_status(format!("opened {}", card.spec));
             }
+            return None;
+        }
+        if state.view == View::GitStatus {
+            open_pr_in_browser(state);
             return None;
         }
         if let Some(url) = state.run_detail.as_ref().map(|d| d.run.url.clone())
@@ -1329,10 +1401,26 @@ async fn handle_key(
             } else if (key_is(&key, km.confirm) || key.code == KeyCode::Enter || key_is(&key, km.open_logs))
                 && let Some(detail) = &state.run_detail {
                     let items = build_detail_items(detail);
+                    let hms = |dt: chrono::DateTime<chrono::Utc>| {
+                        format!("{:02}:{:02}:{:02}", dt.hour(), dt.minute(), dt.second())
+                    };
                     match items.get(state.detail_cursor).copied() {
                         Some(DetailItem::Job(ji)) => {
                             if let Some(job) = detail.jobs.get(ji).cloned() {
-                                state.log_pending_section = None;
+                                // A failed job's logs open at the step that
+                                // broke, not at line one of a checkout step
+                                // nobody is here to read.
+                                state.log_pending_section = job
+                                    .steps
+                                    .iter()
+                                    .find(|s| s.status == Status::Failure)
+                                    .map(|s| {
+                                        (
+                                            s.name.clone(),
+                                            s.started_at.map(hms),
+                                            s.completed_at.map(hms),
+                                        )
+                                    });
                                 state.log_job_idx = Some(ji);
                                 state.switch_view(View::Logs);
                                 state.log_lines = vec!["loading...".into()];
@@ -1344,13 +1432,10 @@ async fn handle_key(
                                 detail.jobs.get(ji).cloned(),
                                 detail.jobs.get(ji).and_then(|j| j.steps.get(si)).cloned(),
                             ) {
-                                let hms = |dt: chrono::DateTime<chrono::Utc>| {
-                                    format!("{:02}:{:02}:{:02}", dt.hour(), dt.minute(), dt.second())
-                                };
                                 state.log_pending_section = Some((
                                     step.name.clone(),
-                                    step.started_at.map(&hms),
-                                    step.completed_at.map(&hms),
+                                    step.started_at.map(hms),
+                                    step.completed_at.map(hms),
                                 ));
                                 state.log_job_idx = Some(ji);
                                 state.switch_view(View::Logs);
@@ -2165,8 +2250,17 @@ fn batch_step(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
     if !batch.is_working() {
         return;
     }
+    let phase_before = batch.phase;
     let Some(idx) = batch.advance(tick) else {
-        // `advance` has already moved the phase to AskPush or Done.
+        // `advance` has already moved the phase on. If committing just ended
+        // at the push question, ask it the way every other commit asks it — a
+        // dialog with yes selected — not only as a banner that reads like a
+        // result. Only on the transition itself: an Esc that dismissed the
+        // dialog must not have it spring back on the next batch_step.
+        if phase_before == BatchPhase::Committing && batch.phase == BatchPhase::AskPush {
+            let committed = batch.tally().committed;
+            state.push_prompt = Some(PushPrompt::for_batch(committed));
+        }
         return;
     };
     let item = &batch.items[idx];
@@ -2315,6 +2409,7 @@ fn offer_push(state: &mut AppState, spec: &str) {
         branch: status.branch.clone(),
         has_upstream: status.has_upstream,
         yes: true,
+        batch_count: None,
     });
 }
 
@@ -2354,6 +2449,12 @@ fn accept_push_prompt(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>
         return;
     };
     if !p.yes {
+        return;
+    }
+    // A batch's yes pushes everything the batch committed; the batch tracks
+    // its own repos, so the prompt's spec/branch have nothing to add.
+    if p.batch_count.is_some() {
+        batch_start_push(state, tx);
         return;
     }
     // The push runs through the open working-tree view, so a view that has
@@ -2401,6 +2502,217 @@ fn push_current(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
     spawn_git_op_streaming(state, tx, "push", "pre-push", move |dir, out| {
         crate::git::push(dir, &branch, has_upstream, out)
     });
+}
+
+/// The GitHub coordinates behind a repo card, if it has any.
+fn github_spec_for(state: &AppState, spec: &str) -> Option<RepoSpec> {
+    let remote = state
+        .repos
+        .iter()
+        .find(|c| c.spec == spec)
+        .and_then(|c| c.remote.clone());
+    RepoSpec::parse(remote.as_deref().unwrap_or(spec)).ok()
+}
+
+/// Ask GitHub whether the branch has an open PR.
+///
+/// Deliberately outside the `pending` counter: this decorates the git view
+/// rather than being something the user asked for and waits on, and the header
+/// must not say "fetching" for decoration.
+fn spawn_fetch_pr(
+    state: &AppState,
+    provider: &Arc<GitHubProvider>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+    spec: &str,
+    branch: &str,
+) {
+    let Some(rs) = github_spec_for(state, spec) else {
+        return;
+    };
+    let p = provider.for_repo(rs);
+    let (spec, branch, tx) = (spec.to_string(), branch.to_string(), tx.clone());
+    tokio::spawn(async move {
+        // An error reads as "no PR": the line simply stays absent, which is
+        // the truthful render of "could not find one".
+        let pr = p.pr_for_branch(&branch).await.ok().flatten();
+        let _ = tx.send(AppEvent::PrLoaded(spec, branch, pr));
+    });
+}
+
+/// `o` in the working tree: the branch's PR if it has one, otherwise the page
+/// that would create it — the two answers to "take this branch to GitHub".
+fn open_pr_in_browser(state: &mut AppState) {
+    let Some(gv) = state.git_view.as_ref() else {
+        return;
+    };
+    if let Some(pr) = gv.open_pr() {
+        let (url, number) = (pr.url.clone(), pr.number);
+        let _ = open::that(&url);
+        state.set_status(format!("opened PR #{number}"));
+        return;
+    }
+    let Some(rs) = github_spec_for(state, &gv.spec) else {
+        state.set_status("no GitHub remote to open".into());
+        return;
+    };
+    let Some(status) = gv.status.as_ref() else {
+        return;
+    };
+    if status.detached {
+        state.set_status("detached HEAD — no branch to open a PR for".into());
+        return;
+    }
+    if !status.has_upstream {
+        state.set_status("push the branch first — a PR needs it on the remote".into());
+        return;
+    }
+    let url = format!(
+        "https://github.com/{}/{}/pull/new/{}",
+        rs.owner, rs.repo, status.branch
+    );
+    let _ = open::that(&url);
+    state.set_status(format!("opened create-PR page for {}", status.branch));
+}
+
+/// Follow a push into CI — see [`PushWatch`]. Replaces any watch already on
+/// the repo: the newest push is the one whose runs matter now.
+fn start_push_watch(state: &mut AppState, spec: &str) {
+    if github_spec_for(state, spec).is_none() {
+        return; // no GitHub remote — nothing will run anything to watch
+    }
+    let branch = state
+        .git_view
+        .as_ref()
+        .filter(|g| g.spec == spec)
+        .and_then(|g| g.status.as_ref())
+        .or_else(|| {
+            state
+                .repos
+                .iter()
+                .find(|c| c.spec == spec)
+                .and_then(|c| c.git.as_ref())
+        })
+        .filter(|s| !s.detached)
+        .map(|s| s.branch.clone());
+    state.push_watches.retain(|w| w.spec != spec);
+    state.push_watches.push(PushWatch {
+        spec: spec.to_string(),
+        branch,
+        pushed_at: chrono::Utc::now(),
+        started_tick: state.tick_count,
+        run: None,
+    });
+}
+
+/// How long an unattached watch keeps looking before concluding the push
+/// triggered nothing. Three minutes of 100ms ticks: GitHub usually stamps a
+/// run within seconds, so this is generous — but a watch that cannot end
+/// would poll forever on every push to a workflow-less repo.
+const PUSH_WATCH_GIVE_UP_TICKS: u64 = 1800;
+
+/// One request per watched repo per poll: the repo's newest runs, to find the
+/// pushed run or to see it settle.
+fn poll_push_watches(
+    state: &mut AppState,
+    provider: &Arc<GitHubProvider>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    if state.push_watches.is_empty() {
+        return;
+    }
+    let now = state.tick_count;
+    let mut gave_up: Vec<String> = Vec::new();
+    state.push_watches.retain(|w| {
+        let expired =
+            w.run.is_none() && now.saturating_sub(w.started_tick) >= PUSH_WATCH_GIVE_UP_TICKS;
+        if expired {
+            gave_up.push(w.spec.clone());
+        }
+        !expired
+    });
+    for spec in gave_up {
+        state.set_status(format!("{spec}: pushed, but no CI run appeared"));
+    }
+    let specs: Vec<String> = state.push_watches.iter().map(|w| w.spec.clone()).collect();
+    for spec in specs {
+        let Some(rs) = github_spec_for(state, &spec) else {
+            continue;
+        };
+        let p = provider.for_repo(rs);
+        let tx2 = tx.clone();
+        state.pending += 1;
+        tokio::spawn(async move {
+            let evt = match p.list_repo_runs(10).await {
+                Ok(runs) => AppEvent::PushWatchRuns(spec, runs),
+                Err(e) => AppEvent::TaskError(format!("push watch: {e:#}")),
+            };
+            let _ = tx2.send(evt);
+        });
+    }
+}
+
+/// Fold one scan of a watched repo's runs into its watch: attach the run the
+/// push spawned, or announce that run settling and end the watch.
+fn settle_push_watch(state: &mut AppState, spec: &str, runs: &[Run], config: &Config) {
+    let Some(idx) = state.push_watches.iter().position(|w| w.spec == spec) else {
+        return;
+    };
+    let w = &state.push_watches[idx];
+    let newly = w.run.is_none();
+    let current: Option<Run> = match &w.run {
+        Some(tracked) => runs.iter().find(|r| r.id == tracked.id).cloned(),
+        None => {
+            // GitHub can stamp the run a moment before the push call returns
+            // on our side; a little slack keeps a fast CI from being missed,
+            // and the branch filter keeps the slack honest.
+            let cutoff = w.pushed_at - chrono::Duration::seconds(30);
+            runs.iter()
+                .filter(|r| r.created_at >= cutoff)
+                .filter(|r| w.branch.as_deref().is_none_or(|b| r.head_branch == b))
+                .max_by_key(|r| r.created_at)
+                .cloned()
+        }
+    };
+    let Some(run) = current else {
+        return;
+    };
+    if run.status.is_terminal() {
+        state.push_watches.remove(idx);
+        // Claim the run from the dashboard's announcer, so whichever of the
+        // two saw it settle first is the only one that makes a noise.
+        state.watch_seen_running.remove(&run.id);
+        notify_run_finished(&run, spec, config);
+        state.set_status(format!(
+            "{spec}: {} {}",
+            if run.status.is_failure() { "✗" } else { "✓" },
+            run.display_title,
+        ));
+    } else {
+        if newly {
+            state.set_status(format!(
+                "{spec}: CI picked up the push — {}",
+                run.display_title
+            ));
+        }
+        state.push_watches[idx].run = Some(run);
+    }
+}
+
+/// Flat index (as `build_detail_items` counts rows) of the first failed step,
+/// or failing that the first failed job — where the cursor lands on a red run.
+fn first_failed_item(detail: &RunDetail) -> Option<usize> {
+    let items = build_detail_items(detail);
+    items
+        .iter()
+        .position(|it| {
+            matches!(it, DetailItem::Step { job, step }
+                if detail.jobs[*job].steps[*step].status == Status::Failure)
+        })
+        .or_else(|| {
+            items.iter().position(|it| {
+                matches!(it, DetailItem::Job(ji) if detail.jobs[*ji].status.is_failure())
+            })
+        })
 }
 
 fn handle_trigger_prompt_edit(state: &mut AppState, key: KeyEvent) {
@@ -3545,7 +3857,8 @@ fn trigger_workflow(
     }
     if !workflow.inputs.is_empty() {
         let return_view = state.view;
-        state.trigger_prompt = Some(TriggerPrompt::from_workflow(workflow, return_view));
+        let recall = state.history.last_dispatch_inputs(&workflow.file_name);
+        state.trigger_prompt = Some(TriggerPrompt::from_workflow(workflow, return_view, recall));
         state.switch_view(View::TriggerPrompt);
         return;
     }
@@ -3603,6 +3916,9 @@ fn submit_trigger_prompt(
     let return_view = prompt.return_view;
     state.trigger_prompt = None;
     state.switch_view(return_view);
+    // What was typed is what will be wanted next time — the prompt opens
+    // prefilled with it from here on.
+    state.history.record_dispatch_inputs(&file, &inputs);
     dispatch_trigger(state, &file, &name, inputs, provider, tx);
 }
 
@@ -3844,6 +4160,44 @@ mod tests {
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // tokio: saying yes spawns the first push op off-thread.
+    #[tokio::test]
+    async fn a_finished_batch_raises_the_same_push_dialog() {
+        let mut st = dashboard();
+        st.repo_marks.insert("acme/api".into());
+        st.repo_marks.insert("acme/web".into());
+        start_batch_commit(&mut st);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        {
+            let batch = st.batch.as_mut().unwrap();
+            batch.input = None;
+            batch.phase = BatchPhase::Committing;
+            for item in &mut batch.items {
+                item.state = crate::app::state::ItemState::Committed;
+            }
+        }
+        // The last commit landing walks the queue and finds it empty — that
+        // moment must raise the dialog, yes preselected, like any commit.
+        batch_step(&mut st, &tx);
+        let p = st.push_prompt.as_ref().expect("the batch asks with the dialog");
+        assert_eq!(p.batch_count, Some(2));
+        assert!(p.yes);
+
+        // Esc declines the dialog without ending the batch: the banner (and
+        // the push key) stay as the second chance…
+        handle_push_prompt(&mut st, press(KeyCode::Esc), &tx);
+        assert!(st.push_prompt.is_none());
+        assert_eq!(st.batch.as_ref().unwrap().phase, BatchPhase::AskPush);
+        // …and a stray batch_step must not resurrect the dismissed question.
+        batch_step(&mut st, &tx);
+        assert!(st.push_prompt.is_none());
+
+        // Enter on the dialog is the whole point: it starts the pushes.
+        st.push_prompt = Some(PushPrompt::for_batch(2));
+        handle_push_prompt(&mut st, press(KeyCode::Enter), &tx);
+        assert_eq!(st.batch.as_ref().unwrap().phase, BatchPhase::Pushing);
     }
 
     #[test]
@@ -4233,6 +4587,104 @@ mod tests {
         // Unknown values must not break startup.
         assert_eq!(mode("nonsense"), NotifyMode::Always);
         assert_eq!(Config::default().ui.notify_mode(), NotifyMode::Always);
+    }
+
+    fn quiet_config() -> Config {
+        let mut cfg = Config::default();
+        // Keep tests silent and headless.
+        cfg.ui.notify_sound = false;
+        cfg.ui.notify_desktop = false;
+        cfg
+    }
+
+    #[test]
+    fn a_push_is_followed_into_ci_until_the_run_it_spawned_settles() {
+        let mut st = dashboard();
+        let cfg = quiet_config();
+        start_push_watch(&mut st, "acme/api");
+        let w = st.push_watches.first().expect("a push starts a watch");
+        // The branch comes off the card's working tree, so only this branch's
+        // runs can be adopted.
+        assert_eq!(w.branch.as_deref(), Some("main"));
+        assert!(w.run.is_none());
+
+        // A run created after the push, on the pushed branch: adopted.
+        settle_push_watch(&mut st, "acme/api", &[run_with(7, Status::Running)], &cfg);
+        assert_eq!(
+            st.push_watches[0].run.as_ref().map(|r| r.id),
+            Some(7),
+            "the spawned run is attached"
+        );
+
+        // The same run settling ends the watch.
+        settle_push_watch(&mut st, "acme/api", &[run_with(7, Status::Failure)], &cfg);
+        assert!(st.push_watches.is_empty(), "a settled run ends the watch");
+    }
+
+    #[test]
+    fn runs_that_predate_the_push_or_ride_another_branch_are_not_adopted() {
+        let mut st = dashboard();
+        let cfg = quiet_config();
+        start_push_watch(&mut st, "acme/api");
+
+        let mut old = run_with(3, Status::Running);
+        old.created_at = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let mut elsewhere = run_with(4, Status::Running);
+        elsewhere.head_branch = "feature".into();
+
+        settle_push_watch(&mut st, "acme/api", &[old, elsewhere], &cfg);
+        assert!(
+            st.push_watches[0].run.is_none(),
+            "neither an old run nor another branch's is the push's offspring"
+        );
+    }
+
+    // async: even constructing an octocrab client wants a tokio reactor.
+    #[tokio::test]
+    async fn a_watch_that_never_finds_a_run_gives_up() {
+        let mut st = dashboard();
+        start_push_watch(&mut st, "acme/api");
+        st.tick_count += PUSH_WATCH_GIVE_UP_TICKS;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let provider = Arc::new(
+            GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "test-token".into())
+                .unwrap(),
+        );
+        poll_push_watches(&mut st, &provider, &tx);
+        assert!(st.push_watches.is_empty());
+    }
+
+    #[test]
+    fn a_failed_run_lands_the_cursor_on_the_step_that_broke() {
+        let step = |name: &str, status| Step {
+            name: name.into(),
+            status,
+            started_at: None,
+            completed_at: None,
+        };
+        let detail = RunDetail {
+            run: run_with(1, Status::Failure),
+            jobs: vec![
+                crate::provider::Job {
+                    id: 1,
+                    name: "build".into(),
+                    status: Status::Success,
+                    steps: vec![step("compile", Status::Success)],
+                },
+                crate::provider::Job {
+                    id: 2,
+                    name: "test".into(),
+                    status: Status::Failure,
+                    steps: vec![
+                        step("checkout", Status::Success),
+                        step("pytest", Status::Failure),
+                    ],
+                },
+            ],
+        };
+        // Rows flatten as job, its steps, next job, its steps — the failing
+        // `pytest` step is row 4, and that is where a red run should open.
+        assert_eq!(first_failed_item(&detail), Some(4));
     }
 
     #[test]

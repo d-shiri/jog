@@ -11,7 +11,7 @@ use crate::config::KeymapConfig;
 use crate::git::RepoStatus;
 use crate::history::History;
 use crate::provider::github::{ApiError, Quota};
-use crate::provider::{Run, RunDetail, Status, Workflow};
+use crate::provider::{PrInfo, Run, RunDetail, Status, Workflow};
 
 
 #[derive(Debug, Clone, Copy)]
@@ -78,6 +78,48 @@ pub struct PushPrompt {
     pub has_upstream: bool,
     /// The highlighted answer. Starts on yes; Enter takes it.
     pub yes: bool,
+    /// `Some(n)` when the question is a finished batch's — "push all n?" —
+    /// rather than one branch's. `spec`/`branch` are unused then: the batch
+    /// itself knows which repos are ready to push.
+    pub batch_count: Option<usize>,
+}
+
+impl PushPrompt {
+    /// The question a finished batch raises: one dialog for all its commits,
+    /// the same shape as the single-repo one, so the answer costs the same
+    /// keystroke everywhere.
+    pub fn for_batch(count: usize) -> Self {
+        Self {
+            spec: String::new(),
+            branch: String::new(),
+            has_upstream: true,
+            yes: true,
+            batch_count: Some(count),
+        }
+    }
+}
+
+/// A push being followed into CI: first watching for the run it spawns, then
+/// for that run to settle.
+///
+/// This exists because polling is per-view: push from the working tree and walk
+/// off to read logs, and nothing would otherwise fetch that repo again — the
+/// run your push started could fail unannounced. The watch polls on its own,
+/// whatever is on screen, and ends itself when the run lands (or none appears).
+#[derive(Debug, Clone)]
+pub struct PushWatch {
+    /// Repo the push went to (a `RepoCard` key).
+    pub spec: String,
+    /// Branch that was pushed, when it was knowable at push time. `None` makes
+    /// the match fall back to "any run created after the push".
+    pub branch: Option<String>,
+    /// When the push landed — runs created before it are not its offspring.
+    pub pushed_at: chrono::DateTime<chrono::Utc>,
+    /// Tick the watch started on, for giving up when no run ever appears
+    /// (plenty of pushes trigger no workflow at all).
+    pub started_tick: u64,
+    /// The run the push spawned, once one has been spotted.
+    pub run: Option<Run>,
 }
 
 /// The working-tree view for one local checkout: stage, commit, push, then hand
@@ -96,6 +138,11 @@ pub struct GitView {
     /// Whether this repo has a GitHub remote, i.e. whether CI can be triggered
     /// after committing.
     pub has_ci: bool,
+    /// The open PR riding the branch, and which branch that answer was fetched
+    /// for. `None` until asked; the branch is kept so switching branches (or a
+    /// push, which clears this) asks again while ordinary status refreshes
+    /// don't.
+    pub pr: Option<(String, Option<PrInfo>)>,
 }
 
 impl GitView {
@@ -108,7 +155,13 @@ impl GitView {
             commit_input: None,
             busy: false,
             has_ci,
+            pr: None,
         }
+    }
+
+    /// The PR shown to the user, if the branch has one.
+    pub fn open_pr(&self) -> Option<&PrInfo> {
+        self.pr.as_ref().and_then(|(_, p)| p.as_ref())
     }
 
     pub fn entries(&self) -> &[crate::git::StatusEntry] {
@@ -821,6 +874,10 @@ pub struct TriggerField {
     pub value: String,
     pub required: bool,
     pub options: Option<Vec<String>>,
+    /// The value came from the last dispatch rather than the YAML default —
+    /// worth a marker, because a prefilled value you did not notice is how a
+    /// deploy goes to yesterday's target.
+    pub recalled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -835,15 +892,37 @@ pub struct TriggerPrompt {
 }
 
 impl TriggerPrompt {
-    pub fn from_workflow(workflow: &Workflow, return_view: View) -> Self {
+    /// `recall` is what the user dispatched this workflow with last time; where
+    /// present (and still a legal choice) it wins over the YAML default. The
+    /// default is what the workflow author guessed; the recall is what this
+    /// user actually wanted, demonstrated once already.
+    pub fn from_workflow(
+        workflow: &Workflow,
+        return_view: View,
+        recall: Option<&HashMap<String, String>>,
+    ) -> Self {
         let fields = workflow
             .inputs
             .iter()
-            .map(|i| TriggerField {
-                name: i.name.clone(),
-                value: i.default.clone().unwrap_or_default(),
-                required: i.required,
-                options: i.options.clone(),
+            .map(|i| {
+                let default = i.default.clone().unwrap_or_default();
+                let recalled = recall
+                    .and_then(|m| m.get(&i.name))
+                    .filter(|v| !v.is_empty())
+                    .filter(|v| {
+                        i.options
+                            .as_ref()
+                            .is_none_or(|opts| opts.iter().any(|o| o == *v))
+                    })
+                    .filter(|v| **v != default)
+                    .cloned();
+                TriggerField {
+                    name: i.name.clone(),
+                    recalled: recalled.is_some(),
+                    value: recalled.unwrap_or(default),
+                    required: i.required,
+                    options: i.options.clone(),
+                }
             })
             .collect();
         Self {
@@ -1404,6 +1483,9 @@ pub struct AppState {
     /// Entries are dropped the moment a run settles, so the strip appears and
     /// clears itself.
     pub run_progress: HashMap<String, Vec<RunDetail>>,
+    /// Pushes being followed into CI — see [`PushWatch`]. A vec, not an option:
+    /// a batch push starts one per repo.
+    pub push_watches: Vec<PushWatch>,
 }
 
 impl AppState {
@@ -1491,6 +1573,7 @@ impl AppState {
             poll_ticks: 50,
             last_poll_tick: 0,
             run_progress: HashMap::new(),
+            push_watches: Vec::new(),
         }
     }
 
@@ -2415,6 +2498,60 @@ fn strip_time_prefix(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::WorkflowInput;
+
+    #[test]
+    fn the_trigger_prompt_prefills_what_was_dispatched_last_time() {
+        let wf = Workflow {
+            name: "Deploy".into(),
+            file_name: "deploy.yml".into(),
+            triggerable: true,
+            last_status: None,
+            last_run_at: None,
+            inputs: vec![
+                WorkflowInput {
+                    name: "env".into(),
+                    required: false,
+                    default: Some("staging".into()),
+                    options: Some(vec!["staging".into(), "prod".into()]),
+                },
+                WorkflowInput {
+                    name: "tag".into(),
+                    required: false,
+                    default: None,
+                    options: None,
+                },
+                WorkflowInput {
+                    name: "mode".into(),
+                    required: false,
+                    default: Some("fast".into()),
+                    options: Some(vec!["fast".into(), "slow".into()]),
+                },
+            ],
+        };
+        let recall: HashMap<String, String> = [
+            ("env".to_string(), "prod".to_string()),
+            ("tag".to_string(), "v3".to_string()),
+            // A choice the workflow no longer offers must not be resurrected.
+            ("mode".to_string(), "gone".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let p = TriggerPrompt::from_workflow(&wf, View::Workflows, Some(&recall));
+        let field = |n: &str| p.fields.iter().find(|f| f.name == n).unwrap();
+        assert_eq!(field("env").value, "prod");
+        assert!(field("env").recalled, "a recall that changed the value is marked");
+        assert_eq!(field("tag").value, "v3");
+        assert!(field("tag").recalled);
+        assert_eq!(field("mode").value, "fast", "an invalid recall falls back to the default");
+        assert!(!field("mode").recalled);
+
+        // Without history the defaults stand, unmarked.
+        let bare = TriggerPrompt::from_workflow(&wf, View::Workflows, None);
+        assert_eq!(bare.fields[0].value, "staging");
+        assert!(bare.fields.iter().all(|f| !f.recalled));
+    }
 
     fn lines(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()

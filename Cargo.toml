@@ -1,6 +1,6 @@
 [package]
 name = "jog"
-version = "0.1.13"
+version = "0.1.17"
 edition = "2024"
 license = "MIT"
 description = "A terminal UI for git and GitHub Actions across several repos: stage, commit, push, trigger and watch CI."
@@ -30,7 +30,7 @@ rayon = "1.12.0"
 
 [profile.release]
 opt-level = "z"      # or "s" (z = smallest)
-lto = true           # link-time optimization
-codegen-units = 1    # better optimization, smaller binary
+lto = false          # fat LTO cost ~30s/build for ~2MB of size — not worth it here
+codegen-units = 16   # parallel codegen across all cores
 panic = "abort"      # removes unwinding machinery
 strip = true         # strips symbols (since Rust 1.70+)
