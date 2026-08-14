@@ -416,9 +416,25 @@ async fn event_loop(
                             for r in &runs {
                                 announce_if_finished(state, r, &label, &config);
                             }
+                            // Hold the selection across the refresh, by run id
+                            // rather than by position. The Runs view re-fetches
+                            // on every poll while anything is in flight — which
+                            // is precisely when the list is worth reading — so
+                            // resetting to the top here threw the cursor off
+                            // whatever had been scrolled to, every few seconds.
+                            //
+                            // Watch is the exception and keeps the old rule: it
+                            // follows the newest run by definition.
+                            let held = (state.view != View::Watch)
+                                .then(|| state.selected_run().map(|r| r.id))
+                                .flatten();
                             state.runs = runs;
-                            state.run_cursor = 0;
-                            if let Some(r) = state.runs.first().cloned() {
+                            state.run_cursor = held
+                                .and_then(|id| state.runs.iter().position(|r| r.id == id))
+                                .unwrap_or(0);
+                            // The preview belongs to the cursor, not to the head
+                            // of the list.
+                            if let Some(r) = state.runs.get(state.run_cursor).cloned() {
                                 spawn_fetch_run_preview(provider.clone(), r.id, tx.clone(), state);
                             }
                         }
@@ -1142,7 +1158,7 @@ async fn handle_key(
                 }
             }),
             View::Logs => state.log_rendered
-                .get(state.log_line_cursor as usize)
+                .get(state.log_line_cursor)
                 .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect()),
             View::Diff => state.run_detail.as_ref().map(|d| d.run.url.clone()),
             View::TriggerPrompt => None,
@@ -1448,8 +1464,8 @@ async fn handle_key(
                 }
         }
         View::Logs => {
-            let total_rendered = state.log_rendered.len() as u16;
-            let viewport = state.last_logs_viewport_height.get().max(1);
+            let total_rendered = state.log_rendered.len();
+            let viewport = state.last_logs_viewport_height.get().max(1) as usize;
             let max_cursor = total_rendered.saturating_sub(1);
 
             if key_is(&key, km.down) || key.code == KeyCode::Down {
@@ -1476,7 +1492,7 @@ async fn handle_key(
                     // Keep the eye where it was: the revealed lines push
                     // everything below down, so hold the line that was under
                     // the cursor rather than the row number.
-                    let anchor = state.log_rendered_src.get(cursor as usize).copied();
+                    let anchor = state.log_rendered_src.get(cursor).copied();
                     state.recompute_log_rendered();
                     if let Some(row) = anchor.and_then(|s| state.rendered_row_for_src(s)) {
                         state.log_line_cursor = row;
@@ -1646,7 +1662,7 @@ fn toggle_log_focus(state: &mut AppState) {
     // to an unrelated part of the log when the filter flips.
     let anchor = state
         .log_rendered_src
-        .get(state.log_line_cursor as usize)
+        .get(state.log_line_cursor)
         .copied();
     state.log_scroll = 0;
     state.log_line_cursor = 0;
@@ -1720,7 +1736,7 @@ fn jump_log_error(state: &mut AppState, dir: i32) {
     }
     let cur_src = state
         .log_rendered_src
-        .get(state.log_line_cursor as usize)
+        .get(state.log_line_cursor)
         .copied()
         .unwrap_or(0);
     let target = if dir > 0 {
@@ -2610,6 +2626,16 @@ fn start_push_watch(state: &mut AppState, spec: &str) {
 /// would poll forever on every push to a workflow-less repo.
 const PUSH_WATCH_GIVE_UP_TICKS: u64 = 1800;
 
+/// A hard ceiling on any watch, attached or not.
+///
+/// The deadline above only ever covered watches that never found a run. One
+/// that *had* found a run had no deadline at all, so a run which neither settles
+/// nor disappears — queued indefinitely because no runner is free — was followed
+/// for as long as jog stayed open, spending a request per poll on an answer that
+/// was never going to change. Two hours of 100ms ticks: longer than any CI run
+/// worth following, short enough to end.
+const PUSH_WATCH_MAX_TICKS: u64 = 72_000;
+
 /// One request per watched repo per poll: the repo's newest runs, to find the
 /// pushed run or to see it settle.
 fn poll_push_watches(
@@ -2621,17 +2647,23 @@ fn poll_push_watches(
         return;
     }
     let now = state.tick_count;
-    let mut gave_up: Vec<String> = Vec::new();
+    let mut gave_up: Vec<(String, bool)> = Vec::new();
     state.push_watches.retain(|w| {
+        let age = now.saturating_sub(w.started_tick);
+        let attached = w.run.is_some();
         let expired =
-            w.run.is_none() && now.saturating_sub(w.started_tick) >= PUSH_WATCH_GIVE_UP_TICKS;
+            age >= PUSH_WATCH_MAX_TICKS || (!attached && age >= PUSH_WATCH_GIVE_UP_TICKS);
         if expired {
-            gave_up.push(w.spec.clone());
+            gave_up.push((w.spec.clone(), attached));
         }
         !expired
     });
-    for spec in gave_up {
-        state.set_status(format!("{spec}: pushed, but no CI run appeared"));
+    for (spec, attached) in gave_up {
+        state.set_status(if attached {
+            format!("{spec}: stopped following its run — still going after two hours")
+        } else {
+            format!("{spec}: pushed, but no CI run appeared")
+        });
     }
     let specs: Vec<String> = state.push_watches.iter().map(|w| w.spec.clone()).collect();
     for spec in specs {
@@ -2674,14 +2706,24 @@ fn settle_push_watch(state: &mut AppState, spec: &str, runs: &[Run], config: &Co
         }
     };
     let Some(run) = current else {
+        // A watch that had already adopted a run and can no longer find it is
+        // done: `list_repo_runs` returns a fixed window over *every* workflow,
+        // so on a busy repo the run drops out of it within minutes and is never
+        // coming back. Kept here, the watch would poll this repo once per
+        // interval for the rest of the session. A watch that has not adopted
+        // anything yet is still waiting legitimately — that is what the deadline
+        // in `poll_push_watches` is for — so it is left alone.
+        if !newly {
+            state.push_watches.remove(idx);
+        }
         return;
     };
     if run.status.is_terminal() {
         state.push_watches.remove(idx);
-        // Claim the run from the dashboard's announcer, so whichever of the
-        // two saw it settle first is the only one that makes a noise.
+        // Also drop it from the "seen running" set, so the dashboard's announcer
+        // stops carrying a run that has already settled.
         state.watch_seen_running.remove(&run.id);
-        notify_run_finished(&run, spec, config);
+        let _ = notify_run_finished(state, &run, spec, config);
         state.set_status(format!(
             "{spec}: {} {}",
             if run.status.is_failure() { "✗" } else { "✓" },
@@ -4014,11 +4056,36 @@ fn announce_if_finished(state: &mut AppState, run: &Run, repo_label: &str, confi
     if !state.watch_seen_running.remove(&run.id) {
         return;
     }
-    notify_run_finished(run, repo_label, config);
+    let _ = notify_run_finished(state, run, repo_label, config);
 }
 
-/// Sound + desktop notification for a finished run, gated on `ui.notify`.
-fn notify_run_finished(run: &Run, repo_label: &str, config: &Config) {
+/// Sound + desktop notification for a finished run, gated on `ui.notify` — and
+/// on the run not having been announced already.
+///
+/// Two watchers can see the same run settle on the same tick: the dashboard poll
+/// and a push watch following your own push, both fetching the same repo. That
+/// run is the one you care most about, and it was the one that got announced
+/// twice — two sounds, two desktop notifications.
+///
+/// The ledger lives *inside* this function rather than in a wrapper around it,
+/// so there is no second door: announcing a run without going through the dedupe
+/// is not something a call site can do by accident. It takes `&mut AppState` for
+/// that reason alone. Returns whether this call was the one that announced.
+fn notify_run_finished(
+    state: &mut AppState,
+    run: &Run,
+    repo_label: &str,
+    config: &Config,
+) -> bool {
+    if !state.announced_runs.insert(run.id) {
+        return false;
+    }
+    notify_now(run, repo_label, config);
+    true
+}
+
+/// Raise the notification, with no questions asked about whether it is a repeat.
+fn notify_now(run: &Run, repo_label: &str, config: &Config) {
     let wanted = match config.ui.notify_mode() {
         NotifyMode::Never => false,
         NotifyMode::Failure => run.status.is_failure(),
@@ -4902,5 +4969,157 @@ mod tests {
         assert!(s1.iter().any(|l| l.contains("other")));
         assert!(!s1.iter().any(|l| l.contains("Outer A")));
     }
-}
 
+    // ── Regression: refresh, watch lifetime, and announcing ───────────────
+
+    /// A runs list under a workflow, as the Runs view holds it.
+    fn runs_view(ids: &[u64]) -> AppState {
+        let mut st = empty_state();
+        st.view = View::Runs;
+        st.workflow_for_runs = Some("ci.yml".into());
+        st.runs = ids.iter().map(|&i| run_with(i, Status::Running)).collect();
+        st
+    }
+
+    /// What the `RunsLoaded` arm does to the cursor, extracted so the rule can
+    /// be tested without standing up the whole event loop.
+    fn apply_runs_loaded(st: &mut AppState, runs: Vec<Run>) {
+        let held = (st.view != View::Watch)
+            .then(|| st.selected_run().map(|r| r.id))
+            .flatten();
+        st.runs = runs;
+        st.run_cursor = held
+            .and_then(|id| st.runs.iter().position(|r| r.id == id))
+            .unwrap_or(0);
+    }
+
+    #[test]
+    fn a_poll_refresh_keeps_the_run_the_user_selected() {
+        let mut st = runs_view(&[10, 9, 8, 7, 6]);
+        st.run_cursor = 3; // run #7
+
+        // The poll re-fetches while anything is in flight. Same list back.
+        apply_runs_loaded(&mut st, (0..5).map(|i| run_with(10 - i, Status::Running)).collect());
+        assert_eq!(st.selected_run().map(|r| r.id), Some(7), "cursor followed the run");
+
+        // A newer run arrives at the head: the selection shifts down a row to
+        // stay on the same run, rather than staying put and pointing at another.
+        let grown: Vec<Run> = (0..6).map(|i| run_with(11 - i, Status::Running)).collect();
+        apply_runs_loaded(&mut st, grown);
+        assert_eq!(st.run_cursor, 4);
+        assert_eq!(st.selected_run().map(|r| r.id), Some(7));
+
+        // The selected run falls off the end of the window: back to the top,
+        // which is the only honest answer left.
+        apply_runs_loaded(&mut st, vec![run_with(20, Status::Running)]);
+        assert_eq!(st.run_cursor, 0);
+    }
+
+    #[test]
+    fn watch_still_follows_the_newest_run() {
+        // Watch is about the run at the head of the list, by definition — the
+        // hold-the-cursor rule must not leak into it.
+        let mut st = runs_view(&[10, 9, 8]);
+        st.view = View::Watch;
+        st.run_cursor = 2;
+        apply_runs_loaded(&mut st, vec![
+            run_with(11, Status::Running),
+            run_with(10, Status::Running),
+        ]);
+        assert_eq!(st.run_cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn a_watch_whose_run_ages_out_of_the_recent_list_stops_polling() {
+        let mut st = dashboard();
+        let cfg = quiet_config();
+        start_push_watch(&mut st, "acme/api");
+        settle_push_watch(&mut st, "acme/api", &[run_with(7, Status::Running)], &cfg);
+        assert_eq!(st.push_watches[0].run.as_ref().map(|r| r.id), Some(7));
+
+        // `list_repo_runs` is a fixed window over every workflow, so on a busy
+        // repo the tracked run drops out of it and never returns. Kept, the
+        // watch would spend a request per poll on it for the rest of the
+        // session — and pin the header chip on a run that never resolves.
+        let newer: Vec<Run> = (100..110).map(|i| run_with(i, Status::Running)).collect();
+        settle_push_watch(&mut st, "acme/api", &newer, &cfg);
+        assert!(st.push_watches.is_empty(), "the stale watch is dropped");
+    }
+
+    #[tokio::test]
+    async fn a_watch_still_waiting_for_its_run_is_not_dropped_for_not_finding_one() {
+        // The same "not found" answer means something different before a run has
+        // been adopted: CI simply has not stamped it yet. That case has its own
+        // deadline and must survive the check above.
+        let mut st = dashboard();
+        let cfg = quiet_config();
+        start_push_watch(&mut st, "acme/api");
+        let old = {
+            let mut r = run_with(3, Status::Running);
+            r.created_at = chrono::Utc::now() - chrono::Duration::minutes(10);
+            r
+        };
+        settle_push_watch(&mut st, "acme/api", &[old], &cfg);
+        assert_eq!(st.push_watches.len(), 1, "still waiting, not given up on");
+        assert!(st.push_watches[0].run.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_watch_that_never_ends_is_still_bounded() {
+        let mut st = dashboard();
+        let cfg = quiet_config();
+        start_push_watch(&mut st, "acme/api");
+        // Adopted, and then queued forever because no runner is free.
+        settle_push_watch(&mut st, "acme/api", &[run_with(7, Status::Queued)], &cfg);
+        assert_eq!(st.push_watches.len(), 1);
+
+        st.tick_count += PUSH_WATCH_MAX_TICKS;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let provider = Arc::new(
+            GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "test-token".into())
+                .unwrap(),
+        );
+        poll_push_watches(&mut st, &provider, &tx);
+        assert!(st.push_watches.is_empty(), "the hard ceiling ends it");
+    }
+
+    #[tokio::test]
+    async fn a_run_two_watchers_see_settle_is_announced_once() {
+        let mut st = dashboard();
+        let cfg = quiet_config();
+        let finished = run_with(7, Status::Failure);
+
+        // Your own push, followed into CI, with the dashboard polling the same
+        // repo. Both of them see run 7 in flight…
+        start_push_watch(&mut st, "acme/api");
+        settle_push_watch(&mut st, "acme/api", &[run_with(7, Status::Running)], &cfg);
+        announce_if_finished(&mut st, &run_with(7, Status::Running), "acme/api", &cfg);
+
+        // …and then both see it settle. The dashboard's poll lands first and
+        // makes the noise.
+        announce_if_finished(&mut st, &finished, "acme/api", &cfg);
+        assert!(st.announced_runs.contains(&7));
+
+        // The push watch arrives with the same run a moment later. It still ends
+        // its watch — but it must not announce a second time.
+        settle_push_watch(&mut st, "acme/api", std::slice::from_ref(&finished), &cfg);
+        assert!(st.push_watches.is_empty(), "the watch is still finished off");
+        assert!(
+            !notify_run_finished(&mut st, &finished, "acme/api", &cfg),
+            "the run was already announced — a second sound and popup is the bug"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_push_watch_announces_a_run_the_dashboard_never_saw_running() {
+        // The other direction: CI so fast that the first poll after the push
+        // already shows the run finished. Nothing put it in `watch_seen_running`,
+        // so the dedupe must not swallow the announcement outright.
+        let mut st = dashboard();
+        let cfg = quiet_config();
+        start_push_watch(&mut st, "acme/api");
+        settle_push_watch(&mut st, "acme/api", &[run_with(7, Status::Success)], &cfg);
+        assert!(st.announced_runs.contains(&7), "the push's own run is announced");
+        assert!(st.push_watches.is_empty());
+    }
+}

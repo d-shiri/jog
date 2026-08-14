@@ -227,13 +227,19 @@ fn classify_octocrab(err: &octocrab::Error) -> ApiError {
 /// apart: "API rate limit exceeded" for the hourly budget, "You have exceeded a
 /// secondary rate limit" for bursts. Both are wait-it-out, and neither is the
 /// permissions problem the bare status code would suggest.
+///
+/// 429 needs no prose to be read: it is the rate-limit status and nothing else.
+/// Sorting it under `Denied` sent the user off to check token scopes and SSO for
+/// something only the clock can fix — so it is decided by its number, while 403
+/// still has to be read, because for 403 the number genuinely is ambiguous.
 fn fault_for(status: u16, message: &str) -> ApiFault {
     if message.to_lowercase().contains("rate limit") {
         return ApiFault::RateLimited;
     }
     match status {
         401 => ApiFault::BadCredentials,
-        403 | 429 => ApiFault::Denied,
+        429 => ApiFault::RateLimited,
+        403 => ApiFault::Denied,
         404 => ApiFault::NotFound,
         500..=599 => ApiFault::Unreachable,
         _ => ApiFault::Other,
@@ -665,6 +671,13 @@ fn clean_log_line(raw: &str) -> String {
 
 /// Returns `(Some("HH:MM:SS"), content)` when the line starts with a GitHub Actions
 /// ISO timestamp (`2025-04-29T08:12:34.5678901Z `), otherwise `(None, whole_line)`.
+///
+/// The byte checks pin down the separators but say nothing about bytes 17 and
+/// 18, so the `HH:MM:SS` window is taken with `get` rather than by slicing: a
+/// multi-byte character starting at either of them straddles offset 19, and
+/// slicing there would panic on a line that is merely shaped a bit like a
+/// timestamp. A line that fails the check keeps its text whole, which is the
+/// right answer for one that was never stamped in the first place.
 fn extract_time(s: &str) -> (Option<&str>, &str) {
     if s.len() > 20
         && s.as_bytes().get(4) == Some(&b'-')
@@ -672,8 +685,9 @@ fn extract_time(s: &str) -> (Option<&str>, &str) {
         && s.as_bytes().get(10) == Some(&b'T')
         && s.as_bytes().get(13) == Some(&b':')
         && s.as_bytes().get(16) == Some(&b':')
+        && let Some(hms) = s.get(11..19)
         && let Some(idx) = s.find(' ') {
-            return (Some(&s[11..19]), &s[idx + 1..]);
+            return (Some(hms), &s[idx + 1..]);
         }
     (None, s)
 }
@@ -710,6 +724,29 @@ mod tests {
         assert_eq!(fault_for(401, "Bad credentials"), ApiFault::BadCredentials);
         assert_eq!(fault_for(404, "Not Found"), ApiFault::NotFound);
         assert_eq!(fault_for(502, "Bad gateway"), ApiFault::Unreachable);
+    }
+
+    #[test]
+    fn a_bare_429_is_a_rate_limit_without_having_to_say_so() {
+        // 429 means one thing. Read as "access denied" it sent the user off to
+        // audit token scopes and SSO for something the clock fixes on its own.
+        assert_eq!(fault_for(429, "Too Many Requests"), ApiFault::RateLimited);
+        assert_eq!(fault_for(429, ""), ApiFault::RateLimited);
+        // 403 stays ambiguous by nature, so it still has to be read.
+        assert_eq!(fault_for(403, "Resource not accessible"), ApiFault::Denied);
+    }
+
+    #[test]
+    fn a_line_shaped_like_a_timestamp_does_not_split_a_character_in_half() {
+        // Passes every separator check, then turns multi-byte across offset 19.
+        // Slicing blind here took the whole TUI down from one malformed line.
+        let raw = "2025-04-29T08:12:3\u{2764}\u{2764} rest";
+        assert_eq!(clean_log_line(raw), raw, "no timestamp found, so nothing is stripped");
+
+        // The genuine article still parses, including the tight variant where
+        // the separating space lands exactly at the end of the HH:MM:SS window.
+        assert_eq!(clean_log_line("2025-04-29T08:12:34.567Z hi"), "08:12:34 hi");
+        assert_eq!(clean_log_line("2025-04-29T08:12:34 hi"), "08:12:34 hi");
     }
 
     #[test]

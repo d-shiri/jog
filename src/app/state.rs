@@ -1333,16 +1333,24 @@ pub struct AppState {
     pub log_step_names: Vec<String>,
     pub log_groups: Vec<LogGroup>,
     pub log_collapsed: HashSet<usize>,
-    pub log_line_cursor: u16,
-    pub log_group_header_rows: Vec<u16>,
-    pub log_rendered_group_map: HashMap<u16, usize>,
+    /// Rendered row the cursor sits on.
+    ///
+    /// `usize`, along with every other rendered-row index below. These counted
+    /// rows in a `u16` while nothing caps how many lines a job log has: a
+    /// verbose build or a matrix test job clears 65 535 without trying, and past
+    /// that the counter wrapped — silently in release, where `[profile.release]`
+    /// turns overflow checks off — so group headers, fold markers and the
+    /// minimap were all keyed 65 536 rows away from where they were drawn.
+    pub log_line_cursor: usize,
+    pub log_group_header_rows: Vec<usize>,
+    pub log_rendered_group_map: HashMap<usize, usize>,
     /// Focus mode: show only error/warning lines plus `log_focus_context` lines
     /// of surrounding context, ignoring group collapse state.
     pub log_focus: bool,
     pub log_focus_context: usize,
     /// Fold markers standing in for skipped lines while focused: rendered row ->
     /// how many source lines it hides.
-    pub log_fold_rows: HashMap<u16, usize>,
+    pub log_fold_rows: HashMap<usize, usize>,
     /// Source line each fold starts at, for folds the user has opened back up.
     /// Two lines of context is enough to spot an error and never enough to
     /// understand it, so the surrounding block has to be one keypress away.
@@ -1358,7 +1366,9 @@ pub struct AppState {
     /// (step_name, started_hms, completed_hms) stored when navigating into logs from a specific step.
     /// started/completed are "HH:MM:SS" strings derived from the GitHub API step timestamps.
     pub log_pending_section: Option<(String, Option<String>, Option<String>)>,
-    pub log_scroll: u16,
+    /// Index into `log_rendered` of the first row drawn. See `log_line_cursor`
+    /// for why this is not a `u16`.
+    pub log_scroll: usize,
     /// Inner viewport height of the Logs pane, captured at last render.
     /// Used to clamp `log_scroll` so users can't scroll past the bottom.
     /// Cell so render can write through `&AppState`.
@@ -1412,6 +1422,9 @@ pub struct AppState {
     /// Run IDs we have seen in a non-terminal state during this Watch session.
     /// Used to fire a sound only when a run we were actively watching finishes.
     pub watch_seen_running: HashSet<u64>,
+    /// Run IDs already announced, so a run that two watchers spot settling on
+    /// the same tick still only makes one noise. See `announce_once`.
+    pub announced_runs: HashSet<u64>,
     /// Multi-repo dashboard rows, in configured order.
     pub repos: Vec<RepoCard>,
     pub repo_cursor: usize,
@@ -1551,6 +1564,7 @@ impl AppState {
             history,
             theme: Theme::default(),
             watch_seen_running: HashSet::new(),
+            announced_runs: HashSet::new(),
             repos: Vec::new(),
             repo_cursor: 0,
             quota: None,
@@ -1643,7 +1657,7 @@ impl AppState {
         self.log_groups = parse_log_groups(&self.log_lines);
         self.log_collapsed = (0..self.log_groups.len()).collect();
         self.log_line_cursor = 0;
-        self.log_group_header_rows = vec![0u16; self.log_groups.len()];
+        self.log_group_header_rows = vec![0usize; self.log_groups.len()];
         self.log_rendered_group_map = HashMap::new();
         let (errors, warnings) = classify_log_severity(&self.log_lines);
         self.log_error_lines = errors;
@@ -1727,11 +1741,11 @@ impl AppState {
 
     /// Open the fold under `row`, if that row is one. Returns whether anything
     /// changed, so the caller knows whether to re-render.
-    pub fn expand_fold_at(&mut self, row: u16) -> bool {
+    pub fn expand_fold_at(&mut self, row: usize) -> bool {
         if !self.log_fold_rows.contains_key(&row) {
             return false;
         }
-        match self.log_rendered_src.get(row as usize).copied() {
+        match self.log_rendered_src.get(row).copied() {
             Some(anchor) => self.log_focus_expanded.insert(anchor),
             None => false,
         }
@@ -1774,13 +1788,13 @@ impl AppState {
 
     /// Largest useful `log_scroll`: the first line such that everything after it
     /// still fills the viewport, so the last line can be reached but no further.
-    pub fn max_log_scroll(&self) -> u16 {
+    pub fn max_log_scroll(&self) -> usize {
         let viewport = self.last_logs_viewport_height.get().max(1) as usize;
         let mut used = 0usize;
         for row in (0..self.log_rendered.len()).rev() {
             used += self.visual_height_of_row(row) as usize;
             if used > viewport {
-                return (row + 1).min(u16::MAX as usize) as u16;
+                return row + 1;
             }
         }
         0
@@ -1793,12 +1807,12 @@ impl AppState {
     /// line one at a time instead would rescan forward on every step — O(n²),
     /// and a visible freeze when jumping to the end of a long log.
     pub fn keep_cursor_visible(&mut self) {
-        let cursor = self.log_line_cursor as usize;
-        if (cursor as u16) < self.log_scroll {
-            self.log_scroll = cursor as u16;
+        let cursor = self.log_line_cursor;
+        if cursor < self.log_scroll {
+            self.log_scroll = cursor;
             return;
         }
-        if self.last_visible_row(self.log_scroll as usize) >= cursor {
+        if self.last_visible_row(self.log_scroll) >= cursor {
             return; // already on screen
         }
         let viewport = self.last_logs_viewport_height.get().max(1) as usize;
@@ -1813,7 +1827,7 @@ impl AppState {
             first -= 1;
         }
         // Only ever scrolls down here; the cursor-above case returned earlier.
-        self.log_scroll = self.log_scroll.max(first as u16);
+        self.log_scroll = self.log_scroll.max(first);
     }
 
     /// Apply cursor and current-search-hit decoration to the rows about to be
@@ -1826,7 +1840,7 @@ impl AppState {
         if first >= end {
             return Vec::new();
         }
-        let cursor = self.log_line_cursor as usize;
+        let cursor = self.log_line_cursor;
         let cursor_bg = Style::default().bg(self.theme.surface_alt);
         let current_match_src = self
             .log_search_match_idx
@@ -1868,7 +1882,7 @@ impl AppState {
         let viewport = self.last_logs_viewport_height.get().max(1) as usize;
         let budget = viewport / 3;
         let mut used = 0usize;
-        let mut first = self.log_line_cursor as usize;
+        let mut first = self.log_line_cursor;
         while first > 0 {
             let h = self.visual_height_of_row(first - 1) as usize;
             if used + h > budget {
@@ -1877,15 +1891,12 @@ impl AppState {
             used += h;
             first -= 1;
         }
-        self.log_scroll = first.min(u16::MAX as usize) as u16;
+        self.log_scroll = first;
     }
 
     /// Cursor row that displays source line `src`, if it is currently visible.
-    pub fn rendered_row_for_src(&self, src: usize) -> Option<u16> {
-        self.log_rendered_src
-            .iter()
-            .position(|&s| s == src)
-            .map(|r| r as u16)
+    pub fn rendered_row_for_src(&self, src: usize) -> Option<usize> {
+        self.log_rendered_src.iter().position(|&s| s == src)
     }
 
     /// Index of the group containing `src`, if any.
@@ -1957,10 +1968,10 @@ impl AppState {
         // where each group header lands. Row positions have to be assigned in
         // order, so this can't be parallel — but it's just index bookkeeping.
         let mut rendered_src: Vec<usize> = Vec::with_capacity(self.log_lines.len());
-        let mut group_header_rows = vec![0u16; self.log_groups.len()];
-        let mut group_map: HashMap<u16, usize> = HashMap::new();
-        let mut fold_rows: HashMap<u16, usize> = HashMap::new();
-        let mut rendered_row: u16 = 0;
+        let mut group_header_rows = vec![0usize; self.log_groups.len()];
+        let mut group_map: HashMap<usize, usize> = HashMap::new();
+        let mut fold_rows: HashMap<usize, usize> = HashMap::new();
+        let mut rendered_row: usize = 0;
         // Run of consecutive dropped lines, tracked only while focused, which
         // becomes one "N lines hidden" row. Without it the filtered log is a
         // stack of fragments with no sign of the distance between them.
@@ -2012,7 +2023,7 @@ impl AppState {
             .par_iter()
             .enumerate()
             .map(|(row, &src_idx)| {
-                if let Some(&n) = folds.get(&(row as u16)) {
+                if let Some(&n) = folds.get(&row) {
                     let plural = if n == 1 { "line" } else { "lines" };
                     return Line::from(Span::styled(
                         format!("  ⋯ {n} {plural} hidden — ↵ to show ⋯"),
@@ -2326,7 +2337,12 @@ pub fn ansi_line_to_spans(line: &str, default_style: Style) -> Vec<Span<'static>
                 let params: String = chars[seq_start..j].iter().collect();
                 current = apply_sgr(&params, current, default_style);
             }
-            i = j + 1;
+            // Step past the terminator — but only if there was one. A line that
+            // ends mid-sequence leaves `j` at the end, and `j + 1` would then
+            // put both cursors one past it, so the tail slice below would run
+            // off the end and take the whole TUI with it. `strip_ansi` has
+            // always clamped here; this is the same clamp.
+            i = if j < chars.len() { j + 1 } else { j };
             seg = i;
         } else {
             i += 1;
@@ -2422,37 +2438,66 @@ pub fn highlight_line(
     }
     let hit_bg = if current { theme.accent } else { theme.accent_dim };
     let hit_fg = theme.surface;
+    let need: Vec<char> = needle.chars().collect();
 
     let mut out: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
     for span in line.spans {
         let text = span.content.into_owned();
         let style = span.style;
-        let lower = text.to_lowercase();
-        if !lower.contains(needle) {
-            out.push(Span::styled(text, style));
-            continue;
-        }
-        let bytes = text.as_bytes();
-        let mut cursor = 0;
-        while cursor < bytes.len() {
-            match lower[cursor..].find(needle) {
-                Some(rel) => {
-                    let start = cursor + rel;
-                    let end = start + needle.len();
-                    if start > cursor {
-                        out.push(Span::styled(text[cursor..start].to_string(), style));
-                    }
-                    out.push(Span::styled(
-                        text[start..end].to_string(),
-                        style.bg(hit_bg).fg(hit_fg).add_modifier(Modifier::BOLD),
-                    ));
-                    cursor = end;
-                }
-                None => {
-                    out.push(Span::styled(text[cursor..].to_string(), style));
-                    break;
-                }
+        // Lowercase the span one character at a time, remembering which byte
+        // span of `text` each lowercase character came from.
+        //
+        // The obvious version — search `text.to_lowercase()` and slice `text`
+        // at the offsets it reports — is wrong, because lowercasing is not
+        // length-preserving in bytes: `K` (U+212A) shrinks from three bytes to
+        // one, `İ` (U+0130) grows from two to three. The offsets then address a
+        // string that no longer exists, so they landed mid-character or past
+        // the end and took the whole process with them. Every index used to cut
+        // `text` below came out of `text.char_indices()`.
+        let mut hay: Vec<char> = Vec::with_capacity(text.len());
+        let mut owner: Vec<(usize, usize)> = Vec::with_capacity(text.len());
+        for (at, ch) in text.char_indices() {
+            let source = (at, at + ch.len_utf8());
+            for lc in ch.to_lowercase() {
+                hay.push(lc);
+                owner.push(source);
             }
+        }
+
+        let mut cursor = 0usize; // byte offset into `text`
+        let mut k = 0usize; // char offset into `hay`
+        let mut hit = false;
+        while k + need.len() <= hay.len() {
+            if hay[k..k + need.len()] != need[..] {
+                k += 1;
+                continue;
+            }
+            // Whole source characters, always. A needle can match part of one
+            // character's expansion (`i` inside `İ`); there is no way to draw
+            // half a character, so the character is highlighted entire — and a
+            // match reaching back into one already emitted is passed over,
+            // which is also what keeps `cursor` moving forward.
+            let (start, _) = owner[k];
+            let (_, end) = owner[k + need.len() - 1];
+            if start < cursor {
+                k += 1;
+                continue;
+            }
+            if start > cursor {
+                out.push(Span::styled(text[cursor..start].to_string(), style));
+            }
+            out.push(Span::styled(
+                text[start..end].to_string(),
+                style.bg(hit_bg).fg(hit_fg).add_modifier(Modifier::BOLD),
+            ));
+            cursor = end;
+            hit = true;
+            k += need.len();
+        }
+        if !hit {
+            out.push(Span::styled(text, style));
+        } else if cursor < text.len() {
+            out.push(Span::styled(text[cursor..].to_string(), style));
         }
     }
     Line::from(out)
@@ -3095,7 +3140,7 @@ mod tests {
         st.keep_cursor_visible();
         // 10 single-row lines fit, so the last screen starts at 990.
         assert_eq!(st.log_scroll, 990);
-        assert!(st.last_visible_row(st.log_scroll as usize) >= 999);
+        assert!(st.last_visible_row(st.log_scroll) >= 999);
     }
 
     #[test]
@@ -3302,12 +3347,12 @@ mod tests {
         timed("ONE KEYPRESS (move+scroll+draw)", || {
             st.log_line_cursor += 1;
             st.keep_cursor_visible();
-            std::hint::black_box(st.decorate_visible(st.log_scroll as usize, 40));
+            std::hint::black_box(st.decorate_visible(st.log_scroll, 40));
         });
 
         // Scrolling to the bottom, the worst case for keep_cursor_visible.
         st.log_scroll = 0;
-        st.log_line_cursor = (st.log_rendered.len() - 1) as u16;
+        st.log_line_cursor = st.log_rendered.len() - 1;
         timed("keep_cursor_visible (0 -> end)", || st.keep_cursor_visible());
 
         st.log_search_query = Some("failure".into());
@@ -3494,7 +3539,7 @@ mod tests {
     }
 
     fn fold_counts(st: &AppState) -> Vec<usize> {
-        let mut rows: Vec<(u16, usize)> = st.log_fold_rows.iter().map(|(&r, &n)| (r, n)).collect();
+        let mut rows: Vec<(usize, usize)> = st.log_fold_rows.iter().map(|(&r, &n)| (r, n)).collect();
         rows.sort();
         rows.into_iter().map(|(_, n)| n).collect()
     }
@@ -3645,5 +3690,123 @@ mod tests {
         ];
         assert_eq!(card.latest_status(), Some(Status::Running));
         assert_eq!(card.counts(), (1, 1, 1));
+    }
+
+    // ── Regression: text handling that used to take the process down ──────
+
+    #[test]
+    fn a_line_that_ends_mid_escape_sequence_does_not_take_the_tui_with_it() {
+        // A CSI with no terminator — a truncated write, a killed process, a
+        // progress bar cut off by the runner. The scanner used to step one past
+        // the end of the line and slice the tail from there.
+        let spans = ansi_line_to_spans("hello \x1b[31", Style::default());
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "hello ", "the text before the stub survives");
+
+        // The stub alone, and a bare ESC at the very end, are the same shape.
+        assert!(ansi_line_to_spans("\x1b[", Style::default()).is_empty());
+        let tail: String = ansi_line_to_spans("x\x1b", Style::default())
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(tail, "x\x1b", "a lone ESC is not a sequence, so it is content");
+
+        // And a well-formed sequence still splits and styles as before.
+        let ok = ansi_line_to_spans("a\x1b[31mb\x1b[0mc", Style::default());
+        let joined: String = ok.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "abc");
+        assert_eq!(ok.len(), 3);
+    }
+
+    #[test]
+    fn highlighting_survives_characters_whose_lowercase_is_a_different_length() {
+        let theme = Theme::midnight();
+        let text_of = |l: &Line<'static>| -> String {
+            l.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+
+        // U+212A KELVIN SIGN: three bytes in, one byte out. Offsets taken from
+        // the lowercased copy used to land inside it.
+        let out = highlight_line(
+            Line::from(Span::raw("\u{212A} error here")),
+            "error",
+            false,
+            &theme,
+        );
+        assert_eq!(text_of(&out), "\u{212A} error here", "no character is lost or doubled");
+
+        // U+0130: two bytes in, three out — offsets ran off the end instead.
+        let out = highlight_line(Line::from(Span::raw("\u{130}error")), "error", false, &theme);
+        assert_eq!(text_of(&out), "\u{130}error");
+
+        // A needle matching *inside* one character's expansion highlights that
+        // character whole rather than half of it — and terminates.
+        let out = highlight_line(Line::from(Span::raw("\u{130}x")), "i", false, &theme);
+        assert_eq!(text_of(&out), "\u{130}x");
+    }
+
+    #[test]
+    fn highlighting_still_marks_the_matches_it_is_there_to_mark() {
+        let theme = Theme::midnight();
+        let out = highlight_line(
+            Line::from(Span::raw("Error: an ERROR and an error")),
+            "error",
+            false,
+            &theme,
+        );
+        let joined: String = out.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "Error: an ERROR and an error", "text is preserved exactly");
+        // Three hits, case-insensitively, each carrying the hit background.
+        let hits: Vec<&str> = out
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == Some(theme.accent_dim))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(hits, vec!["Error", "ERROR", "error"]);
+
+        // No match: one span back, unstyled.
+        let miss = highlight_line(Line::from(Span::raw("all quiet")), "error", false, &theme);
+        assert_eq!(miss.spans.len(), 1);
+        assert!(miss.spans[0].style.bg.is_none());
+    }
+
+    #[test]
+    fn a_log_longer_than_a_u16_can_count_still_renders() {
+        // These indices were u16. Past 65_535 the counter wrapped — silently in
+        // release, where overflow checks are off — and every group header, fold
+        // marker and minimap band was keyed 65_536 rows from where it was drawn.
+        let mut st = AppState::new(
+            "o/r".into(),
+            "main".into(),
+            Vec::new(),
+            KeymapConfig::default(),
+            History::default(),
+        );
+        const N: usize = 70_000;
+        let mut lines: Vec<String> = (0..N).map(|i| format!("line {i}")).collect();
+        lines.push("##[group]late group".into());
+        lines.push("##[error]boom".into());
+        lines.push("##[endgroup]".into());
+        st.log_lines = lines;
+        st.last_logs_viewport_height.set(40);
+        st.last_logs_viewport_width.set(100);
+        st.init_log_groups();
+        st.recompute_log_rendered();
+
+        assert!(st.log_rendered.len() > u16::MAX as usize);
+        assert_eq!(st.log_rendered.len(), st.log_rendered_src.len());
+
+        // The group past the old ceiling is keyed where it is actually drawn.
+        let header_row = st.log_group_header_rows[0];
+        assert!(header_row > u16::MAX as usize, "got {header_row}");
+        assert_eq!(st.log_rendered_group_map.get(&header_row), Some(&0));
+        assert_eq!(st.log_rendered_src[header_row], N);
+
+        // And the cursor can still reach the end of it.
+        st.log_line_cursor = st.log_rendered.len() - 1;
+        st.keep_cursor_visible();
+        assert!(st.log_scroll > u16::MAX as usize);
+        assert!(st.last_visible_row(st.log_scroll) >= st.log_line_cursor);
     }
 }

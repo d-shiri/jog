@@ -3716,7 +3716,7 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
     // wrapping Paragraph instead would need the visual height of every line
     // above the viewport, which can only be estimated — and the error compounds
     // over a long log, so jumps land in the wrong place.
-    let first = (state.log_scroll as usize).min(state.log_rendered.len());
+    let first = state.log_scroll.min(state.log_rendered.len());
     // Every rendered line occupies at least one screen row, so `viewport` of
     // them is all the widget can possibly draw. Cutting there keeps the per-frame
     // clone bounded instead of copying the tail of a 40k-line log each redraw.
