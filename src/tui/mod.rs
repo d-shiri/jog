@@ -550,6 +550,15 @@ async fn event_loop(
                             card.error = None;
                             card.loaded = true;
                         }
+                        // A row answered with no hold running means the trouble
+                        // is over, so the next refusal starts at the bottom of
+                        // the ladder rather than the top of the last one. A hold
+                        // still running is left to expire on its own: one round
+                        // can have rows answered and rows refused, and cutting
+                        // the wait short walks straight back into the wall.
+                        if !state.api_held() {
+                            state.clear_api_hold();
+                        }
                         sync_repo_progress(&provider, state, &spec, &tx);
                         state.pending = state.pending.saturating_sub(1);
                     }
@@ -558,8 +567,20 @@ async fn event_loop(
                         // unanswered, and the rejection doesn't carry the clock.
                         // Re-read rather than trust the last poll's figure:
                         // being turned away is itself news about the budget.
-                        if err.fault == ApiFault::RateLimited {
-                            spawn_quota_probe(&provider, state, &tx);
+                        match err.fault {
+                            ApiFault::RateLimited => {
+                                spawn_quota_probe(&provider, state, &tx);
+                                // The hour's budget is gone: the reset is the
+                                // only moment worth asking again at, and it is
+                                // the one figure the rejection didn't carry.
+                                let reset = state.quota.map(|q| q.reset);
+                                state.hold_api(reset);
+                            }
+                            // Pace, not budget. Nobody told us how long, so the
+                            // ladder guesses — and stops guessing on the first
+                            // poll that lands.
+                            ApiFault::Throttled => state.hold_api(None),
+                            _ => {}
                         }
                         if let Some(card) = state.repos.iter_mut().find(|c| c.spec == spec) {
                             card.error = Some(err);
@@ -575,10 +596,17 @@ async fn event_loop(
                         // Cleared even when the answer is `None`: a read that
                         // failed must not wedge the flag and mute every retry.
                         state.quota_pending = false;
-                        if let Some(q) = q
-                            && record_quota(state, q)
-                        {
-                            play_quota_alarm(&config);
+                        if let Some(q) = q {
+                            // The reading the refusal sent us for. If the hour's
+                            // budget really is gone, the reset is the first
+                            // moment anything can work — sooner than that the
+                            // ladder would spend requests proving it again.
+                            if state.api_held() && q.used >= q.limit {
+                                state.hold_api(Some(q.reset));
+                            }
+                            if record_quota(state, q) {
+                                play_quota_alarm(&config);
+                            }
                         }
                     }
                     AppEvent::RepoProgressLoaded(spec, detail) => {
@@ -806,7 +834,10 @@ async fn event_loop(
                     // Outside the view match below: every view spends from the
                     // same bucket, and a meter that stops moving when you walk
                     // into the logs is worse than none — that is exactly where
-                    // the budget goes.
+                    // the budget goes. It also keeps going while everything else
+                    // is held off after a refusal: one request per poll, exempt
+                    // from the limit it reports, and the meter is how you tell
+                    // which of the two limits you are actually waiting on.
                     spawn_quota_probe(&provider, state, &tx);
                     // The finder holds indices into the list it was opened over.
                     // Refreshing that list underneath it would shift every index,
@@ -818,11 +849,17 @@ async fn event_loop(
                     // not pause polling: a run finishing in another repo would
                     // go unannounced until the hook was done.
                     let in_hooks = state.git_ops.values().filter(|o| !o.finished).count();
+                    // Turned away for asking too fast: asking again on schedule
+                    // is what keeps us there. The dashboard's own half of the
+                    // poll — every repo's working tree — costs nothing and
+                    // carries on inside `spawn_fetch_repo_cards`.
+                    let held = state.api_held();
                     if state.pending == in_hooks && state.finder.is_none() {
                         match state.view {
                             View::Repos => {
                                 spawn_fetch_repo_cards(&provider, state, &tx);
                             }
+                            _ if held => {}
                             View::Watch => {
                                 if let Some(file) = state.workflow_for_runs.clone() {
                                     spawn_fetch_runs(provider.clone(), file, tx.clone(), state);
@@ -856,7 +893,9 @@ async fn event_loop(
                         }
                         // View-independent: a pushed repo is followed into CI
                         // even while its owner reads some other repo's logs.
-                        poll_push_watches(state, &provider, &tx);
+                        if !held {
+                            poll_push_watches(state, &provider, &tx);
+                        }
                     }
                 }
             }
@@ -3289,6 +3328,11 @@ fn spawn_fetch_repo_cards(
         if let Some(path) = path {
             spawn_git_status(label.clone(), path, tx.clone(), state);
         }
+        // Held off after a refusal — the row keeps the error it already shows,
+        // and the header says how long. Re-asking is what extends the wait.
+        if state.api_held() {
+            continue;
+        }
         let Some(remote) = remote else { continue };
         let Ok(spec) = RepoSpec::parse(&remote) else {
             continue;
@@ -3402,11 +3446,16 @@ fn sync_repo_progress(
     };
     for run in runs {
         let p = provider.for_repo(rspec.clone());
-        let (label, run_id, tx) = (spec.to_string(), run.id, tx.clone());
+        let (label, tx) = (spec.to_string(), tx.clone());
         tokio::spawn(async move {
+            // Jobs only: the run itself came back with the row's poll a moment
+            // ago, and re-fetching it doubled the traffic of the busiest part
+            // of the poll for an answer we already hold.
+            //
             // A failure here is silent on purpose: the row still reports the
             // run, and a toast per poll per repo would bury every other message.
-            if let Ok(detail) = p.get_run(run_id).await {
+            if let Ok(jobs) = p.run_jobs(run.id).await {
+                let detail = RunDetail { run, jobs };
                 let _ = tx.send(AppEvent::RepoProgressLoaded(label, detail));
             }
         });

@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use ratatui::text::{Line, Span};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 
@@ -1440,6 +1441,19 @@ pub struct AppState {
     /// The alarm has already sounded for this hour's budget. Cleared when the
     /// quota resets, so the next hour can raise it again — and only once.
     pub quota_alarmed: bool,
+    /// Polling is held off until this moment, because GitHub turned the last
+    /// poll away for asking too fast.
+    ///
+    /// Without it the dashboard answers a refusal by asking again five seconds
+    /// later, which is what the refusal was about: the secondary limit is fed
+    /// by rejected requests too, so an eight-row dashboard can hold itself in
+    /// the limit indefinitely. The wait is visible in the header — a poll that
+    /// silently stops looks like a hang.
+    pub api_paused_until: Option<DateTime<Utc>>,
+    /// How long the current hold is, doubling for each refusal in a row and
+    /// reset by the first poll that gets through. A fixed wait either gives up
+    /// the dashboard for too long or walks straight back into the wall.
+    pub api_backoff_secs: i64,
     /// Repos marked on the dashboard, by spec. Only ever fed to the batch —
     /// marking is inert until a batch is started, so it can't surprise anyone.
     pub repo_marks: HashSet<String>,
@@ -1570,6 +1584,8 @@ impl AppState {
             quota: None,
             quota_pending: false,
             quota_alarmed: false,
+            api_paused_until: None,
+            api_backoff_secs: 0,
             repo_marks: HashSet::new(),
             batch: None,
             finder: None,
@@ -1605,6 +1621,52 @@ impl AppState {
             .flat_map(|(c, ds)| ds.iter().map(move |d| (c, d)))
             .filter(|(_, d)| !d.run.status.is_terminal())
             .collect()
+    }
+
+    /// Seconds still to sit out before jog talks to GitHub again, if it is
+    /// waiting at all. `None` is the normal state.
+    pub fn api_hold_left(&self) -> Option<i64> {
+        let until = self.api_paused_until?;
+        let left = (until - Utc::now()).num_seconds();
+        (left > 0).then_some(left)
+    }
+
+    /// Whether this poll should stay off the wire.
+    pub fn api_held(&self) -> bool {
+        self.api_hold_left().is_some()
+    }
+
+    /// Sit out a poll or several: GitHub just turned us away for pace, and the
+    /// only thing that clears that is not asking. Each refusal in a row doubles
+    /// the wait; `clear_api_hold` puts it back once a poll gets through.
+    ///
+    /// `until` overrides the ladder when GitHub has told us the actual moment —
+    /// the hourly quota's reset — because guessing shorter only spends the
+    /// requests that prove it is still spent.
+    pub fn hold_api(&mut self, until: Option<DateTime<Utc>>) {
+        const FIRST: i64 = 15;
+        const MAX: i64 = 120;
+        if let Some(t) = until.filter(|t| *t > Utc::now()) {
+            self.api_paused_until = Some(t);
+            return;
+        }
+        // Already waiting on this refusal — every other row's copy of the same
+        // failure must not push the deadline out again.
+        if self.api_held() {
+            return;
+        }
+        self.api_backoff_secs = if self.api_backoff_secs == 0 {
+            FIRST
+        } else {
+            (self.api_backoff_secs * 2).min(MAX)
+        };
+        self.api_paused_until = Some(Utc::now() + chrono::Duration::seconds(self.api_backoff_secs));
+    }
+
+    /// A poll got through: stop waiting, and forget how long the last wait was.
+    pub fn clear_api_hold(&mut self) {
+        self.api_paused_until = None;
+        self.api_backoff_secs = 0;
     }
 
     pub fn switch_view(&mut self, v: View) {
@@ -3808,5 +3870,49 @@ mod tests {
         st.keep_cursor_visible();
         assert!(st.log_scroll > u16::MAX as usize);
         assert!(st.last_visible_row(st.log_scroll) >= st.log_line_cursor);
+    }
+
+    #[test]
+    fn the_hold_after_a_refusal_doubles_and_forgets() {
+        let mut st = AppState::new(
+            "o/r".into(),
+            "main".into(),
+            Vec::new(),
+            KeymapConfig::default(),
+            History::default(),
+        );
+        assert!(!st.api_held(), "nothing has been refused yet");
+
+        // Eight rows fail on the same tick and all eight say so — the wait is
+        // one wait, not eight compounded.
+        st.hold_api(None);
+        let first = st.api_hold_left().unwrap();
+        for _ in 0..7 {
+            st.hold_api(None);
+        }
+        assert!((st.api_hold_left().unwrap() - first).abs() <= 1);
+
+        // The next round of refusals is a longer wait: the first one plainly
+        // was not enough.
+        st.api_paused_until = None;
+        st.hold_api(None);
+        assert!(st.api_hold_left().unwrap() > first);
+
+        // …and a poll that gets through puts it back to nothing, so an hour
+        // later a single hiccup does not start at two minutes.
+        st.clear_api_hold();
+        assert!(!st.api_held());
+        st.hold_api(None);
+        assert!((st.api_hold_left().unwrap() - first).abs() <= 1);
+
+        // When GitHub has named the moment — the hourly quota's reset — that
+        // beats any guess the ladder could make.
+        let reset = Utc::now() + chrono::Duration::minutes(20);
+        st.hold_api(Some(reset));
+        assert!(st.api_hold_left().unwrap() > 60 * 19);
+        // A reset already in the past is no hold at all.
+        st.clear_api_hold();
+        st.hold_api(Some(Utc::now() - chrono::Duration::minutes(1)));
+        assert!(st.api_held(), "an expired reset falls back to the ladder");
     }
 }

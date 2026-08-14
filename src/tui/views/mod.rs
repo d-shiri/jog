@@ -9,6 +9,7 @@ use ratatui::widgets::{
 };
 
 use std::collections::HashMap;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::animated_glyph;
 use super::motion::{Motion, mix};
@@ -981,11 +982,28 @@ fn shared_fault_detail(state: &AppState) -> Option<String> {
             ),
             None => format!("rate limited · {}", ApiFault::RateLimited.detail()),
         },
+        // Not the hourly budget — the meter two inches to the right can read 4%
+        // while this is happening, and pointing at the hour's reset would offer
+        // a fifty-minute wait for something that clears in one. What it needs to
+        // say is that jog is the one holding off, and for how long.
+        ApiFault::Throttled => match state.api_hold_left() {
+            Some(secs) => format!("asked too fast · retrying in {}", format_countdown(secs)),
+            None => format!("throttled · {}", ApiFault::Throttled.detail()),
+        },
         // Nothing canned to add — the message already is the specific one.
         ApiFault::Other => first.text.clone(),
         fault => format!("{} · {}", fault.label(), fault.detail()),
     };
     Some(truncate(&detail, 60))
+}
+
+/// A wait short enough to sit through, worded as one.
+fn format_countdown(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
 }
 
 fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
@@ -1705,7 +1723,9 @@ fn render_activity_strip(
         ));
     }
 
-    let rows: Vec<Row> = entries
+    // What each row has to say, resolved to text before anything decides how
+    // wide it may be.
+    let cells: Vec<StripRow> = entries
         .iter()
         .take(shown)
         .enumerate()
@@ -1717,7 +1737,7 @@ fn render_activity_strip(
             let run = &detail.run;
             let running_job = detail.jobs.iter().find(|j| j.status == Status::Running);
 
-            let (ratio, count_text, step_spans) = match running_job {
+            let (ratio, count, job, step) = match running_job {
                 Some(job) => {
                     let total = job.steps.len();
                     let done = job.steps.iter().filter(|s| s.status.is_terminal()).count();
@@ -1728,41 +1748,26 @@ fn render_activity_strip(
                         (Some(i), t) => format!("{}/{}", i + 1, t),
                         (None, t) => format!("{done}/{t}"),
                     };
-                    let mut spans = vec![Span::styled(
-                        truncate(&job.name, 18),
-                        Style::default().fg(theme.text_muted),
-                    )];
-                    match cur {
-                        Some(i) => {
-                            spans.push(Span::styled(
-                                " › ",
-                                Style::default().fg(theme.text_ghost),
-                            ));
-                            spans.push(Span::styled(
-                                truncate(&job.steps[i].name, 36),
-                                Style::default().fg(breathing(tick, theme)).bold(),
-                            ));
-                        }
-                        None => spans.push(Span::styled(
-                            "  ·  wrapping up",
-                            Style::default().fg(theme.text_muted).italic(),
-                        )),
-                    }
-                    (ratio, count, spans)
+                    let step = match cur {
+                        Some(i) => StepCell::Named(job.steps[i].name.clone()),
+                        None => StepCell::Note("wrapping up".into()),
+                    };
+                    (ratio, count, job.name.clone(), step)
                 }
                 // No jobs at all: GitHub has accepted the run but hasn't placed
                 // it on a runner, so there is genuinely no step to name yet.
                 None if detail.jobs.is_empty() => (
                     None,
                     String::new(),
-                    vec![Span::styled(
+                    String::new(),
+                    StepCell::Note(
                         if run.status == Status::Queued {
                             "queued · waiting for a runner"
                         } else {
                             "starting up…"
-                        },
-                        Style::default().fg(theme.text_muted).italic(),
-                    )],
+                        }
+                        .into(),
+                    ),
                 ),
                 // Jobs exist but none is running: between two of them, or a
                 // matrix leg is still being scheduled.
@@ -1771,10 +1776,8 @@ fn render_activity_strip(
                     (
                         Some(done as f64 / detail.jobs.len() as f64),
                         format!("{done}/{} jobs", detail.jobs.len()),
-                        vec![Span::styled(
-                            "waiting for the next job",
-                            Style::default().fg(theme.text_muted).italic(),
-                        )],
+                        String::new(),
+                        StepCell::Note("waiting for the next job".into()),
                     )
                 }
             };
@@ -1784,47 +1787,113 @@ fn render_activity_strip(
             let glyph = if run.status == Status::Queued {
                 const PULSE: [&str; 4] = ["·", "•", "●", "•"];
                 // Quarter of the spinner's rate: waiting, not working.
-                PULSE[((tick / 5) % 4) as usize]
+                PULSE[((tick / 5) % 4) as usize].to_string()
             } else {
-                animated_glyph(run.status, tick)
+                animated_glyph(run.status, tick).to_string()
             };
 
+            StripRow {
+                glyph,
+                repeat,
+                repo: card.spec.clone(),
+                workflow: run.display_title.clone(),
+                branch: run.head_branch.clone(),
+                job,
+                step,
+                ratio,
+                count,
+                elapsed: format_elapsed(elapsed_seconds(run)),
+            }
+        })
+        .collect();
+
+    // Every field gets its own column, sized to the longest one actually on
+    // screen. Packing workflow·branch and job›step into two cells was cheaper,
+    // but it left each row's branch, job and step at a different x — and this
+    // strip is read down its columns, not across its rows. Long names now cost
+    // their own column width instead of everyone else's alignment.
+    let longest = |pick: &dyn Fn(&StripRow) -> usize| {
+        cells.iter().map(pick).max().unwrap_or(0)
+    };
+    // Where a column stops growing, and where it refuses to shrink further:
+    // repo, workflow, branch, job, step.
+    const CAP: [usize; 5] = [28, 30, 18, 22, 48];
+    const FLOOR: [usize; 5] = [10, 8, 6, 6, 12];
+    let mut cols = [
+        longest(&|c| disp_width(&c.repo)),
+        longest(&|c| disp_width(&c.workflow)),
+        longest(&|c| disp_width(&c.branch)),
+        longest(&|c| disp_width(&c.job)),
+        longest(&|c| c.step.width()),
+    ];
+    for (w, cap) in cols.iter_mut().zip(CAP) {
+        *w = (*w).min(cap);
+    }
+
+    let w_count = longest(&|c| disp_width(&c.count)).min(9);
+    let w_elapsed = longest(&|c| disp_width(&c.elapsed)).max(4);
+    const SPACING: usize = 2;
+    let inner = area.width.saturating_sub(2) as usize;
+    // The bar is the first thing to go: it repeats what the counter beside it
+    // already says, and on a narrow terminal the step name needs the room more.
+    let bar_w = if inner >= 96 { 14 } else { 0 };
+    let fixed = 1 + bar_w + w_count + w_elapsed + SPACING * 8;
+    let avail = inner.saturating_sub(fixed);
+    shrink_to_fit(&mut cols, &FLOOR, avail);
+    // Slack goes to the step, so the elapsed clock keeps the right edge and the
+    // field most likely to be cut gets whatever nobody else needed.
+    cols[4] += avail.saturating_sub(cols.iter().sum::<usize>());
+
+    let rows: Vec<Row> = cells
+        .iter()
+        .map(|c| {
+            let step = match &c.step {
+                StepCell::Named(name) => Line::from(vec![
+                    Span::styled("› ", Style::default().fg(theme.text_ghost)),
+                    Span::styled(
+                        truncate(name, cols[4].saturating_sub(2)),
+                        Style::default().fg(breathing(tick, theme)).bold(),
+                    ),
+                ]),
+                StepCell::Note(note) => Line::from(Span::styled(
+                    truncate(note, cols[4]),
+                    Style::default().fg(theme.text_muted).italic(),
+                )),
+            };
             Row::new(vec![
                 Cell::from(Span::styled(
-                    glyph,
+                    c.glyph.clone(),
                     Style::default().fg(theme.warning).bold(),
                 )),
-                Cell::from(if repeat {
-                    Span::styled(
-                        truncate(&card.spec, 24),
-                        Style::default().fg(theme.text_ghost),
-                    )
-                } else {
-                    Span::styled(
-                        truncate(&card.spec, 24),
-                        Style::default().fg(theme.text_bright).bold(),
-                    )
-                }),
-                Cell::from(Line::from(vec![
-                    Span::styled(
-                        truncate(&run.display_title, 24),
-                        Style::default().fg(theme.text),
-                    ),
-                    Span::styled(" · ", Style::default().fg(theme.text_ghost)),
-                    Span::styled(
-                        truncate(&run.head_branch, 14),
-                        Style::default().fg(theme.accent_dim),
-                    ),
-                ])),
-                Cell::from(Line::from(step_spans)),
-                Cell::from(Line::from(progress_bar(ratio, 14, tick, theme))),
                 Cell::from(Span::styled(
-                    count_text,
+                    truncate(&c.repo, cols[0]),
+                    if c.repeat {
+                        Style::default().fg(theme.text_ghost)
+                    } else {
+                        Style::default().fg(theme.text_bright).bold()
+                    },
+                )),
+                Cell::from(Span::styled(
+                    truncate(&c.workflow, cols[1]),
+                    Style::default().fg(theme.text),
+                )),
+                Cell::from(Span::styled(
+                    truncate(&c.branch, cols[2]),
+                    Style::default().fg(theme.accent_dim),
+                )),
+                Cell::from(Span::styled(
+                    truncate(&c.job, cols[3]),
+                    Style::default().fg(theme.text_muted),
+                )),
+                Cell::from(step),
+                Cell::from(Line::from(progress_bar(c.ratio, bar_w, tick, theme))),
+                Cell::from(Span::styled(
+                    c.count.clone(),
                     Style::default().fg(theme.text_muted),
                 )),
                 Cell::from(
                     Line::from(Span::styled(
-                        format_elapsed(elapsed_seconds(run)),
+                        c.elapsed.clone(),
                         Style::default().fg(theme.warning),
                     ))
                     .right_aligned(),
@@ -1834,17 +1903,19 @@ fn render_activity_strip(
         .collect();
 
     let widths = [
-        Constraint::Length(1),  // spinner
-        Constraint::Fill(26),   // repo
-        Constraint::Fill(30),   // workflow · branch the run used
-        Constraint::Fill(44),   // job › step
-        Constraint::Length(14), // progress
-        Constraint::Length(8),  // step counter
-        Constraint::Length(7),  // elapsed
+        Constraint::Length(1), // spinner
+        Constraint::Length(cols[0] as u16),
+        Constraint::Length(cols[1] as u16),
+        Constraint::Length(cols[2] as u16),
+        Constraint::Length(cols[3] as u16),
+        Constraint::Length(cols[4] as u16),
+        Constraint::Length(bar_w as u16),
+        Constraint::Length(w_count as u16),
+        Constraint::Length(w_elapsed as u16),
     ];
 
     f.render_widget(
-        Table::new(rows, widths).column_spacing(2).block(
+        Table::new(rows, widths).column_spacing(SPACING as u16).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -1853,6 +1924,58 @@ fn render_activity_strip(
         ),
         area,
     );
+}
+
+/// One line of the live strip, before anything has been measured or cut.
+struct StripRow {
+    glyph: String,
+    /// The row above is the same repo, so the name is worth showing quietly.
+    repeat: bool,
+    repo: String,
+    workflow: String,
+    branch: String,
+    /// Empty when no job is running yet — the step column says why.
+    job: String,
+    step: StepCell,
+    ratio: Option<f64>,
+    count: String,
+    elapsed: String,
+}
+
+/// The step column either names the step running, or says why none is.
+enum StepCell {
+    Named(String),
+    Note(String),
+}
+
+impl StepCell {
+    /// Columns it would like, the `›` marker included.
+    fn width(&self) -> usize {
+        match self {
+            Self::Named(s) => disp_width(s) + 2,
+            Self::Note(s) => disp_width(s),
+        }
+    }
+}
+
+/// Take columns down from the widest end until they fit, never below `floors`.
+///
+/// Shrinking every column by the same share makes the short ones pay for the
+/// long one; taking from whoever has the most to give keeps the narrow columns
+/// whole and cuts only what was already too long to read.
+fn shrink_to_fit(cols: &mut [usize], floors: &[usize], avail: usize) {
+    while cols.iter().sum::<usize>() > avail {
+        let Some(i) = cols
+            .iter()
+            .enumerate()
+            .filter(|(i, w)| **w > floors[*i])
+            .max_by_key(|(_, w)| **w)
+            .map(|(i, _)| i)
+        else {
+            return;
+        };
+        cols[i] -= 1;
+    }
 }
 
 /// The full keybinding reference, built from the *configured* keys so remapped
@@ -3024,12 +3147,38 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
+/// How many terminal columns a string occupies.
+///
+/// Not its length in `char`s: workflow names carry emoji, and every one of them
+/// is two columns wide. Measured by count, a name with two emoji in it overruns
+/// the column it was cut to fit — which is how a branch beside one went missing
+/// from the live strip while the same field on the row above was fine.
+fn disp_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// `s` cut to at most `max` terminal columns, with an ellipsis where it was cut.
 fn truncate(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
+    if disp_width(s) <= max {
         return s.to_string();
     }
-    format!("{}…", chars[..max.saturating_sub(1)].iter().collect::<String>())
+    if max == 0 {
+        return String::new();
+    }
+    // The ellipsis takes a column of its own, so the text gets one fewer.
+    let budget = max - 1;
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > budget {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
 }
 
 fn render_finder_overlay(f: &mut Frame, area: Rect, state: &AppState) {
@@ -4804,6 +4953,77 @@ mod tests {
     }
 
     #[test]
+    fn the_strip_lines_its_fields_up_whatever_length_the_names_are() {
+        // The failure this is here for: workflow and job names differ in length
+        // by a dozen characters between rows, and when two fields shared a cell
+        // every row put its branch, its job and its step at a different x. The
+        // strip is read down its columns — ragged ones make it unreadable, and
+        // the longest row's branch fell off the end of the cell entirely.
+        let mut st = dashboard_with_live_ci();
+        st.repos[1].runs = vec![a_run(2, "Build & Test Frontend Everywhere", Status::Running, 40)];
+        st.run_progress.insert(
+            "muufree/cms".into(),
+            vec![crate::provider::RunDetail {
+                run: st.repos[1].runs[0].clone(),
+                jobs: vec![a_job(
+                    "build-and-push-the-frontend",
+                    &[("Build frontend container", Status::Running)],
+                )],
+            }],
+        );
+        st.repos[2].runs = vec![a_run(3, "CI", Status::Running, 5)];
+        st.run_progress.insert(
+            "muufree/website".into(),
+            vec![crate::provider::RunDetail {
+                run: st.repos[2].runs[0].clone(),
+                jobs: vec![a_job("t", &[("Lint", Status::Running)])],
+            }],
+        );
+
+        let out = draw_repos(&st, 150, 16);
+        let strip: Vec<&str> = out
+            .lines()
+            .skip_while(|l| !l.contains("in flight"))
+            .filter(|l| l.contains("main"))
+            .collect();
+        assert_eq!(strip.len(), 3, "got:\n{out}");
+        // Which *column* the field starts in — `find` answers in bytes, and an
+        // ellipsis on one row would move the answer without moving the pixel.
+        let at = |needle: &str| -> Vec<usize> {
+            strip
+                .iter()
+                .map(|l| l.find(needle).map(|b| disp_width(&l[..b])).unwrap_or(usize::MAX))
+                .collect()
+        };
+        let branch = at("main");
+        assert!(
+            branch.iter().all(|c| *c == branch[0]),
+            "branches start at {branch:?}, got:\n{out}"
+        );
+        let step = at("›");
+        assert!(
+            step.iter().all(|c| *c == step[0]),
+            "steps start at {step:?}, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_cut_field_is_measured_in_columns_not_characters() {
+        // Workflow names carry emoji, and every one is two columns wide. Cut by
+        // `char` count they overran the cell they were cut to fit, and ratatui
+        // clipped whatever came next — which is how a branch went missing from
+        // one row of the strip while the row above it was fine.
+        // Never over the cell — a two-column glyph that doesn't fit is dropped
+        // whole rather than half-drawn into the next field.
+        assert!(disp_width(&truncate("🔨🔨🔨🔨 CI", 6)) <= 6);
+        assert!(disp_width(&truncate("🔨🔨🔨🔨 CI", 7)) <= 7);
+        assert_eq!(disp_width(&truncate("Build & Test Frontend", 10)), 10);
+        // Room for all of it is room for all of it — no ellipsis for its own sake.
+        assert_eq!(truncate("🔨 CI", 8), "🔨 CI");
+        assert_eq!(truncate("", 4), "");
+    }
+
+    #[test]
     fn a_queued_run_says_it_is_waiting_rather_than_inventing_a_step() {
         let out = draw_repos(&dashboard_with_live_ci(), 150, 16);
         assert!(out.contains("waiting for a runner"), "got:\n{out}");
@@ -5509,6 +5729,33 @@ mod tests {
         // screen to a moment that is over.
         st.quota = Some(quota_at(40, Utc::now() - chrono::Duration::minutes(1)));
         assert!(!draw_header(&st, 150).contains("retry"));
+    }
+
+    #[test]
+    fn the_pace_limit_does_not_borrow_the_hourly_clock() {
+        // The screenshot this comes from: a meter reading "API 4%" beside eight
+        // rows saying "rate limited", and a retry time an hour away. Two
+        // different limits were wearing one word — the hourly budget was barely
+        // touched, and what jog had actually run into was the pace limit, which
+        // is over in a minute.
+        let mut st = dashboard_out_of_quota();
+        for card in st.repos.iter_mut() {
+            card.error = Some(ApiError {
+                fault: ApiFault::Throttled,
+                text: ApiFault::Throttled.label().into(),
+            });
+        }
+        st.quota = Some(quota_at(4, Utc::now() + chrono::Duration::minutes(55)));
+        st.hold_api(None);
+
+        let out = draw_header(&st, 150);
+        assert!(out.contains("API 4%"), "{out}");
+        assert!(out.contains("asked too fast"), "{out}");
+        // The hour's reset is not the answer to this one, and offering it sends
+        // you away for fifty-five minutes over a fifteen-second wait.
+        let hour_away = (Local::now() + chrono::Duration::minutes(55)).format("%H:%M");
+        assert!(!out.contains(&hour_away.to_string()), "{out}");
+        assert!(out.contains("retrying in"), "{out}");
     }
 
     #[test]

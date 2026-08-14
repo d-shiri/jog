@@ -100,6 +100,10 @@ pub fn current_branch() -> Result<String> {
 pub enum ApiFault {
     /// Quota spent. Nothing to fix — the clock fixes it.
     RateLimited,
+    /// GitHub's *secondary* limit: too many requests too close together. Not
+    /// the hourly budget — that can be barely touched while this one refuses
+    /// every call — and it clears in a minute or two rather than at the hour.
+    Throttled,
     /// Token missing, expired, or revoked.
     BadCredentials,
     /// Authenticated but not allowed: missing scope, or SSO not authorized.
@@ -117,6 +121,7 @@ impl ApiFault {
     pub fn label(self) -> &'static str {
         match self {
             Self::RateLimited => "rate limited",
+            Self::Throttled => "throttled",
             Self::BadCredentials => "bad credentials",
             Self::Denied => "access denied",
             Self::NotFound => "not found",
@@ -129,6 +134,7 @@ impl ApiFault {
     pub fn detail(self) -> &'static str {
         match self {
             Self::RateLimited => "GitHub API quota spent",
+            Self::Throttled => "asked too fast — backing off",
             Self::BadCredentials => "run `gh auth login`, or set GITHUB_TOKEN",
             Self::Denied => "token lacks access — check its scopes and SSO",
             Self::NotFound => "no such repo, or the token can't see it",
@@ -232,8 +238,20 @@ fn classify_octocrab(err: &octocrab::Error) -> ApiError {
 /// Sorting it under `Denied` sent the user off to check token scopes and SSO for
 /// something only the clock can fix — so it is decided by its number, while 403
 /// still has to be read, because for 403 the number genuinely is ambiguous.
+///
+/// The two quota kinds are told apart rather than merged, because they lead
+/// different places: the hourly budget is answered by the meter in the header
+/// and waits out the hour, while the secondary one fires with the meter at 4%
+/// and clears in a minute. Calling the second one "rate limited" next to a
+/// header saying 4% spent reads as a bug in jog — it wasn't, it was two
+/// different limits wearing one word.
 fn fault_for(status: u16, message: &str) -> ApiFault {
-    if message.to_lowercase().contains("rate limit") {
+    let lower = message.to_lowercase();
+    // GitHub's own wording for the pace limit, in both of its phrasings.
+    if lower.contains("secondary rate limit") || lower.contains("abuse detection") {
+        return ApiFault::Throttled;
+    }
+    if lower.contains("rate limit") {
         return ApiFault::RateLimited;
     }
     match status {
@@ -258,6 +276,24 @@ fn first_line(s: &str, fallback: &str) -> String {
     } else {
         line.to_string()
     }
+}
+
+/// How many GitHub requests jog will have in the air at once.
+///
+/// A dashboard poll fans out over every repo at the same instant, and each row
+/// with CI going pulls its jobs on top of that — eight repos is a burst of
+/// seventy simultaneous requests, which is what trips the secondary limit while
+/// the hourly meter still reads single digits. The cap turns the burst into a
+/// trickle; it costs a fraction of a second on the poll and buys back a
+/// dashboard that isn't refusing to load.
+const MAX_INFLIGHT: usize = 4;
+
+static API_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_INFLIGHT);
+
+/// Run `f` with one of the in-flight slots held.
+async fn gated<T>(f: impl std::future::Future<Output = T>) -> T {
+    let _permit = API_GATE.acquire().await;
+    f.await
 }
 
 pub struct GitHubProvider {
@@ -348,7 +384,9 @@ impl GitHubProvider {
     /// reset time, since octocrab hands back the error body of a rejected call,
     /// not the `X-RateLimit-Reset` header it came with.
     pub async fn quota(&self) -> Result<Quota> {
-        let limits = self.crab.ratelimit().get().await.context("get rate limit")?;
+        let limits = gated(self.crab.ratelimit().get())
+            .await
+            .context("get rate limit")?;
         let core = limits.resources.core;
         let reset = DateTime::from_timestamp(core.reset as i64, 0)
             .ok_or_else(|| anyhow!("rate limit reset out of range"))?;
@@ -359,16 +397,37 @@ impl GitHubProvider {
         })
     }
 
+    /// Just the jobs of a run, for a caller that already has the run itself.
+    ///
+    /// The dashboard's live strip is exactly that caller: the row's poll already
+    /// listed the run a moment ago, so `get_run`'s second request would re-fetch
+    /// something we hold. Across eight repos following four runs each that is
+    /// half the poll's traffic spent on a known answer — and that traffic is
+    /// what earns the secondary rate limit.
+    pub async fn run_jobs(&self, id: u64) -> Result<Vec<Job>> {
+        let page = gated(
+            self.crab
+                .workflows(&self.repo.owner, &self.repo.repo)
+                .list_jobs(octocrab::models::RunId(id))
+                .per_page(50)
+                .send(),
+        )
+        .await
+        .context("list jobs")?;
+        Ok(page.items.into_iter().map(map_job).collect())
+    }
+
     /// Raw text of a file in the repo's default branch.
     async fn fetch_workflow_yaml(&self, path: &str) -> Result<String> {
-        let content = self
-            .crab
-            .repos(&self.repo.owner, &self.repo.repo)
-            .get_content()
-            .path(path)
-            .send()
-            .await
-            .with_context(|| format!("get contents of {path}"))?;
+        let content = gated(
+            self.crab
+                .repos(&self.repo.owner, &self.repo.repo)
+                .get_content()
+                .path(path)
+                .send(),
+        )
+        .await
+        .with_context(|| format!("get contents of {path}"))?;
         content
             .items
             .into_iter()
@@ -500,26 +559,28 @@ impl Provider for GitHubProvider {
     }
 
     async fn list_runs(&self, workflow_file: &str, limit: u8) -> Result<Vec<Run>> {
-        let page = self
-            .crab
-            .workflows(&self.repo.owner, &self.repo.repo)
-            .list_runs(workflow_file)
-            .per_page(limit)
-            .send()
-            .await
-            .context("list workflow runs")?;
+        let page = gated(
+            self.crab
+                .workflows(&self.repo.owner, &self.repo.repo)
+                .list_runs(workflow_file)
+                .per_page(limit)
+                .send(),
+        )
+        .await
+        .context("list workflow runs")?;
         Ok(page.items.into_iter().map(map_run).collect())
     }
 
     async fn list_repo_runs(&self, limit: u8) -> Result<Vec<Run>> {
-        let page = self
-            .crab
-            .workflows(&self.repo.owner, &self.repo.repo)
-            .list_all_runs()
-            .per_page(limit)
-            .send()
-            .await
-            .context("list all repo runs")?;
+        let page = gated(
+            self.crab
+                .workflows(&self.repo.owner, &self.repo.repo)
+                .list_all_runs()
+                .per_page(limit)
+                .send(),
+        )
+        .await
+        .context("list all repo runs")?;
         Ok(page.items.into_iter().map(map_run).collect())
     }
 
@@ -531,18 +592,10 @@ impl Provider for GitHubProvider {
     async fn get_run(&self, id: u64) -> Result<RunDetail> {
         let run_id = octocrab::models::RunId(id);
         let handler = self.crab.workflows(&self.repo.owner, &self.repo.repo);
-        let (run, jobs_page) = tokio::try_join!(
-            async { handler.get(run_id).await.context("get run") },
-            async {
-                handler
-                    .list_jobs(run_id)
-                    .per_page(50)
-                    .send()
-                    .await
-                    .context("list jobs")
-            },
+        let (run, jobs) = tokio::try_join!(
+            async { gated(handler.get(run_id)).await.context("get run") },
+            self.run_jobs(id),
         )?;
-        let jobs = jobs_page.items.into_iter().map(map_job).collect();
         Ok(RunDetail {
             run: map_run(run),
             jobs,
@@ -716,14 +769,25 @@ mod tests {
         // permissions problem and sends you off to re-check token scopes.
         let msg = "API rate limit exceeded for user ID 44789851. If you reach out …";
         assert_eq!(fault_for(403, msg), ApiFault::RateLimited);
-        assert_eq!(
-            fault_for(403, "You have exceeded a secondary rate limit"),
-            ApiFault::RateLimited
-        );
         assert_eq!(fault_for(403, "Resource not accessible"), ApiFault::Denied);
         assert_eq!(fault_for(401, "Bad credentials"), ApiFault::BadCredentials);
         assert_eq!(fault_for(404, "Not Found"), ApiFault::NotFound);
         assert_eq!(fault_for(502, "Bad gateway"), ApiFault::Unreachable);
+    }
+
+    #[test]
+    fn the_pace_limit_is_not_the_hourly_one() {
+        // The hourly meter can read 4% while every row is being refused: the
+        // secondary limit is about how fast we asked, not how much we spent.
+        // Told apart here, or the header offers an hour-away reset time for a
+        // wait that is over in a minute.
+        for msg in [
+            "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+            "You have triggered an abuse detection mechanism.",
+        ] {
+            assert_eq!(fault_for(403, msg), ApiFault::Throttled, "{msg}");
+            assert_eq!(fault_for(429, msg), ApiFault::Throttled, "{msg}");
+        }
     }
 
     #[test]
