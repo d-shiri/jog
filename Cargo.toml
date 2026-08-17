@@ -1,6 +1,6 @@
 [package]
 name = "jog"
-version = "0.1.18"
+version = "0.1.19"
 edition = "2024"
 license = "MIT"
 description = "A terminal UI for git and GitHub Actions across several repos: stage, commit, push, trigger and watch CI."
@@ -12,6 +12,12 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 octocrab = "0.44"
+# The same `http` stack octocrab speaks, for the conditional-request headers
+# (`If-None-Match`) its typed API has no slot for — and for naming the body
+# type its raw responses carry.
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,8 +36,8 @@ unicode-width = "0.2"
 
 
 [profile.release]
-opt-level = "z"      # or "s" (z = smallest)
-lto = false          # fat LTO cost ~30s/build for ~2MB of size — not worth it here
+opt-level = 3        # speed over size: rendering + parsing are the hot paths
+lto = "thin"         # near-fat-LTO wins at a fraction of the build-time cost
 codegen-units = 16   # parallel codegen across all cores
 panic = "abort"      # removes unwinding machinery
 strip = true         # strips symbols (since Rust 1.70+)

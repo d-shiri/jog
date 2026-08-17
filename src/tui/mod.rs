@@ -70,6 +70,10 @@ pub enum AppEvent {
     PrLoaded(String, String, Option<PrInfo>),
     /// Recent runs of a repo whose push is being followed into CI.
     PushWatchRuns(String, Vec<Run>),
+    /// The log-so-far of the running job the Watch view is following: job id,
+    /// job name, and the tail of its lines. `None` when GitHub has accepted
+    /// the job but has no log text to serve yet.
+    WatchTailLoaded(u64, String, Option<Vec<String>>),
     /// The active repo changed: new label, default branch, and workflow list.
     RepoSwitched {
         label: String,
@@ -337,12 +341,22 @@ async fn event_loop(
     state.poll_ticks = (poll_interval.as_millis() / 100).max(1) as u64;
     tick.tick().await;
 
+    // Whether the coming frame is worth painting. Every keypress and every
+    // task reply says yes; the 100ms tick only says yes while something on
+    // screen is actually moving, plus once a second so the header's clocks
+    // stay honest. An idle dashboard used to rebuild the whole frame ten
+    // times a second to display a screen that was not changing.
+    let mut redraw = true;
     loop {
         if state.needs_clear {
             terminal.clear()?;
             state.needs_clear = false;
+            redraw = true;
         }
-        terminal.draw(|f| views::render(f, state))?;
+        if redraw {
+            terminal.draw(|f| views::render(f, state))?;
+        }
+        redraw = true;
 
         tokio::select! {
             maybe_evt = events.next() => {
@@ -546,10 +560,24 @@ async fn event_loop(
                             if card.loaded && before != after {
                                 card.changed_tick = Some(tick);
                             }
+                            // A landing outranks a mere change: a run this row
+                            // had in flight is now terminal, and how it ended
+                            // is worth a longer, coloured breath.
+                            let landed = card
+                                .active_runs()
+                                .find_map(|old| {
+                                    runs.iter()
+                                        .find(|n| n.id == old.id && n.status.is_terminal())
+                                        .map(|n| n.status)
+                                });
+                            if card.loaded && let Some(verdict) = landed {
+                                card.settled_tick = Some((tick, verdict));
+                            }
                             card.runs = runs;
                             card.error = None;
                             card.loaded = true;
                         }
+                        note_all_green(state);
                         // A row answered with no hold running means the trouble
                         // is over, so the next refusal starts at the bottom of
                         // the ladder rather than the top of the last one. A hold
@@ -627,6 +655,7 @@ async fn event_loop(
                                 state.run_progress.remove(&spec);
                             }
                         }
+                        note_all_green(state);
                     }
                     AppEvent::GitStatusLoaded(spec, status) => {
                         if let Some(card) = state.repos.iter_mut().find(|c| c.spec == spec) {
@@ -667,6 +696,25 @@ async fn event_loop(
                     AppEvent::PushWatchRuns(spec, runs) => {
                         state.pending = state.pending.saturating_sub(1);
                         settle_push_watch(state, &spec, &runs, &config);
+                    }
+                    AppEvent::WatchTailLoaded(job_id, job_name, lines) => {
+                        state.watch_tail_pending = false;
+                        // Only worth holding while Watch is the view asking.
+                        if state.view == View::Watch {
+                            // "Nothing to serve yet" keeps what the last fetch
+                            // showed rather than blanking a pane the user is
+                            // reading — the endpoint flickers between the two
+                            // while the archive is being assembled.
+                            let prev = state.watch_tail.take().filter(|t| t.job_id == job_id);
+                            state.watch_tail = match (lines, prev) {
+                                (Some(lines), _) => Some(crate::app::state::WatchTail {
+                                    job_id,
+                                    job_name,
+                                    lines,
+                                }),
+                                (None, prev) => prev,
+                            };
+                        }
                     }
                     AppEvent::GitDiffLoaded(spec, file, sections) => {
                         // Only fold in a diff that still matches what the view
@@ -824,8 +872,13 @@ async fn event_loop(
             }
             _ = tick.tick() => {
                 state.tick_count += 1;
+                // Animations earn the 10fps; a still screen redraws once a
+                // second, which is what keeps the header clock and the poll
+                // countdown moving. Every non-tick branch redraws regardless.
+                redraw = state.tick_count % 10 == 0 || animations_active(state);
                 if state.status_msg.is_some() && state.tick_count.saturating_sub(state.status_msg_tick) > 30 {
                     state.status_msg = None;
+                    redraw = true;
                 }
                 let now = tokio::time::Instant::now();
                 if now.duration_since(last_poll) >= poll_interval {
@@ -867,6 +920,7 @@ async fn event_loop(
                                 if let Some(run) = state.runs.first().cloned() {
                                     spawn_fetch_run_detail(provider.clone(), run.id, tx.clone(), state);
                                 }
+                                spawn_watch_tail(&provider, state, &tx);
                             }
                             View::Runs => {
                                 let has_active = state.runs.iter().any(|r| !r.status.is_terminal());
@@ -3326,7 +3380,7 @@ fn spawn_fetch_repo_cards(
         // Local checkouts report their working-tree state whether or not they
         // have a remote — that half of the row is useful on its own.
         if let Some(path) = path {
-            spawn_git_status(label.clone(), path, tx.clone(), state);
+            spawn_git_status_gated(label.clone(), path, tx.clone(), state);
         }
         // Held off after a refusal — the row keeps the error it already shows,
         // and the header says how long. Re-asking is what extends the wait.
@@ -3350,6 +3404,28 @@ fn spawn_fetch_repo_cards(
             let _ = tx2.send(evt);
         });
     }
+}
+
+/// Notice the workspace going quiet with every row green, once per lull.
+///
+/// A transition, not a state: "busy a moment ago, and now nothing in flight
+/// with nothing red" is the moment the sweep celebrates. A plain all-green
+/// predicate would fire on every poll of a quiet morning, and a celebration
+/// on a schedule is a screensaver.
+fn note_all_green(state: &mut AppState) {
+    let busy = state.repos.iter().any(|c| c.active_runs().next().is_some());
+    if state.ci_was_busy && !busy {
+        let verdicts: Vec<Status> = state
+            .repos
+            .iter()
+            .filter(|c| c.has_ci() && c.error.is_none())
+            .filter_map(|c| c.latest_status())
+            .collect();
+        if !verdicts.is_empty() && verdicts.iter().all(|s| *s == Status::Success) {
+            state.all_green_tick = Some(state.tick_count);
+        }
+    }
+    state.ci_was_busy = busy;
 }
 
 /// Take a new budget reading, and say whether it is worth making a noise about.
@@ -3466,6 +3542,38 @@ fn sync_repo_progress(
 ///
 /// `git status` is fast but not instant on a large repo, and the event loop must
 /// not stall mid-frame — so every git call goes through `spawn_blocking`.
+/// The dashboard poll's ticks between unconditional `git status` runs — the
+/// backstop for what the fingerprint cannot see (edits to tracked files touch
+/// nothing under `.git`). Thirty seconds: an external edit shows up in the
+/// Changes column within that, while the six polls in between cost a few
+/// stats instead of a subprocess per repo each.
+const GIT_STATUS_BACKSTOP_TICKS: u64 = 300;
+
+/// `spawn_git_status`, but only when the repo looks like it moved.
+///
+/// For the dashboard poll alone: everything jog *does* to a repo refreshes
+/// the status explicitly through `spawn_git_status`, so this gate only ever
+/// skips re-asking a question whose answer nothing has touched.
+fn spawn_git_status_gated(
+    spec: String,
+    path: std::path::PathBuf,
+    tx: mpsc::UnboundedSender<AppEvent>,
+    state: &mut AppState,
+) {
+    let now = state.tick_count;
+    // A handful of stats on the event loop, not a subprocess: cheaper than
+    // shipping the check off-thread and having to marshal the skip back.
+    let fp = crate::git::fingerprint(&path);
+    if let Some((prev, last_full)) = state.git_poll_gate.get(&spec)
+        && *prev == fp
+        && now.saturating_sub(*last_full) < GIT_STATUS_BACKSTOP_TICKS
+    {
+        return;
+    }
+    state.git_poll_gate.insert(spec.clone(), (fp, now));
+    spawn_git_status(spec, path, tx, state);
+}
+
 fn spawn_git_status(
     spec: String,
     path: std::path::PathBuf,
@@ -3797,6 +3905,60 @@ fn switch_to_selected_repo(
                 let _ = tx2.send(AppEvent::TaskError(format!("load {label}: {e:#}")));
             }
         }
+    });
+}
+
+/// How many lines of a running job's log the Watch view keeps. The pane shows
+/// a dozen; the rest is slack for a burst between polls, not an archive — the
+/// Logs view is the archive.
+const WATCH_TAIL_KEEP: usize = 400;
+
+/// Follow the running job's log while Watch is open: one fetch per poll, for
+/// the tail pane under the step list.
+///
+/// GitHub serves a running job's log-so-far from the same endpoint as the
+/// archive, just unreliably early on — a miss reports "nothing yet" rather
+/// than erroring, and the next poll asks again. Deliberately outside the
+/// `pending` counter, like the strip's detail fetches: it is decoration over
+/// the view, and a slow log body must not pause the poll that keeps the steps
+/// current.
+fn spawn_watch_tail(
+    provider: &Arc<GitHubProvider>,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    if state.watch_tail_pending {
+        return;
+    }
+    let Some(detail) = &state.run_detail else {
+        return;
+    };
+    if detail.run.status.is_terminal() {
+        return;
+    }
+    let Some(job) = detail.jobs.iter().find(|j| j.status == Status::Running) else {
+        return;
+    };
+    let (id, name) = (job.id, job.name.clone());
+    state.watch_tail_pending = true;
+    let (p, tx) = (provider.clone(), tx.clone());
+    tokio::spawn(async move {
+        let lines = match p.stream_logs(id).await {
+            Ok(stream) => {
+                let mut lines: Vec<String> = stream
+                    .filter_map(|c| async { c.ok().map(|c| c.line) })
+                    .collect()
+                    .await;
+                if lines.len() > WATCH_TAIL_KEEP {
+                    lines.drain(..lines.len() - WATCH_TAIL_KEEP);
+                }
+                Some(lines)
+            }
+            // "Not available yet" and every other failure read the same from
+            // the pane: keep showing what we have and try again next poll.
+            Err(_) => None,
+        };
+        let _ = tx.send(AppEvent::WatchTailLoaded(id, name, lines));
     });
 }
 
@@ -4195,6 +4357,39 @@ fn sound_path(configured: &str, bundled: &'static [u8], name: &str) -> Option<St
     Some(path.to_string_lossy().into_owned())
 }
 
+/// Whether anything on screen is mid-animation — the difference between a
+/// frame worth painting every 100ms and one worth painting once a second.
+///
+/// Deliberately over-inclusive: a wrongly-true answer costs one redundant
+/// frame, a wrongly-false one freezes a spinner. Anything doubtful counts as
+/// moving, and the once-a-second unconditional redraw in the tick arm bounds
+/// whatever this misses at under a second of staleness.
+fn animations_active(state: &AppState) -> bool {
+    let tick = state.tick_count;
+    let flashing = |at: Option<u64>, span: u64| at.is_some_and(|a| tick.saturating_sub(a) < span);
+    let live = |r: &Run| !r.status.is_terminal();
+    state.pending > 0
+        || state.git_ops.values().any(|o| !o.finished)
+        || !state.run_progress.is_empty()
+        || !state.push_watches.is_empty()
+        || state.batch.is_some()
+        || flashing(state.all_green_tick, views::CELEBRATE_TICKS)
+        || state.repos.iter().any(|c| {
+            (c.has_ci() && !c.loaded && c.error.is_none())
+                || c.active_runs().next().is_some()
+                || flashing(c.changed_tick, views::FLASH_TICKS)
+                || flashing(c.settled_tick.map(|(t, _)| t), views::SETTLE_TICKS)
+        })
+        || state.runs.iter().any(live)
+        || state.workflow_preview_runs.iter().any(live)
+        || state
+            .workflows
+            .iter()
+            .any(|w| matches!(w.last_status, Some(Status::Running | Status::Queued)))
+        || state.run_detail.as_ref().is_some_and(|d| live(&d.run))
+        || state.runs_preview.as_ref().is_some_and(|d| live(&d.run))
+}
+
 pub fn animated_glyph(s: Status, tick: u64) -> &'static str {
     if s == Status::Running {
         motion::Motion::new(tick).spinner()
@@ -4231,6 +4426,57 @@ mod tests {
 
     fn quota(used: u32) -> Quota {
         Quota { limit: 100, used, reset: chrono::Utc::now() + chrono::Duration::minutes(20) }
+    }
+
+    #[test]
+    fn the_all_green_moment_is_a_transition_not_a_state() {
+        let mut st = dashboard();
+        for (i, c) in st.repos.iter_mut().enumerate() {
+            c.runs = vec![run_with(i as u64, Status::Success)];
+            c.loaded = true;
+        }
+        // Quiet and green from the first look: nothing to celebrate — the
+        // morning simply started well.
+        note_all_green(&mut st);
+        assert_eq!(st.all_green_tick, None);
+        // A run takes off, then lands green: that is the moment.
+        st.repos[0].runs[0].status = Status::Running;
+        note_all_green(&mut st);
+        st.tick_count = 50;
+        st.repos[0].runs[0].status = Status::Success;
+        note_all_green(&mut st);
+        assert_eq!(st.all_green_tick, Some(50));
+        // …and when one lands red instead, no sweep for a red board.
+        st.repos[0].runs[0].status = Status::Running;
+        note_all_green(&mut st);
+        st.tick_count = 90;
+        st.repos[0].runs[0].status = Status::Failure;
+        note_all_green(&mut st);
+        assert_eq!(st.all_green_tick, Some(50), "the old moment, not a new one");
+    }
+
+    #[test]
+    fn an_idle_dashboard_earns_no_animation_frames() {
+        let mut st = dashboard();
+        for (i, c) in st.repos.iter_mut().enumerate() {
+            c.runs = vec![run_with(i as u64, Status::Success)];
+            c.loaded = true;
+        }
+        st.tick_count = 1000;
+        assert!(!animations_active(&st), "everything settled, nothing moving");
+        // One run in flight is one spinner spinning.
+        st.repos[0].runs[0].status = Status::Running;
+        assert!(animations_active(&st));
+        st.repos[0].runs[0].status = Status::Success;
+        // A flash mid-fade still needs its frames…
+        st.repos[0].changed_tick = Some(995);
+        assert!(animations_active(&st));
+        // …and a faded one doesn't.
+        st.repos[0].changed_tick = Some(500);
+        assert!(!animations_active(&st));
+        // A row still skeleton-loading shimmers.
+        st.repos[1].loaded = false;
+        assert!(animations_active(&st));
     }
 
     #[test]

@@ -5,8 +5,9 @@ what CI is doing, and everything in between.
 
 - **Working tree** — stage, unstage, diff, commit and push, per repo or across
   several at once, with `pre-commit` hook output on screen while it runs.
-- **CI** — trigger workflows, watch runs step by step, read logs with the errors
-  already found, rerun or cancel.
+- **CI** — trigger workflows, watch runs step by step with the running job's
+  log tailing live underneath and an ETA learned from the workflow's own recent
+  durations, read logs with the errors already found, rerun or cancel.
 - **Several repos at a time** — one dashboard with each repo's branch, dirty
   files, latest run and run history; it keeps polling all of them, so a failure
   anywhere finds you.
@@ -266,6 +267,11 @@ The reading is refreshed on every poll from `/rate_limit`, which is exempt from
 the limit it reports, so watching the meter costs nothing against it. It is
 shared: every `gh` command and every other tool on the same token draws from the
 same bucket, which is usually how it gets emptied without you noticing.
+
+The dashboard's own polls are conditional requests: each repo's run list is
+re-asked with the `ETag` GitHub handed back last time, and the usual answer — a
+`304 Not Modified` — is free. A dashboard of quiet repos left open all day
+spends almost nothing; only a poll that actually has news pays for it.
 
 ## Default keys (TUI)
 

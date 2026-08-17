@@ -14,7 +14,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::animated_glyph;
 use super::motion::{Motion, mix};
 use crate::app::state::{
-    AppState, BatchPhase, DetailItem, GitOp, ItemState, Theme, View, build_detail_items,
+    AppState, BatchPhase, DetailItem, GitOp, ItemState, Theme, View, ansi_line_to_spans,
+    build_detail_items,
 };
 use crate::history::HistoryEntry;
 use crate::provider::github::{ApiFault, CRITICAL_PERCENT};
@@ -259,6 +260,29 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         f.render_widget(Paragraph::new(Line::from(mid)), slot);
     }
     f.render_widget(Paragraph::new(Line::from(right)).right_aligned(), area);
+
+    // The moment the last in-flight run lands and every row is green, one
+    // comet of that green crosses the header and is gone. Painted over the
+    // finished cells rather than rendered as a widget, so it lights the text
+    // it passes instead of replacing it — a sweep, not a banner.
+    if let Some(at) = state.all_green_tick {
+        let strength = Motion::new(state.tick_count).decay(at, CELEBRATE_TICKS);
+        if strength > 0.0 {
+            const TAIL: f64 = 12.0;
+            // The head enters at the left edge and exits fully, tail and all.
+            let head = (1.0 - strength) * (area.width as f64 + TAIL);
+            let buf = f.buffer_mut();
+            for x in 0..area.width {
+                let behind = head - x as f64;
+                if (0.0..TAIL).contains(&behind) {
+                    let t = (1.0 - behind / TAIL) * 0.45;
+                    let cell = &mut buf[(area.x + x, area.y)];
+                    let bg = cell.style().bg.unwrap_or(theme.surface);
+                    cell.set_bg(mix(bg, theme.success, t));
+                }
+            }
+        }
+    }
 }
 
 /// What is happening right now, for the middle of the header.
@@ -342,6 +366,15 @@ fn now_playing(state: &AppState) -> Vec<Span<'static>> {
             Style::default().fg(theme.text_faint),
         ),
     ];
+    // The stopwatch with the answer attached, when this workflow's recent
+    // durations offer one.
+    if let Some(t) = typical_run_secs(card.runs.iter(), &detail.run.display_title) {
+        let secs = (Utc::now() - detail.run.created_at).num_seconds().max(0);
+        out.push(Span::styled(
+            format!(" · {}", eta_text(t, secs)),
+            Style::default().fg(theme.text_faint),
+        ));
+    }
     if live.len() > 1 {
         out.push(Span::styled(
             format!("  +{}", live.len() - 1),
@@ -1344,14 +1377,28 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
 
             // A row whose CI moved since you last looked lights up and fades
             // back down, so the change is findable without diffing the screen
-            // against your memory of it.
-            let bg = match card.changed_tick {
-                Some(at) => mix(
-                    row_bg_for_status(status, theme),
+            // against your memory of it. A *landing* outranks a mere change:
+            // it breathes in the verdict's colour for two full breaths —
+            // longer and warmer than the flash — because "it finished, and
+            // this is how" is the fact the dashboard exists to deliver.
+            let m = Motion::new(state.tick_count);
+            let base = row_bg_for_status(status, theme);
+            let settle = card
+                .settled_tick
+                .map(|(at, verdict)| (m.decay(at, SETTLE_TICKS), verdict))
+                .filter(|(envelope, _)| *envelope > 0.0);
+            let bg = if let Some((envelope, verdict)) = settle {
+                let tint = style_for_status(verdict, theme).fg.unwrap_or(theme.text);
+                // The pulse carries the breath; the decay fades it out.
+                mix(base, tint, envelope * (0.2 + 0.35 * m.pulse(12)))
+            } else if let Some(at) = card.changed_tick {
+                mix(
+                    base,
                     style_for_status(status, theme).fg.unwrap_or(theme.text),
-                    0.4 * Motion::new(state.tick_count).decay(at, FLASH_TICKS),
-                ),
-                None => row_bg_for_status(status, theme),
+                    0.4 * m.decay(at, FLASH_TICKS),
+                )
+            } else {
+                base
             };
             let dress = row_dress(bg, rows.len(), i == state.repo_cursor, theme);
 
@@ -1606,7 +1653,18 @@ fn run_sparkline(runs: &[Run], width: usize, theme: &Theme) -> Vec<Span<'static>
 /// How long a row stays lit after its CI moves — one second, which is long
 /// enough to catch out of the corner of an eye and short enough that a busy
 /// dashboard is not permanently glowing.
-const FLASH_TICKS: u64 = 10;
+///
+/// `pub(super)` along with the two below: the event loop reads them to know
+/// whether a flash is still animating and the 10fps redraw still earned.
+pub(super) const FLASH_TICKS: u64 = 10;
+
+/// How long a row breathes in its verdict colour after a run lands — two full
+/// breaths. Longer than the any-change flash because a landing is the moment
+/// the dashboard exists for.
+pub(super) const SETTLE_TICKS: u64 = 24;
+
+/// How long the all-green sweep takes to cross the header and fade.
+pub(super) const CELEBRATE_TICKS: u64 = 20;
 
 /// A row that has nothing to show yet, waiting rather than broken.
 ///
@@ -1802,6 +1860,11 @@ fn render_activity_strip(
                 step,
                 ratio,
                 count,
+                // What the row's own recent runs say is left of this one —
+                // the question every glance at the strip is actually asking.
+                eta: typical_run_secs(card.runs.iter(), &run.display_title)
+                    .map(|t| eta_text(t, elapsed_seconds(run)))
+                    .unwrap_or_default(),
                 elapsed: format_elapsed(elapsed_seconds(run)),
             }
         })
@@ -1837,7 +1900,13 @@ fn render_activity_strip(
     // The bar is the first thing to go: it repeats what the counter beside it
     // already says, and on a narrow terminal the step name needs the room more.
     let bar_w = if inner >= 96 { 14 } else { 0 };
-    let fixed = 1 + bar_w + w_count + w_elapsed + SPACING * 8;
+    // The ETA column exists only when some row has one to show and the strip
+    // is wide enough that its two-space toll doesn't come out of the step
+    // name; without it the layout is exactly what it was before ETAs existed.
+    let w_eta = longest(&|c| disp_width(&c.eta)).min(14);
+    let show_eta = w_eta > 0 && inner >= 80;
+    let (w_eta, eta_spacing) = if show_eta { (w_eta, SPACING) } else { (0, 0) };
+    let fixed = 1 + bar_w + w_count + w_elapsed + w_eta + eta_spacing + SPACING * 8;
     let avail = inner.saturating_sub(fixed);
     shrink_to_fit(&mut cols, &FLOOR, avail);
     // Slack goes to the step, so the elapsed clock keeps the right edge and the
@@ -1860,7 +1929,7 @@ fn render_activity_strip(
                     Style::default().fg(theme.text_muted).italic(),
                 )),
             };
-            Row::new(vec![
+            let mut cells_out = vec![
                 Cell::from(Span::styled(
                     c.glyph.clone(),
                     Style::default().fg(theme.warning).bold(),
@@ -1891,18 +1960,28 @@ fn render_activity_strip(
                     c.count.clone(),
                     Style::default().fg(theme.text_muted),
                 )),
-                Cell::from(
+            ];
+            if show_eta {
+                cells_out.push(Cell::from(
                     Line::from(Span::styled(
-                        c.elapsed.clone(),
-                        Style::default().fg(theme.warning),
+                        c.eta.clone(),
+                        Style::default().fg(theme.text_muted),
                     ))
                     .right_aligned(),
-                ),
-            ])
+                ));
+            }
+            cells_out.push(Cell::from(
+                Line::from(Span::styled(
+                    c.elapsed.clone(),
+                    Style::default().fg(theme.warning),
+                ))
+                .right_aligned(),
+            ));
+            Row::new(cells_out)
         })
         .collect();
 
-    let widths = [
+    let mut widths = vec![
         Constraint::Length(1), // spinner
         Constraint::Length(cols[0] as u16),
         Constraint::Length(cols[1] as u16),
@@ -1911,8 +1990,11 @@ fn render_activity_strip(
         Constraint::Length(cols[4] as u16),
         Constraint::Length(bar_w as u16),
         Constraint::Length(w_count as u16),
-        Constraint::Length(w_elapsed as u16),
     ];
+    if show_eta {
+        widths.push(Constraint::Length(w_eta as u16));
+    }
+    widths.push(Constraint::Length(w_elapsed as u16));
 
     f.render_widget(
         Table::new(rows, widths).column_spacing(SPACING as u16).block(
@@ -1939,6 +2021,9 @@ struct StripRow {
     step: StepCell,
     ratio: Option<f64>,
     count: String,
+    /// "~1:16 left", from this workflow's own recent durations. Empty when
+    /// there is no history to predict from.
+    eta: String,
     elapsed: String,
 }
 
@@ -3997,14 +4082,95 @@ fn render_search_overlay(f: &mut Frame, area: Rect, state: &AppState) {
 
 fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
+    // The live tail earns a pane only while a job is actually producing one —
+    // between runs, and once everything has settled, the steps get the room
+    // back and the view is exactly what it was before the pane existed.
+    let tail_job = state
+        .run_detail
+        .as_ref()
+        .filter(|d| !d.run.status.is_terminal())
+        .and_then(|d| d.jobs.iter().find(|j| j.status == Status::Running));
+    let tail_h = if tail_job.is_some() && area.height >= 20 {
+        (area.height / 3).clamp(5, 14)
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Min(0),
+            Constraint::Length(tail_h),
+        ])
         .split(area);
 
+    // Drawn before the step lists, whose section returns early when a run has
+    // no jobs yet — which is exactly when "waiting for the log" is the only
+    // thing worth saying.
+    if let Some(job) = tail_job
+        && tail_h > 0
+    {
+        let ta = chunks[2];
+        let viewport = ta.height.saturating_sub(2) as usize;
+        let (title, lines): (String, Vec<Line>) = match &state.watch_tail {
+            Some(t) if t.job_id == job.id && !t.lines.is_empty() => {
+                // The tail follows the newest lines by definition; scrolling
+                // back through history is what the Logs view is for.
+                let shown: Vec<Line> = t
+                    .lines
+                    .iter()
+                    .rev()
+                    .take(viewport)
+                    .rev()
+                    .map(|l| {
+                        Line::from(ansi_line_to_spans(
+                            l,
+                            Style::default().fg(theme.text),
+                        ))
+                    })
+                    .collect();
+                (
+                    format!("Live log — {}  ({} lines)", t.job_name, t.lines.len()),
+                    shown,
+                )
+            }
+            _ => (
+                format!("Live log — {}", job.name),
+                vec![Line::from(Span::styled(
+                    "waiting for GitHub to serve the log…",
+                    Style::default().fg(theme.text_muted).italic(),
+                ))],
+            ),
+        };
+        f.render_widget(
+            Paragraph::new(lines).block(styled_block(&title, &state.theme)),
+            ta,
+        );
+    }
+
     let summary_lines = if let Some(detail) = &state.run_detail {
-        let elapsed = format_elapsed(elapsed_seconds(&detail.run));
+        let secs = elapsed_seconds(&detail.run);
+        let elapsed = format_elapsed(secs);
         let step = detail.current_step().unwrap_or("—");
+        // What the recent runs say this workflow usually takes, and what that
+        // makes of the clock: "usually 3:57 · ~1:16 left" turns a stopwatch
+        // into an answer to the question actually being asked of it.
+        let mut elapsed_spans = vec![
+            Span::styled("Elapsed:", Style::default().fg(theme.primary).bold()),
+            Span::raw(format!(" {}", elapsed)),
+        ];
+        if !detail.run.status.is_terminal()
+            && let Some(t) = typical_run_secs(state.runs.iter(), &detail.run.display_title)
+        {
+            elapsed_spans.push(Span::styled(
+                format!("  ·  usually {}", format_elapsed(t)),
+                Style::default().fg(theme.text_muted),
+            ));
+            elapsed_spans.push(Span::styled(
+                format!("  ·  {}", eta_text(t, secs)),
+                Style::default().fg(theme.warning),
+            ));
+        }
         vec![
             Line::from(vec![
                 Span::styled("Status: ", Style::default().fg(theme.primary).bold()),
@@ -4017,10 +4183,7 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
                 Span::styled("Step:   ", Style::default().fg(theme.primary).bold()),
                 Span::raw(step.to_string()),
             ]),
-            Line::from(vec![
-                Span::styled("Elapsed:", Style::default().fg(theme.primary).bold()),
-                Span::raw(format!(" {}", elapsed)),
-            ]),
+            Line::from(elapsed_spans),
             Line::from(vec![
                 Span::styled("Run:    ", Style::default().fg(theme.primary).bold()),
                 Span::raw(format!(
@@ -4391,6 +4554,37 @@ fn elapsed_seconds(run: &Run) -> i64 {
         Utc::now()
     };
     (end - run.created_at).num_seconds().max(0)
+}
+
+/// The typical duration of one workflow, learned from the finished successes
+/// already on hand — the median, which one freak cache-miss build cannot
+/// drag. `None` until there is at least one to learn from.
+///
+/// Runs, not the history file: every caller already holds a window of this
+/// workflow's recent runs with both timestamps on them, which is fresher than
+/// anything on disk and exists for remote-only repos too.
+fn typical_run_secs<'a>(runs: impl Iterator<Item = &'a Run>, title: &str) -> Option<i64> {
+    let mut durs: Vec<i64> = runs
+        .filter(|r| r.display_title == title && r.status == Status::Success)
+        .map(|r| (r.updated_at - r.created_at).num_seconds())
+        .filter(|s| *s > 0)
+        .collect();
+    if durs.is_empty() {
+        return None;
+    }
+    durs.sort_unstable();
+    Some(durs[durs.len() / 2])
+}
+
+/// What to say about a running run's remaining time. Honest about being a
+/// guess — past the typical it says so rather than counting negative time.
+fn eta_text(typical: i64, elapsed: i64) -> String {
+    let left = typical - elapsed;
+    if left >= 5 {
+        format!("~{} left", format_elapsed(left))
+    } else {
+        "running long".into()
+    }
 }
 
 fn format_elapsed(secs: i64) -> String {
@@ -4814,6 +5008,39 @@ mod tests {
         assert!(api.contains("●1"), "got {api:?}");
         // …and only on that repo. A marker on every row would say nothing.
         assert!(!web.contains("commit"), "got {web:?}");
+    }
+
+    #[test]
+    fn the_eta_is_the_median_of_this_workflows_successes() {
+        let done = |mins: i64, status| {
+            let mut r = a_run(0, "Deploy", status, 0);
+            r.created_at = Utc.with_ymd_and_hms(2026, 5, 1, 10, 0, 0).unwrap();
+            r.updated_at = r.created_at + chrono::Duration::minutes(mins);
+            r
+        };
+        let runs = vec![
+            done(4, Status::Success),
+            done(3, Status::Success),
+            // Failures say nothing about how long a healthy run takes.
+            done(60, Status::Failure),
+            // The freak build is exactly what the median exists to shrug off.
+            done(30, Status::Success),
+        ];
+        assert_eq!(typical_run_secs(runs.iter(), "Deploy"), Some(240));
+        assert_eq!(
+            typical_run_secs(runs.iter(), "Other"),
+            None,
+            "someone else's history predicts nothing"
+        );
+    }
+
+    #[test]
+    fn the_eta_stops_promising_when_the_run_outlives_its_history() {
+        assert_eq!(eta_text(240, 100), "~2:20 left");
+        // Past the typical, an honest guess is that there is no guess — never
+        // a negative countdown.
+        assert_eq!(eta_text(240, 238), "running long");
+        assert_eq!(eta_text(240, 500), "running long");
     }
 
     fn a_run(id: u64, title: &str, status: Status, age_secs: i64) -> Run {

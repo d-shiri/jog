@@ -385,6 +385,45 @@ pub fn remote_url(dir: &Path) -> Result<String> {
         .to_string())
 }
 
+/// A cheap identity for the state `.git` itself records — HEAD, the index,
+/// the loose and packed refs, a merge in progress.
+///
+/// This is what lets the dashboard skip most of its `git status` subprocesses:
+/// commits, staging, branch switches and pulls all move one of these files (a
+/// ref update lands by rename, which stamps its parent directory), so an
+/// unchanged fingerprint means that whole class of change did not happen.
+/// What it cannot see is an edit to a tracked file, which touches nothing
+/// under `.git` — the caller covers that with a periodic unconditional
+/// refresh rather than by statting the working tree, which is the very cost
+/// being avoided.
+pub fn fingerprint(dir: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let git = dir.join(".git");
+    for rel in ["HEAD", "index", "packed-refs", "MERGE_HEAD", "refs", "refs/heads"] {
+        // Absence is state too: MERGE_HEAD disappearing is a merge finishing.
+        match std::fs::metadata(git.join(rel)) {
+            Ok(m) => {
+                rel.hash(&mut h);
+                m.len().hash(&mut h);
+                if let Ok(t) = m.modified()
+                    && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
+                {
+                    d.as_nanos().hash(&mut h);
+                }
+            }
+            Err(_) => (rel, u64::MAX).hash(&mut h),
+        }
+    }
+    // A linked worktree's `.git` is a file pointing elsewhere; hashing it too
+    // costs one stat and keeps repos like that from all fingerprinting alike.
+    if let Ok(m) = std::fs::metadata(&git) {
+        m.is_file().hash(&mut h);
+        m.len().hash(&mut h);
+    }
+    h.finish()
+}
+
 pub fn status(dir: &Path) -> Result<RepoStatus> {
     // NUL-separated so paths with spaces, quotes or newlines survive intact.
     let raw = git(dir, &["status", "--porcelain=v1", "-b", "-z"])?;
@@ -599,6 +638,21 @@ pub fn head_sha(dir: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fingerprint_holds_still_until_git_state_moves() {
+        let dir = std::env::temp_dir().join(format!("jog-fp-test-{}", std::process::id()));
+        let git_dir = dir.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let a = fingerprint(&dir);
+        assert_eq!(a, fingerprint(&dir), "nothing moved, nothing changes");
+        // A merge starting is a new file under `.git`; its existence alone
+        // moves the print, no mtime granularity required.
+        std::fs::write(git_dir.join("MERGE_HEAD"), "abc123\n").unwrap();
+        assert_ne!(a, fingerprint(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn parses_branch_header_with_tracking() {

@@ -700,6 +700,14 @@ pub struct RepoCard {
     /// without it the only evidence that anything happened is a glyph that is
     /// now a different shape than it was the last time you looked at it.
     pub changed_tick: Option<u64>,
+    /// Tick a run on this row *landed* — running one poll, terminal the next —
+    /// and how it ended.
+    ///
+    /// Separate from `changed_tick` because a landing is the change worth
+    /// more: the row breathes in the run's verdict colour for a couple of
+    /// seconds, long enough to catch from the corner of an eye with the sound
+    /// off, where the generic flash is one second and gone.
+    pub settled_tick: Option<(u64, Status)>,
 }
 
 impl RepoCard {
@@ -714,6 +722,7 @@ impl RepoCard {
             loaded: false,
             git: None,
             changed_tick: None,
+            settled_tick: None,
         }
     }
 
@@ -732,6 +741,7 @@ impl RepoCard {
             loaded: false,
             git: None,
             changed_tick: None,
+            settled_tick: None,
         }
     }
 
@@ -1513,6 +1523,36 @@ pub struct AppState {
     /// Pushes being followed into CI — see [`PushWatch`]. A vec, not an option:
     /// a batch push starts one per repo.
     pub push_watches: Vec<PushWatch>,
+    /// Per repo: the `.git` fingerprint last seen by the dashboard poll, and
+    /// the tick of the last unconditional `git status`. What lets the poll
+    /// skip the subprocess when nothing under `.git` has moved — see
+    /// `crate::git::fingerprint` for what that does and doesn't cover.
+    pub git_poll_gate: HashMap<String, (u64, u64)>,
+    /// The tick the workspace last went quiet with every row green — the last
+    /// in-flight run landed and nothing is red. Drives the one sweep of light
+    /// across the header; `None` once it has faded (or before it ever happens).
+    pub all_green_tick: Option<u64>,
+    /// Whether the last look across the dashboard had anything in flight.
+    /// The all-green moment is a *transition* — busy, then quiet-and-green —
+    /// and a plain predicate would fire on every poll of a green morning.
+    pub ci_was_busy: bool,
+    /// Live tail of the running job on the watched run, refreshed once per
+    /// poll while Watch is open. GitHub serves a running job's log-so-far
+    /// from the same endpoint that serves the archive; some moments it has
+    /// nothing yet, which is what `available` reports.
+    pub watch_tail: Option<WatchTail>,
+    /// A tail fetch is in flight — one per poll, not one per tick.
+    pub watch_tail_pending: bool,
+}
+
+/// What the Watch view's live log pane holds: whose log it is and the last
+/// lines of it. Replaced whole on every fetch — the endpoint returns the log
+/// from the top, so there is no append to do.
+#[derive(Debug, Clone)]
+pub struct WatchTail {
+    pub job_id: u64,
+    pub job_name: String,
+    pub lines: Vec<String>,
 }
 
 impl AppState {
@@ -1604,6 +1644,11 @@ impl AppState {
             last_poll_tick: 0,
             run_progress: HashMap::new(),
             push_watches: Vec::new(),
+            git_poll_gate: HashMap::new(),
+            all_green_tick: None,
+            ci_was_busy: false,
+            watch_tail: None,
+            watch_tail_pending: false,
         }
     }
 

@@ -296,12 +296,36 @@ async fn gated<T>(f: impl std::future::Future<Output = T>) -> T {
     f.await
 }
 
+/// The ETag cache, poison notwithstanding: it holds nothing that can't be
+/// re-fetched, so a panic elsewhere must not turn every later poll into an
+/// unwrap panic of its own.
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What one conditional fetch left behind: the validator GitHub handed us and
+/// the answer it validates. A 304 replays `runs`; anything else replaces the
+/// whole entry.
+struct CachedRuns {
+    etag: String,
+    runs: Vec<Run>,
+}
+
 pub struct GitHubProvider {
     crab: Arc<Octocrab>,
     repo: RepoSpec,
     /// Kept so we can mint a sibling provider for another repo without
     /// re-resolving credentials (see `for_repo`).
     token: String,
+    /// ETags (and the run lists they stand for) per `owner/repo#limit`.
+    ///
+    /// The dashboard re-asks the same question every poll, and most polls the
+    /// answer has not moved. GitHub says so with a 304 — which costs nothing
+    /// against the hourly budget — but only if we kept the validator from last
+    /// time. Shared across `for_repo` siblings because the dashboard mints a
+    /// fresh provider per repo per poll; a cache that died with the provider
+    /// would never see its second request.
+    run_etags: Arc<std::sync::Mutex<HashMap<String, CachedRuns>>>,
 }
 
 impl GitHubProvider {
@@ -314,6 +338,7 @@ impl GitHubProvider {
             crab: Arc::new(crab),
             repo,
             token,
+            run_etags: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -328,6 +353,7 @@ impl GitHubProvider {
             crab: self.crab.clone(),
             repo,
             token: self.token.clone(),
+            run_etags: self.run_etags.clone(),
         }
     }
 
@@ -415,6 +441,147 @@ impl GitHubProvider {
         .await
         .context("list jobs")?;
         Ok(page.items.into_iter().map(map_job).collect())
+    }
+
+    /// The repo-wide run list, asked conditionally.
+    ///
+    /// Sent with `If-None-Match` whenever a previous answer left an ETag
+    /// behind. A 304 replays that answer from the cache — and, per GitHub's
+    /// documentation, does not count against the hourly budget. A dashboard
+    /// polling eight quiet repos every five seconds spends its whole hour on
+    /// this one question; conditionally it spends almost nothing.
+    ///
+    /// Octocrab's typed runs endpoint has no slot for request headers or for
+    /// reading response ones, so this speaks the route raw and parses the same
+    /// model the typed call would have.
+    async fn list_repo_runs_conditional(&self, limit: u8) -> Result<Vec<Run>> {
+        let key = format!("{}/{}#{}", self.repo.owner, self.repo.repo, limit);
+        let route = format!(
+            "/repos/{}/{}/actions/runs?per_page={}",
+            self.repo.owner, self.repo.repo, limit
+        );
+        let prev = lock(&self.run_etags).get(&key).map(|c| c.etag.clone());
+        let mut headers = http::HeaderMap::new();
+        if let Some(etag) = prev.as_deref().and_then(|e| http::HeaderValue::from_str(e).ok()) {
+            headers.insert(http::header::IF_NONE_MATCH, etag);
+        }
+        let resp = gated(self.crab._get_with_headers(route.as_str(), Some(headers)))
+            .await
+            .context("list all repo runs")?;
+        if resp.status() == http::StatusCode::NOT_MODIFIED {
+            if let Some(cached) = lock(&self.run_etags).get(&key) {
+                return Ok(cached.runs.clone());
+            }
+            // A 304 with nothing to replay should be impossible (nothing
+            // evicts), but answering it with an empty dashboard would be
+            // worse than one uncached request: drop the validator and ask
+            // plainly.
+            let plain = gated(self.crab._get_with_headers(route.as_str(), None))
+                .await
+                .context("list all repo runs")?;
+            return self.digest_runs_page(&key, plain).await;
+        }
+        self.digest_runs_page(&key, resp).await
+    }
+
+    /// Turn a raw runs-page response into `Run`s, banking the ETag on the way.
+    async fn digest_runs_page(
+        &self,
+        key: &str,
+        resp: http::Response<http_body_util::combinators::BoxBody<bytes::Bytes, octocrab::Error>>,
+    ) -> Result<Vec<Run>> {
+        let etag = resp
+            .headers()
+            .get(http::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        // Through octocrab's own error mapping, so a refusal here classifies
+        // (rate limited, not found, …) exactly like one from the typed API.
+        let resp = octocrab::map_github_error(resp)
+            .await
+            .map_err(anyhow::Error::from)
+            .context("list all repo runs")?;
+        let body = self
+            .crab
+            .body_to_string(resp)
+            .await
+            .context("read repo runs body")?;
+        #[derive(serde::Deserialize)]
+        struct RunsPage {
+            workflow_runs: Vec<gh_workflows::Run>,
+        }
+        let page: RunsPage = serde_json::from_str(&body).context("parse repo runs")?;
+        let runs: Vec<Run> = page.workflow_runs.into_iter().map(map_run).collect();
+        match etag {
+            Some(etag) => {
+                lock(&self.run_etags).insert(key.to_string(), CachedRuns { etag, runs: runs.clone() });
+            }
+            // No validator means the next request cannot be conditional; a
+            // stale entry left behind would pair last poll's runs with an
+            // ETag GitHub no longer honours.
+            None => {
+                lock(&self.run_etags).remove(key);
+            }
+        }
+        Ok(runs)
+    }
+
+    /// The repo-wide run list assembled from its parts: one request for the
+    /// workflow files, one per workflow (capped) for its newest runs, merged
+    /// newest-first. Strictly a fallback — it costs N+1 requests where the
+    /// real endpoint costs one — for when that endpoint alone is refusing.
+    async fn repo_runs_via_workflows(&self, limit: u8) -> Result<Vec<Run>> {
+        // Enough for any repo a dashboard row summarises; a monorepo with
+        // dozens of workflows must not turn one broken poll into dozens of
+        // requests per interval.
+        const MAX_WORKFLOWS: usize = 8;
+        let page = gated(
+            self.crab
+                .workflows(&self.repo.owner, &self.repo.repo)
+                .list()
+                .per_page(50u8)
+                .send(),
+        )
+        .await
+        .context("list workflows")?;
+        let files: Vec<String> = page
+            .items
+            .into_iter()
+            // Legacy/removed workflows list with an empty path — no file to
+            // ask about.
+            .filter(|wf| !wf.path.trim().is_empty())
+            .map(|wf| {
+                wf.path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(wf.path.as_str())
+                    .to_string()
+            })
+            .take(MAX_WORKFLOWS)
+            .collect();
+        if files.is_empty() {
+            return Err(anyhow!("no workflows to fall back on"));
+        }
+        // Spread the budget: enough per workflow to reconstruct the window,
+        // never more than the window itself.
+        let per = (limit as usize / files.len()).clamp(3, limit.max(1) as usize) as u8;
+        let fetches = files.iter().map(|f| async move {
+            let mut runs = self.list_runs(f, per).await.unwrap_or_default();
+            // The real endpoint doesn't name the workflow file; here we know
+            // it, and downstream matching is better off for it.
+            for r in &mut runs {
+                r.workflow_file = Some(f.clone());
+            }
+            runs
+        });
+        let mut all: Vec<Run> = futures::future::join_all(fetches)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        all.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        all.truncate(limit as usize);
+        Ok(all)
     }
 
     /// Raw text of a file in the repo's default branch.
@@ -572,16 +739,22 @@ impl Provider for GitHubProvider {
     }
 
     async fn list_repo_runs(&self, limit: u8) -> Result<Vec<Run>> {
-        let page = gated(
-            self.crab
-                .workflows(&self.repo.owner, &self.repo.repo)
-                .list_all_runs()
-                .per_page(limit)
-                .send(),
-        )
-        .await
-        .context("list all repo runs")?;
-        Ok(page.items.into_iter().map(map_run).collect())
+        match self.list_repo_runs_conditional(limit).await {
+            Ok(runs) => Ok(runs),
+            // GitHub's Actions backend has been seen 404-ing exactly this
+            // route during incidents while the repo — and its per-workflow
+            // runs — answered fine. Degrade to the long way round rather than
+            // to eight rows of "not found"; a repo that is genuinely gone
+            // fails the fallback too and keeps the original error.
+            Err(err) => {
+                if classify_error(&err).fault == ApiFault::NotFound
+                    && let Ok(runs) = self.repo_runs_via_workflows(limit).await
+                {
+                    return Ok(runs);
+                }
+                Err(err)
+            }
+        }
     }
 
     async fn get_latest_run(&self, workflow_file: &str) -> Result<Option<Run>> {
@@ -748,6 +921,32 @@ fn extract_time(s: &str) -> (Option<&str>, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "live API probe: cargo test etag_roundtrip -- --ignored --nocapture"]
+    async fn etag_roundtrip() {
+        // Two identical polls: the second should ride the ETag — same answer,
+        // and (per GitHub's docs) no charge against the hourly budget. The
+        // budget readings printed here are the evidence; the assertions only
+        // pin what must hold either way.
+        let token = resolve_token().unwrap();
+        let p = GitHubProvider::new(RepoSpec::parse("cli/cli").unwrap(), token).unwrap();
+        let before = p.quota().await.unwrap();
+        let a = p.list_repo_runs(5).await.unwrap();
+        let mid = p.quota().await.unwrap();
+        let b = p.list_repo_runs(5).await.unwrap();
+        let after = p.quota().await.unwrap();
+        println!(
+            "used: {} -> {} (uncached) -> {} (conditional)",
+            before.used, mid.used, after.used
+        );
+        assert_eq!(
+            a.iter().map(|r| r.id).collect::<Vec<_>>(),
+            b.iter().map(|r| r.id).collect::<Vec<_>>(),
+            "a 304 must replay exactly what the 200 said"
+        );
+        assert!(!a.is_empty(), "cli/cli runs CI; an empty answer is a parse bug");
+    }
 
     #[test]
     fn parses_https_remote() {
