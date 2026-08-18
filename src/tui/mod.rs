@@ -1081,10 +1081,24 @@ async fn handle_key(
         return None;
     }
 
+    // The services overlay is a card, not a document: nothing in it scrolls,
+    // so any key puts it away.
+    if state.show_services {
+        state.show_services = false;
+        state.needs_clear = true;
+        return None;
+    }
+
     // Global: keybinding reference.
     if key_is(&key, km.help) {
         state.show_help = true;
         state.help_scroll = 0;
+        return None;
+    }
+
+    // Global: service health by name, wherever you are.
+    if key_is(&key, km.services) {
+        state.show_services = true;
         return None;
     }
 
@@ -2952,6 +2966,7 @@ struct Keymap {
     prev_error: (KeyCode, KeyModifiers),
     finder: (KeyCode, KeyModifiers),
     repos_view: (KeyCode, KeyModifiers),
+    services: (KeyCode, KeyModifiers),
     repo_mark: (KeyCode, KeyModifiers),
     batch_commit: (KeyCode, KeyModifiers),
     batch_retry: (KeyCode, KeyModifiers),
@@ -3052,6 +3067,7 @@ fn resolve_keymap(cfg: &KeymapConfig) -> Result<Keymap> {
         prev_error:    parse_key(&cfg.prev_error)?,
         finder:        parse_key(&cfg.finder)?,
         repos_view:    parse_key(&cfg.repos_view)?,
+        services:      parse_key(&cfg.services)?,
         repo_mark:     parse_key(&cfg.repo_mark)?,
         batch_commit:  parse_key(&cfg.batch_commit)?,
         batch_retry:   parse_key(&cfg.batch_retry)?,

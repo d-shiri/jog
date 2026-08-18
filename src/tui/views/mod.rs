@@ -54,8 +54,179 @@ pub fn render(f: &mut Frame, state: &AppState) {
     }
     render_push_prompt(f, area, state);
     render_finder_overlay(f, area, state);
+    render_services_overlay(f, area, state);
     // Drawn last so it sits above every other overlay.
     render_help_overlay(f, area, state);
+}
+
+/// Every monitor by name — the card behind the header's heart.
+///
+/// The tally can only count and the Live column only decorates mapped rows;
+/// this is where "which ones, and how are they doing" gets answered, the
+/// unmapped monitors included. A card, not a view: nothing here is acted on,
+/// so any key puts it away.
+fn render_services_overlay(f: &mut Frame, area: Rect, state: &AppState) {
+    if !state.show_services {
+        return;
+    }
+    let theme = &state.theme;
+
+    let rows: Vec<Line> = if state.services.is_empty() {
+        vec![Line::from(Span::styled(
+            "nothing to show — add [uptime_kuma] with your status page's URL to config.toml",
+            Style::default().fg(theme.text_muted).italic(),
+        ))]
+    } else {
+        let name_w = state
+            .services
+            .iter()
+            .map(|s| disp_width(&s.name))
+            .max()
+            .unwrap_or(4);
+        // What divides the card into sections, best evidence first: the status
+        // page's own groups when it has more than one; failing that, the
+        // monitors' first tags — five rows each wearing the same #Prod chip
+        // are a group that hasn't been drawn yet. One lone group under a card
+        // already titled "Services" would just say the same word twice.
+        let distinct_groups: std::collections::HashSet<&str> =
+            state.services.iter().map(|s| s.group.as_str()).collect();
+        let by_group = distinct_groups.len() > 1;
+        let by_tag = !by_group && state.services.iter().any(|s| !s.tags.is_empty());
+        let mut sections: Vec<(String, Vec<&crate::kuma::Service>)> = Vec::new();
+        for s in &state.services {
+            let key = if by_group {
+                s.group.clone()
+            } else if by_tag {
+                s.tags.first().cloned().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            match sections.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, list)) => list.push(s),
+                None => sections.push((key, vec![s])),
+            }
+        }
+        // The untagged straggle in at the end rather than opening the card.
+        if by_tag && let Some(i) = sections.iter().position(|(k, _)| k.is_empty()) {
+            let untagged = sections.remove(i);
+            sections.push(untagged);
+        }
+
+        let mut out: Vec<Line> = Vec::new();
+        for (i, (section, members)) in sections.iter().enumerate() {
+            if sections.len() > 1 {
+                if i > 0 {
+                    out.push(Line::from(""));
+                }
+                let label = if section.is_empty() { "untagged" } else { section };
+                out.push(Line::from(vec![
+                    Span::styled(format!(" {label}"), Style::default().fg(theme.text_faint)),
+                    Span::styled(" ╌╌╌", Style::default().fg(theme.border_dim)),
+                ]));
+            }
+            for s in members {
+            out.push({
+                use crate::kuma::ServiceState;
+                let (glyph, style, word) = match s.state {
+                    ServiceState::Up => ("●", Style::default().fg(theme.success), "up"),
+                    ServiceState::Down => (
+                        "✗",
+                        Style::default().fg(theme.failure).bold(),
+                        "down",
+                    ),
+                    ServiceState::Pending => {
+                        ("◌", Style::default().fg(theme.warning), "pending")
+                    }
+                    ServiceState::Maintenance => {
+                        ("◒", Style::default().fg(theme.info), "maintenance")
+                    }
+                };
+                let mut spans = vec![
+                    Span::styled(format!(" {glyph} "), style),
+                    Span::styled(
+                        format!("{:<name_w$}", s.name),
+                        Style::default().fg(theme.text_bright),
+                    ),
+                    Span::styled(format!("  {word:<12}"), style),
+                    Span::styled(
+                        match s.ping_ms {
+                            Some(p) => format!("{p:>5}ms"),
+                            None => format!("{:>7}", "—"),
+                        },
+                        Style::default().fg(theme.text),
+                    ),
+                    Span::styled(
+                        match s.uptime24 {
+                            Some(u) => format!("  {:>5.1}% today", u * 100.0),
+                            None => String::new(),
+                        },
+                        Style::default().fg(theme.text_muted),
+                    ),
+                ];
+                // Tags, when the status page publishes them ("Show Tags" in
+                // Kuma's page settings) — minus the one already serving as
+                // this section's heading, which a chip would only repeat.
+                for tag in s.tags.iter().filter(|t| *t != section) {
+                    spans.push(Span::styled(
+                        format!("  #{tag}"),
+                        Style::default().fg(theme.info),
+                    ));
+                }
+                // Which dashboard row this monitor decorates, when one does.
+                if let Some(repo) = state.service_repos.get(&s.name) {
+                    spans.push(Span::styled(
+                        format!("  → {repo}"),
+                        Style::default().fg(theme.text_faint),
+                    ));
+                }
+                Line::from(spans)
+            });
+            }
+        }
+        out
+    };
+
+    let w = rows
+        .iter()
+        .map(|l| l.width() as u16 + 4)
+        .max()
+        .unwrap_or(40)
+        .clamp(36, area.width.saturating_sub(4));
+    let h = (rows.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let slot = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, slot);
+    // Its own border, brighter than the panels': every other frame on screen
+    // sits *under* things, while this one floats above them all and dim grey
+    // read as part of the background it was covering.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .title(Line::from(vec![
+            Span::styled("─┤ ", Style::default().fg(theme.accent)),
+            Span::styled("♥ Services", Style::default().fg(theme.accent).bold()),
+            Span::styled(" ├", Style::default().fg(theme.accent)),
+        ]))
+        .title_bottom(
+            Line::from(Span::styled(
+                " any key closes ",
+                Style::default().fg(theme.text_faint),
+            ))
+            .right_aligned(),
+        );
+    // Solid ground like the help card's: Clear alone leaves default cells,
+    // which a translucent terminal renders as wallpaper behind the text.
+    f.render_widget(
+        Paragraph::new(rows)
+            .block(block)
+            .style(Style::default().bg(theme.surface_alt)),
+        slot,
+    );
 }
 
 fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
@@ -699,6 +870,10 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                 hints.push((display_key(&km.batch_commit).into(), "commit marked"));
             }
             hints.push((display_key(&km.finder).into(), "find"));
+            // Advertised only while there is something behind it.
+            if !state.services.is_empty() {
+                hints.push((display_key(&km.services).into(), "services"));
+            }
             hints.push((display_key(&km.open_browser).into(), "open"));
             hints.push((display_key(&km.quit).into(), "quit"));
             hints
@@ -2182,6 +2357,7 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
                 (k(&km.back), "back one view"),
                 (k(&km.finder), "fuzzy find in the current list"),
                 (k(&km.repos_view), "multi-repo dashboard"),
+                (k(&km.services), "service health, by monitor name"),
                 (k(&km.open_browser), "open in browser"),
                 (k(&km.yank), "copy the selection to the clipboard"),
                 (k(&km.help), "this help"),
@@ -5112,6 +5288,97 @@ mod tests {
     }
 
     #[test]
+    fn the_services_card_names_every_monitor_mapped_or_not() {
+        let mut st = AppState::new(
+            "o/r".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        st.show_services = true;
+        st.services = vec![
+            crate::kuma::Service {
+                name: "API".into(),
+                state: crate::kuma::ServiceState::Up,
+                ping_ms: Some(44),
+                uptime24: Some(1.0),
+                group: "production".into(),
+                tags: vec!["critical".into()],
+            },
+            crate::kuma::Service {
+                name: "Logs UI".into(),
+                state: crate::kuma::ServiceState::Down,
+                ping_ms: None,
+                uptime24: Some(0.97),
+                group: "stage".into(),
+                tags: Vec::new(),
+            },
+        ];
+        st.service_repos.insert("API".into(), "acme/backend".into());
+
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| render_services_overlay(f, f.area(), &st)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let out = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(out.contains("API") && out.contains("44ms"), "{out}");
+        // The groups are the production/stage answer; tags are the other one.
+        assert!(out.contains("production") && out.contains("stage"), "{out}");
+        assert!(out.contains("#critical"), "{out}");
+        assert!(out.contains("→ acme/backend"), "mapped monitors say whose row they sit on\n{out}");
+        // The unmapped monitor is exactly the one only this card can show.
+        assert!(out.contains("Logs UI") && out.contains("down"), "{out}");
+        assert!(out.contains("97.0% today"), "{out}");
+    }
+
+    #[test]
+    fn one_tag_worn_by_every_row_becomes_a_heading_instead() {
+        let mut st = AppState::new(
+            "o/r".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        st.show_services = true;
+        let svc = |name: &str, tags: Vec<String>| crate::kuma::Service {
+            name: name.into(),
+            state: crate::kuma::ServiceState::Up,
+            ping_ms: Some(40),
+            uptime24: Some(1.0),
+            // One status-page group for everyone: the case where the tags are
+            // the only structure there is.
+            group: "Services".into(),
+            tags,
+        };
+        st.services = vec![
+            svc("API", vec!["Prod".into()]),
+            svc("web", vec!["Prod".into(), "critical".into()]),
+            svc("Stage", Vec::new()),
+        ];
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 14)).unwrap();
+        term.draw(|f| render_services_overlay(f, f.area(), &st)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let out = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(out.contains("Prod ╌╌╌"), "the shared tag heads its section\n{out}");
+        assert!(!out.contains("#Prod"), "…and is not repeated as a chip on every row\n{out}");
+        assert!(out.contains("#critical"), "other tags stay as chips\n{out}");
+        assert!(out.contains("untagged ╌╌╌"), "the tagless get a section, at the end\n{out}");
+    }
+
+    #[test]
     fn the_heart_only_raises_its_voice_when_something_is_down() {
         let mut st = AppState::new(
             "o/r".into(),
@@ -5125,6 +5392,8 @@ mod tests {
             state,
             ping_ms: Some(40),
             uptime24: Some(1.0),
+            group: "Services".into(),
+            tags: Vec::new(),
         };
         assert!(
             workspace_tallies(&st).is_empty(),

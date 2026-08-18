@@ -1555,6 +1555,9 @@ pub struct AppState {
     /// A misconfigured Kuma has already said so once. A URL typo should be
     /// one status line, not one per poll forever.
     pub kuma_error_shown: bool,
+    /// The service-health overlay: every monitor by name, with its ping and
+    /// day's uptime — including the ones no dashboard row claims.
+    pub show_services: bool,
 }
 
 /// What the Watch view's live log pane holds: whose log it is and the last
@@ -1665,6 +1668,7 @@ impl AppState {
             service_repos: HashMap::new(),
             kuma_pending: false,
             kuma_error_shown: false,
+            show_services: false,
         }
     }
 

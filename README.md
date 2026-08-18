@@ -303,6 +303,20 @@ get one mapping line each:
 "muufree.com" = "acme/website"
 ```
 
+Press `S` from any view for the full card — every monitor by name under its
+status-page group (name your Kuma groups `production` and `stage` and the card
+reads that way), with state, response time, the day's uptime, tags (shown when
+the status page has "Show Tags" on), and which dashboard row it decorates:
+
+```
+ production ╌╌╌
+ ● muufree.com        up            62ms  100.0% today  → muufree/website
+ ● API                up            33ms  100.0% today  #critical  → muufree/backend
+
+ stage ╌╌╌
+ ✗ Logs UI            down             —   97.0% today
+```
+
 Health is re-read on the normal poll, off-thread; a Kuma that is slow or gone
 never delays the dashboard, and a misconfigured URL is reported once rather
 than once per poll.
@@ -327,7 +341,8 @@ view you're in floats to the top.
 | Logs      | `j`/`k` scroll · `d`/`u` page · `g`/`G` top/bottom · `n`/`p` next/prev step · `a` all steps · `/` search · `e`/`E` next/prev error · `F` focus · `Enter` expand a fold |
 | Trigger   | `i`/`Enter` edit field · `Space` cycle choice · `t` submit |
 
-All keys are remappable in `config.toml` (see [Config](#config)).
+`S` opens the service-health card from anywhere (when Uptime Kuma is
+configured). All keys are remappable in `config.toml` (see [Config](#config)).
 
 ## Config
 

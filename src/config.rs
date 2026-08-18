@@ -199,6 +199,8 @@ pub struct KeymapConfig {
     pub finder: String,
     // multi-repo dashboard
     pub repos_view: String,
+    // service-health overlay (Uptime Kuma monitors by name)
+    pub services: String,
     // batch commit: mark repos on the dashboard, commit them with one message
     pub repo_mark: String,
     pub batch_commit: String,
@@ -253,6 +255,7 @@ impl Default for KeymapConfig {
             prev_error: "E".into(),
             finder: "ctrl+p".into(),
             repos_view: "H".into(),
+            services: "S".into(),
             repo_mark: "Space".into(),
             batch_commit: "C".into(),
             batch_retry: "r".into(),

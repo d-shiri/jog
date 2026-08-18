@@ -45,6 +45,12 @@ pub struct Service {
     pub ping_ms: Option<u32>,
     /// Share of the last 24h the service was up, 0.0–1.0.
     pub uptime24: Option<f64>,
+    /// The status-page group this monitor sits in ("production", "stage", …).
+    /// Kuma always groups; a page with one group just has one name here.
+    pub group: String,
+    /// The monitor's tags — present in the JSON only when the status page has
+    /// "Show Tags" switched on, empty otherwise.
+    pub tags: Vec<String>,
 }
 
 /// The two status-page documents, joined by monitor id.
@@ -59,12 +65,20 @@ pub fn parse(page_json: &str, heartbeat_json: &str) -> Result<Vec<Service>> {
     }
     #[derive(serde::Deserialize)]
     struct Group {
+        #[serde(default)]
+        name: String,
         #[serde(rename = "monitorList", default)]
         monitors: Vec<Monitor>,
     }
     #[derive(serde::Deserialize)]
     struct Monitor {
         id: i64,
+        name: String,
+        #[serde(default)]
+        tags: Vec<Tag>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Tag {
         name: String,
     }
     #[derive(serde::Deserialize)]
@@ -85,7 +99,7 @@ pub fn parse(page_json: &str, heartbeat_json: &str) -> Result<Vec<Service>> {
 
     let mut out = Vec::new();
     for group in page.groups {
-        for m in group.monitors {
+        for m in group.monitors.into_iter() {
             // Beats arrive oldest-first; the newest one is the verdict. A
             // monitor with no beats yet is genuinely pending, not down.
             let last = hb.beats.get(&m.id.to_string()).and_then(|b| b.last());
@@ -100,6 +114,8 @@ pub fn parse(page_json: &str, heartbeat_json: &str) -> Result<Vec<Service>> {
                 state,
                 ping_ms,
                 uptime24: hb.uptime.get(&format!("{}_24", m.id)).copied(),
+                group: group.name.clone(),
+                tags: m.tags.into_iter().map(|t| t.name).collect(),
                 name: m.name,
             });
         }
@@ -162,7 +178,7 @@ mod tests {
     const PAGE: &str = r#"{"config":{"slug":"all"},"incidents":[],
         "publicGroupList":[{"id":2,"name":"Services","weight":1,"monitorList":[
             {"id":2,"name":"muufree.com","sendUrl":0,"type":"keyword"},
-            {"id":3,"name":"API","sendUrl":0,"type":"http"},
+            {"id":3,"name":"API","sendUrl":0,"type":"http","tags":[{"name":"production"}]},
             {"id":9,"name":"brand-new","sendUrl":0,"type":"http"}]}],
         "maintenanceList":[]}"#;
     const BEATS: &str = r#"{"heartbeatList":{
@@ -203,6 +219,11 @@ mod tests {
         assert_eq!(api.uptime24, Some(0.97));
         // No beats yet is a monitor still warming up, not an outage.
         assert_eq!(by_name("brand-new").state, ServiceState::Pending);
+        // The status-page group and tags ride along: they are how a card can
+        // say production from stage.
+        assert_eq!(site.group, "Services");
+        assert_eq!(api.tags, vec!["production".to_string()]);
+        assert!(site.tags.is_empty(), "no tags in the JSON, none invented");
     }
 
     #[test]
