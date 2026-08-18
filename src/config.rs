@@ -40,10 +40,19 @@ pub struct UptimeKumaConfig {
     /// nothing about which repo they belong to.
     #[serde(default)]
     pub map: std::collections::HashMap<String, String>,
+    /// Seconds between reads of the status page. Its own clock, slower than
+    /// the CI poll: monitors check on the order of minutes, so re-fetching
+    /// every few seconds re-downloads an answer that hasn't moved.
+    #[serde(default = "default_kuma_poll_s")]
+    pub poll_interval_s: u64,
 }
 
 fn default_status_page() -> String {
     "default".into()
+}
+
+fn default_kuma_poll_s() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -1558,6 +1558,15 @@ pub struct AppState {
     /// The service-health overlay: every monitor by name, with its ping and
     /// day's uptime — including the ones no dashboard row claims.
     pub show_services: bool,
+    /// When the readings on screen were fetched — what the card's "updated
+    /// Ns ago" is measured from. `None` until Kuma first answers.
+    pub kuma_fetched_at: Option<DateTime<Utc>>,
+    /// The tick the last Kuma read went out on. Kuma runs on its own, slower
+    /// clock than the CI poll; this is what holds it to that clock.
+    pub kuma_last_poll_tick: u64,
+    /// The `[uptime_kuma]` config, copied in at startup so the card's manual
+    /// refresh can fire a fetch without threading `Config` through every key.
+    pub kuma: Option<crate::config::UptimeKumaConfig>,
 }
 
 /// What the Watch view's live log pane holds: whose log it is and the last
@@ -1669,6 +1678,9 @@ impl AppState {
             kuma_pending: false,
             kuma_error_shown: false,
             show_services: false,
+            kuma_fetched_at: None,
+            kuma_last_poll_tick: 0,
+            kuma: None,
         }
     }
 

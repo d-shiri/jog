@@ -142,12 +142,14 @@ fn render_services_overlay(f: &mut Frame, area: Rect, state: &AppState) {
                     }
                 };
                 let mut spans = vec![
-                    Span::styled(format!(" {glyph} "), style),
+                    Span::raw("  "),
                     Span::styled(
                         format!("{:<name_w$}", s.name),
                         Style::default().fg(theme.text_bright),
                     ),
-                    Span::styled(format!("  {word:<12}"), style),
+                    // The dot rides with its word: colour and text answer the
+                    // same question in the same place.
+                    Span::styled(format!("  {glyph} {word:<12}"), style),
                     Span::styled(
                         match s.ping_ms {
                             Some(p) => format!("{p:>5}ms"),
@@ -214,11 +216,28 @@ fn render_services_overlay(f: &mut Frame, area: Rect, state: &AppState) {
         ]))
         .title_bottom(
             Line::from(Span::styled(
-                " any key closes ",
+                " r refresh · any other key closes ",
                 Style::default().fg(theme.text_faint),
             ))
             .right_aligned(),
         );
+    // When these readings were fetched — the one fact that separates "all up"
+    // from "all up, as of some time before the wifi dropped".
+    let block = match state.kuma_fetched_at {
+        Some(at) => {
+            let secs = (Utc::now() - at).num_seconds().max(0);
+            let ago = if secs < 60 {
+                format!("{secs}s ago")
+            } else {
+                format!("{}m ago", secs / 60)
+            };
+            block.title_bottom(Line::from(Span::styled(
+                format!(" updated {ago} "),
+                Style::default().fg(theme.text_faint),
+            )))
+        }
+        None => block,
+    };
     // Solid ground like the help card's: Clear alone leaves default cells,
     // which a translucent terminal renders as wallpaper behind the text.
     f.render_widget(

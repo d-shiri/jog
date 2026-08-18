@@ -327,6 +327,7 @@ async fn event_loop(
     // Rebound on repo switch from the dashboard, so it can't be a parameter binding.
     let mut provider = provider;
     let km = resolve_keymap(&config.keys)?;
+    state.kuma = config.uptime_kuma.clone();
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     if state.view == View::Repos {
         spawn_fetch_repo_cards(&provider, state, &tx);
@@ -887,6 +888,7 @@ async fn event_loop(
                                     })
                                     .collect();
                                 state.services = services;
+                                state.kuma_fetched_at = Some(chrono::Utc::now());
                             }
                             // Said once, not once per poll: a URL typo and a
                             // server reboot read the same from here, and the
@@ -934,7 +936,7 @@ async fn event_loop(
                     // whether production is up, it spends nothing from the
                     // GitHub budget, and an API hold is no reason to stop
                     // watching a different server entirely.
-                    spawn_kuma_probe(&config, state, &tx);
+                    spawn_kuma_probe(state, &tx, false);
                     // The finder holds indices into the list it was opened over.
                     // Refreshing that list underneath it would shift every index,
                     // so Enter would commit to whatever slid into the slot.
@@ -1082,8 +1084,13 @@ async fn handle_key(
     }
 
     // The services overlay is a card, not a document: nothing in it scrolls,
-    // so any key puts it away.
+    // so any key puts it away — except refresh, which re-asks Kuma right now
+    // instead of waiting out the cadence.
     if state.show_services {
+        if key_is(&key, km.git_refresh) {
+            spawn_kuma_probe(state, tx, true);
+            return None;
+        }
         state.show_services = false;
         state.needs_clear = true;
         return None;
@@ -3514,14 +3521,26 @@ fn record_quota(state: &mut AppState, q: Quota) -> bool {
 /// serves every view — production being down matters just as much from
 /// inside a log as from the dashboard.
 fn spawn_kuma_probe(
-    config: &Config,
     state: &mut AppState,
     tx: &mpsc::UnboundedSender<AppEvent>,
+    force: bool,
 ) {
-    let Some(k) = &config.uptime_kuma else { return };
+    let Some(k) = &state.kuma else { return };
     if state.kuma_pending {
         return;
     }
+    // Kuma's own cadence, not the CI poll's: the monitors behind the page
+    // check on the order of minutes, so five-second reads mostly re-download
+    // an answer that hasn't moved. First read goes out immediately; `force`
+    // is the card's refresh key jumping the queue.
+    let every_ticks = k.poll_interval_s.max(5) * 10;
+    if !force
+        && state.kuma_last_poll_tick != 0
+        && state.tick_count.saturating_sub(state.kuma_last_poll_tick) < every_ticks
+    {
+        return;
+    }
+    state.kuma_last_poll_tick = state.tick_count.max(1);
     state.kuma_pending = true;
     let (url, slug, tx) = (k.url.clone(), k.status_page.clone(), tx.clone());
     tokio::task::spawn_blocking(move || {

@@ -11,6 +11,9 @@ what CI is doing, and everything in between.
 - **Several repos at a time** — one dashboard with each repo's branch, dirty
   files, latest run and run history; it keeps polling all of them, so a failure
   anywhere finds you.
+- **Service health** — point it at an Uptime Kuma status page and production
+  being down is one heart in the header, a Live column on the dashboard, and
+  an `S` card away — right next to the CI that deployed it.
 
 ![The jog dashboard: every repo's CI, working tree and run history on one screen](./images/dashboard.png)
 
@@ -285,6 +288,9 @@ budget, no credentials anywhere:
 [uptime_kuma]
 url = "https://up.example.com"
 status_page = "default"      # the page's slug
+# poll_interval_s = 30       # its own clock — monitors check on the order of
+#                            # minutes, so faster reads mostly refetch no news
+#                            # (r inside the S card refreshes on demand)
 ```
 
 That alone puts a heart in the header — `♥5` quietly green while everything
@@ -303,23 +309,32 @@ get one mapping line each:
 "muufree.com" = "acme/website"
 ```
 
-Press `S` from any view for the full card — every monitor by name under its
-status-page group (name your Kuma groups `production` and `stage` and the card
-reads that way), with state, response time, the day's uptime, tags (shown when
-the status page has "Show Tags" on), and which dashboard row it decorates:
+Press `S` from any view for the full card — every monitor by name with state,
+response time, the day's uptime, tags, and which dashboard row it decorates:
 
 ```
  production ╌╌╌
- ● muufree.com        up            62ms  100.0% today  → muufree/website
- ● API                up            33ms  100.0% today  #critical  → muufree/backend
+ muufree.com        ● up      62ms  100.0% today  → acme/website
+ API                ● up      33ms  100.0% today  #critical  → acme/backend
 
  stage ╌╌╌
- ✗ Logs UI            down             —   97.0% today
+ Logs UI            ✗ down       —   97.0% today
+
+  updated 12s ago                       r refresh · any other key closes
 ```
 
-Health is re-read on the normal poll, off-thread; a Kuma that is slow or gone
-never delays the dashboard, and a misconfigured URL is reported once rather
-than once per poll.
+The card takes its sections from the best structure the page publishes: its
+**groups**, when it has more than one — name them `production` and `stage`
+and the card reads that way. With only one group it falls back to **tags**
+(shown once the page's "Show Tags" is on): a tag every row wears becomes a
+section heading instead of a chip repeated down the card, extra tags stay as
+chips, and untagged monitors close the card in a section of their own.
+
+Health is fetched on its own clock — `poll_interval_s`, default 30, since the
+monitors behind the page only check on the order of minutes — and the card's
+corner always says how old the readings are. `r` inside the card refreshes on
+demand. Reads happen off-thread: a Kuma that is slow or gone never delays the
+dashboard, and a misconfigured URL is reported once rather than once per poll.
 
 ## Default keys (TUI)
 
