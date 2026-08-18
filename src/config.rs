@@ -10,6 +10,40 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub keys: KeymapConfig,
+    /// Service health from an Uptime Kuma status page. Absent = the feature
+    /// does not exist: no column, no tally, no requests.
+    #[serde(default, alias = "kuma")]
+    pub uptime_kuma: Option<UptimeKumaConfig>,
+}
+
+/// `[uptime_kuma]` — the two lines that turn service health on:
+///
+/// ```toml
+/// [uptime_kuma]
+/// url = "https://up.example.com"
+/// # status_page = "default"          # the page's slug, if not the default
+/// # [uptime_kuma.map]                # monitor name -> dashboard repo, for
+/// # "API" = "acme/backend"           # names that don't match a repo's name
+/// ```
+///
+/// Monitors whose name matches a repo's name (case-insensitive, short or
+/// full) attach themselves to that row with no map at all; everything else
+/// still counts in the header's health tally.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UptimeKumaConfig {
+    /// Base URL of the Kuma instance, e.g. `https://up.example.com`.
+    pub url: String,
+    /// Slug of the status page to read. Kuma names its first one `default`.
+    #[serde(default = "default_status_page", alias = "slug")]
+    pub status_page: String,
+    /// Monitor name → repo (`owner/name`), for monitors whose name says
+    /// nothing about which repo they belong to.
+    #[serde(default)]
+    pub map: std::collections::HashMap<String, String>,
+}
+
+fn default_status_page() -> String {
+    "default".into()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

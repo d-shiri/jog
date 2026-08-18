@@ -74,6 +74,9 @@ pub enum AppEvent {
     /// job name, and the tail of its lines. `None` when GitHub has accepted
     /// the job but has no log text to serve yet.
     WatchTailLoaded(u64, String, Option<Vec<String>>),
+    /// Service health from the Uptime Kuma status page, or why it couldn't be
+    /// read.
+    KumaLoaded(Result<Vec<crate::kuma::Service>, String>),
     /// The active repo changed: new label, default branch, and workflow list.
     RepoSwitched {
         label: String,
@@ -861,6 +864,41 @@ async fn event_loop(
                             spawn_fetch_workflow_preview(provider.clone(), w.file_name, tx.clone(), state);
                         }
                     }
+                    AppEvent::KumaLoaded(result) => {
+                        state.kuma_pending = false;
+                        match result {
+                            Ok(services) => {
+                                // Resolve which row each monitor decorates:
+                                // explicit map first, then name-matching. Redone
+                                // on every answer because both sides can move —
+                                // monitors get added, repos get switched.
+                                let specs: Vec<String> =
+                                    state.repos.iter().map(|c| c.spec.clone()).collect();
+                                let explicit = config
+                                    .uptime_kuma
+                                    .as_ref()
+                                    .map(|k| k.map.clone())
+                                    .unwrap_or_default();
+                                state.service_repos = services
+                                    .iter()
+                                    .filter_map(|s| {
+                                        crate::kuma::repo_for_service(&s.name, &explicit, &specs)
+                                            .map(|repo| (s.name.clone(), repo))
+                                    })
+                                    .collect();
+                                state.services = services;
+                            }
+                            // Said once, not once per poll: a URL typo and a
+                            // server reboot read the same from here, and the
+                            // stale readings (if any) stay on screen either way.
+                            Err(e) => {
+                                if !state.kuma_error_shown {
+                                    state.set_status(format!("uptime kuma: {e}"));
+                                    state.kuma_error_shown = true;
+                                }
+                            }
+                        }
+                    }
                     AppEvent::Status(msg) => {
                         state.set_status(msg);
                     }
@@ -892,6 +930,11 @@ async fn event_loop(
                     // from the limit it reports, and the meter is how you tell
                     // which of the two limits you are actually waiting on.
                     spawn_quota_probe(&provider, state, &tx);
+                    // Same standing as the quota probe: every view cares
+                    // whether production is up, it spends nothing from the
+                    // GitHub budget, and an API hold is no reason to stop
+                    // watching a different server entirely.
+                    spawn_kuma_probe(&config, state, &tx);
                     // The finder holds indices into the list it was opened over.
                     // Refreshing that list underneath it would shift every index,
                     // so Enter would commit to whatever slid into the slot.
@@ -3446,6 +3489,29 @@ fn record_quota(state: &mut AppState, q: Quota) -> bool {
         ));
     }
     alarm
+}
+
+/// Re-read the Uptime Kuma status page, when one is configured.
+///
+/// Blocking HTTP off-thread, exactly the shape of a git subprocess; nothing
+/// here touches the GitHub budget or its rate-limit holds. One read per poll
+/// serves every view — production being down matters just as much from
+/// inside a log as from the dashboard.
+fn spawn_kuma_probe(
+    config: &Config,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(k) = &config.uptime_kuma else { return };
+    if state.kuma_pending {
+        return;
+    }
+    state.kuma_pending = true;
+    let (url, slug, tx) = (k.url.clone(), k.status_page.clone(), tx.clone());
+    tokio::task::spawn_blocking(move || {
+        let res = crate::kuma::fetch(&url, &slug).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::KumaLoaded(res));
+    });
 }
 
 /// Re-read the API budget: what the header meter shows, and what tells a

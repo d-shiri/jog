@@ -7,6 +7,7 @@ mod cli;
 mod git;
 mod config;
 mod history;
+mod kuma;
 mod provider;
 mod tui;
 

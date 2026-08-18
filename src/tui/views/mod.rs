@@ -300,6 +300,29 @@ fn now_playing(state: &AppState) -> Vec<Span<'static>> {
             Span::styled(detail, Style::default().fg(theme.failure)),
         ];
     }
+    // A service being down is the same rank of trouble: production not
+    // answering outranks anything CI is merely doing.
+    let down: Vec<&crate::kuma::Service> = state
+        .services
+        .iter()
+        .filter(|s| s.state == crate::kuma::ServiceState::Down)
+        .collect();
+    if let Some(first) = down.first() {
+        let mut out = vec![
+            Span::styled("♥ ", Style::default().fg(theme.failure).bold()),
+            Span::styled(
+                format!("{} down", first.name),
+                Style::default().fg(theme.failure).bold(),
+            ),
+        ];
+        if down.len() > 1 {
+            out.push(Span::styled(
+                format!("  +{}", down.len() - 1),
+                Style::default().fg(theme.failure),
+            ));
+        }
+        return out;
+    }
     // Your own push outranks the ambient traffic: the ⇡ chip follows it from
     // "waiting for CI to notice" through the run it spawned, and vanishes the
     // moment that run settles (which is also when the notification fires).
@@ -405,9 +428,31 @@ fn compact_elapsed(t: chrono::DateTime<Utc>) -> String {
 /// going red is easiest to miss.
 fn workspace_tallies(state: &AppState) -> Vec<Span<'static>> {
     let theme = &state.theme;
+    let mut out = Vec::new();
+    // Service health, when an Uptime Kuma page is configured: quiet while
+    // everything answers, loud the moment something doesn't — CI can be all
+    // green while production is down, and that is the one combination this
+    // corner must never be calm about.
+    if !state.services.is_empty() {
+        let total = state.services.len();
+        let down = state
+            .services
+            .iter()
+            .filter(|s| s.state == crate::kuma::ServiceState::Down)
+            .count();
+        out.push(if down > 0 {
+            Span::styled(
+                format!("♥{}/{}", total - down, total),
+                Style::default().fg(theme.failure).bold(),
+            )
+        } else {
+            Span::styled(format!("♥{total}"), Style::default().fg(theme.success_dim))
+        });
+        out.push(Span::styled("   ", Style::default()));
+    }
     let t = Tallies::of(state);
     if state.repos.is_empty() {
-        return Vec::new();
+        return out;
     }
     // A zero is the absence of a thing, not an instance of it. Painting `✗0` in
     // failure red puts a red mark in the corner of a workspace where nothing is
@@ -420,10 +465,8 @@ fn workspace_tallies(state: &AppState) -> Vec<Span<'static>> {
         }
         Span::styled(text, style)
     };
-    let mut out = vec![
-        count(t.ok, format!("✓{}", t.ok), theme.success, false),
-        count(t.fail, format!("  ✗{}", t.fail), theme.failure, false),
-    ];
+    out.push(count(t.ok, format!("✓{}", t.ok), theme.success, false));
+    out.push(count(t.fail, format!("  ✗{}", t.fail), theme.failure, false));
     if t.busy > 0 {
         out.push(count(t.busy, format!("  ⏵{}", t.busy), theme.warning, true));
     }
@@ -1095,6 +1138,15 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
     let cols = Columns::for_width(inner.width);
     let spark_w = cols.spark_w;
 
+    // Runtime health next to CI health, when Uptime Kuma is configured and
+    // any monitor mapped itself to a row. All-or-nothing like the other
+    // optional columns: on a narrow terminal the run itself matters more.
+    let show_live = inner.width >= 100
+        && state
+            .repos
+            .iter()
+            .any(|c| state.repo_services(&c.spec).next().is_some());
+
     // Faint rather than muted: a column head is read once, when you are learning
     // the table, and never again. At the same weight as the data it labels it
     // competes with it on every glance after that.
@@ -1107,6 +1159,9 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         Cell::from(Span::styled("Changes", hdr)),
         Cell::from(Span::styled("Latest run", hdr)),
     ];
+    if show_live {
+        header_cells.insert(5, Cell::from(Span::styled("Live", hdr)));
+    }
     if cols.ran_on {
         header_cells.push(Cell::from(Span::styled("Ran on", hdr)));
     }
@@ -1199,6 +1254,42 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         Cell::from(Line::from(spans))
     };
 
+    // What the repo's monitors say it is doing in production right now.
+    // Worst news wins the cell: one down service among three is a down cell,
+    // because "mostly up" is not a state anyone acts on.
+    let live_cell = |card: &crate::app::state::RepoCard| -> Cell<'static> {
+        use crate::kuma::ServiceState;
+        let svcs: Vec<_> = state.repo_services(&card.spec).collect();
+        if svcs.is_empty() {
+            return Cell::from("");
+        }
+        let down = svcs.iter().filter(|s| s.state == ServiceState::Down).count();
+        if down > 0 {
+            let label = if svcs.len() == 1 {
+                // The day's uptime says whether this is a blip or a siege.
+                match svcs[0].uptime24 {
+                    Some(u) => format!("✗ down · {:.0}%", u * 100.0),
+                    None => "✗ down".to_string(),
+                }
+            } else {
+                format!("✗ {down}/{} down", svcs.len())
+            };
+            return Cell::from(Span::styled(label, Style::default().fg(theme.failure).bold()));
+        }
+        if svcs.iter().all(|s| s.state != ServiceState::Up) {
+            return Cell::from(Span::styled(
+                "◌ pending",
+                Style::default().fg(theme.text_muted).italic(),
+            ));
+        }
+        // Up: the slowest answer is the honest one number to show for the row.
+        let label = match svcs.iter().filter_map(|s| s.ping_ms).max() {
+            Some(p) => format!("● {p}ms"),
+            None => "● up".to_string(),
+        };
+        Cell::from(Span::styled(label, Style::default().fg(theme.success)))
+    };
+
     // The run's branch, flagged when it isn't the branch you're standing on —
     // that mismatch is exactly the "why does this say dependabot?" confusion.
     let ran_on_cell = |card: &crate::app::state::RepoCard, run_branch: &str| -> Cell<'static> {
@@ -1276,20 +1367,22 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
 
             // A repo that failed to load says so instead of pretending to be idle.
             if let Some(err) = &card.error {
-                rows.push(Row::new(vec![
+                let mut cells = vec![
                     mark_cell(card),
                     Cell::from(Span::styled("!", Style::default().fg(theme.failure).bold())),
                     name_cell,
                     local_cell(card),
                     changes_cell(card),
-                    Cell::from(Span::styled(
-                        truncate(&err.text, 46),
-                        Style::default().fg(theme.failure),
-                    )),
-                ]
-                .into_iter()
-                .chain(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")))
-                .collect::<Vec<_>>())
+                ];
+                if show_live {
+                    cells.push(live_cell(card));
+                }
+                cells.push(Cell::from(Span::styled(
+                    truncate(&err.text, 46),
+                    Style::default().fg(theme.failure),
+                )));
+                cells.extend(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")));
+                rows.push(Row::new(cells)
                 .style(row_dress(
                     row_bg_for_status(Status::Failure, theme),
                     rows.len(),
@@ -1302,20 +1395,22 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
             // A checkout with no GitHub origin never fetches, so it must not sit
             // at "loading…" forever — it just has no CI half to show.
             if !card.has_ci() {
-                rows.push(Row::new(vec![
+                let mut cells = vec![
                     mark_cell(card),
                     Cell::from(""),
                     name_cell,
                     local_cell(card),
                     changes_cell(card),
-                    Cell::from(Span::styled(
-                        "local only — no GitHub remote",
-                        Style::default().fg(theme.text_faint).italic(),
-                    )),
-                ]
-                .into_iter()
-                .chain(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")))
-                .collect::<Vec<_>>())
+                ];
+                if show_live {
+                    cells.push(live_cell(card));
+                }
+                cells.push(Cell::from(Span::styled(
+                    "local only — no GitHub remote",
+                    Style::default().fg(theme.text_faint).italic(),
+                )));
+                cells.extend(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")));
+                rows.push(Row::new(cells)
                 .style(row_dress(
                     theme.row_idle,
                     rows.len(),
@@ -1326,17 +1421,19 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
             }
 
             if !card.loaded {
-                rows.push(Row::new(vec![
+                let mut cells = vec![
                     mark_cell(card),
                     Cell::from(""),
                     name_cell,
                     local_cell(card),
                     changes_cell(card),
-                    Cell::from(Line::from(skeleton(14, state.tick_count, theme))),
-                ]
-                .into_iter()
-                .chain(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")))
-                .collect::<Vec<_>>())
+                ];
+                if show_live {
+                    cells.push(live_cell(card));
+                }
+                cells.push(Cell::from(Line::from(skeleton(14, state.tick_count, theme))));
+                cells.extend(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")));
+                rows.push(Row::new(cells)
                 .style(row_dress(
                     theme.row_idle,
                     rows.len(),
@@ -1402,7 +1499,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
             };
             let dress = row_dress(bg, rows.len(), i == state.repo_cursor, theme);
 
-            Row::new(vec![
+            let mut cells = vec![
                 mark_cell(card),
                 Cell::from(Span::styled(
                     animated_glyph(status, state.tick_count),
@@ -1411,18 +1508,19 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                 name_cell,
                 local_cell(card),
                 changes_cell(card),
-                Cell::from(Span::styled(workflow, Style::default().fg(theme.text))),
-            ]
-            .into_iter()
-            .chain(cols.tail(
+            ];
+            if show_live {
+                cells.push(live_cell(card));
+            }
+            cells.push(Cell::from(Span::styled(workflow, Style::default().fg(theme.text))));
+            cells.extend(cols.tail(
                 ran_on_cell(card, &branch),
                 // Right-aligned: "4d ago" over "130d ago" with ragged units is
                 // the most reliable tell that a table was never looked at.
                 Cell::from(Line::from(Span::styled(when_text, when_style)).right_aligned()),
                 Cell::from(sparkline),
-            ))
-            .collect::<Vec<_>>())
-            .style(dress)
+            ));
+            Row::new(cells).style(dress)
         });
     }
 
@@ -1434,6 +1532,9 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         Constraint::Length(9),   // working-tree changes
         Constraint::Fill(35),    // latest workflow
     ];
+    if show_live {
+        widths.insert(5, Constraint::Length(12)); // service health
+    }
     if cols.ran_on {
         widths.push(Constraint::Fill(26)); // branch the run used
     }
@@ -5008,6 +5109,38 @@ mod tests {
         assert!(api.contains("●1"), "got {api:?}");
         // …and only on that repo. A marker on every row would say nothing.
         assert!(!web.contains("commit"), "got {web:?}");
+    }
+
+    #[test]
+    fn the_heart_only_raises_its_voice_when_something_is_down() {
+        let mut st = AppState::new(
+            "o/r".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        let svc = |name: &str, state| crate::kuma::Service {
+            name: name.into(),
+            state,
+            ping_ms: Some(40),
+            uptime24: Some(1.0),
+        };
+        assert!(
+            workspace_tallies(&st).is_empty(),
+            "no Kuma configured, no heart at all"
+        );
+        st.services = vec![
+            svc("API", crate::kuma::ServiceState::Up),
+            svc("site", crate::kuma::ServiceState::Up),
+        ];
+        let text = |spans: Vec<Span>| spans.iter().map(|s| s.content.clone()).collect::<String>();
+        assert!(text(workspace_tallies(&st)).contains("♥2"), "quietly all up");
+        st.services[0].state = crate::kuma::ServiceState::Down;
+        assert!(
+            text(workspace_tallies(&st)).contains("♥1/2"),
+            "one down is a fraction, not a calm total"
+        );
     }
 
     #[test]

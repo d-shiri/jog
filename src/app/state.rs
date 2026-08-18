@@ -1543,6 +1543,18 @@ pub struct AppState {
     pub watch_tail: Option<WatchTail>,
     /// A tail fetch is in flight — one per poll, not one per tick.
     pub watch_tail_pending: bool,
+    /// Service health from the configured Uptime Kuma status page, refreshed
+    /// once per poll. Empty when Kuma is unconfigured or has never answered.
+    pub services: Vec<crate::kuma::Service>,
+    /// Monitor name → dashboard repo, resolved when services arrive: the
+    /// explicit `[uptime_kuma.map]` entries plus every monitor whose name
+    /// matches a repo's. What the Live column joins on.
+    pub service_repos: HashMap<String, String>,
+    /// A Kuma read is in flight — one per poll, however slow the answer.
+    pub kuma_pending: bool,
+    /// A misconfigured Kuma has already said so once. A URL typo should be
+    /// one status line, not one per poll forever.
+    pub kuma_error_shown: bool,
 }
 
 /// What the Watch view's live log pane holds: whose log it is and the last
@@ -1649,7 +1661,18 @@ impl AppState {
             ci_was_busy: false,
             watch_tail: None,
             watch_tail_pending: false,
+            services: Vec::new(),
+            service_repos: HashMap::new(),
+            kuma_pending: false,
+            kuma_error_shown: false,
         }
+    }
+
+    /// The monitors watching one dashboard repo, in status-page order.
+    pub fn repo_services(&self, spec: &str) -> impl Iterator<Item = &crate::kuma::Service> {
+        self.services
+            .iter()
+            .filter(move |s| self.service_repos.get(&s.name).is_some_and(|r| r == spec))
     }
 
     /// Runs in flight across the dashboard, in the order the table lists their

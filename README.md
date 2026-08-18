@@ -273,6 +273,40 @@ re-asked with the `ETag` GitHub handed back last time, and the usual answer — 
 `304 Not Modified` — is free. A dashboard of quiet repos left open all day
 spends almost nothing; only a poll that actually has news pays for it.
 
+## Service health (Uptime Kuma)
+
+CI passing is half the story; the other half is whether what it deployed is
+actually up. If you run [Uptime Kuma](https://github.com/louislam/uptime-kuma),
+point `jog` at any **published status page** and it reads the same two
+unauthenticated JSON endpoints the page itself uses — nothing from GitHub's
+budget, no credentials anywhere:
+
+```toml
+[uptime_kuma]
+url = "https://up.example.com"
+status_page = "default"      # the page's slug
+```
+
+That alone puts a heart in the header — `♥5` quietly green while everything
+answers, `♥4/5` red the moment something doesn't, with the down service named
+in the middle of the header from any view.
+
+Monitors whose name matches a repo's name (`backend` → `acme/backend`,
+case-insensitive) also attach themselves to that dashboard row as a **Live**
+column — `● 44ms` up, `✗ down · 97%` with the day's uptime when not, right
+next to the CI status. Monitors named after the service rather than the repo
+get one mapping line each:
+
+```toml
+[uptime_kuma.map]
+"API" = "acme/backend"
+"muufree.com" = "acme/website"
+```
+
+Health is re-read on the normal poll, off-thread; a Kuma that is slow or gone
+never delays the dashboard, and a misconfigured URL is reported once rather
+than once per poll.
+
 ## Default keys (TUI)
 
 Press **`?`** anywhere in the TUI for the full reference. It reads your actual
@@ -317,6 +351,12 @@ log_focus_context = 2                  # context lines kept around each error in
 kind = "github"
 repo = "owner/name"                    # optional; otherwise auto-detected from git remote
 repos = ["acme/api", "acme/web"]       # multi-repo dashboard rows
+
+[uptime_kuma]                          # service health — see the section above
+url = "https://up.example.com"
+status_page = "default"                # the status page's slug
+[uptime_kuma.map]                      # monitor name -> repo, when names differ
+"API" = "acme/api"
 
 [keys]
 quit = "q"
