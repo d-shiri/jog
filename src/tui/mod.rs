@@ -4470,6 +4470,9 @@ fn animations_active(state: &AppState) -> bool {
     let flashing = |at: Option<u64>, span: u64| at.is_some_and(|a| tick.saturating_sub(a) < span);
     let live = |r: &Run| !r.status.is_terminal();
     state.pending > 0
+        // A down service keeps the header's heart beating, and the beat needs
+        // every tick, not the idle one-per-second redraw.
+        || state.services.iter().any(|s| s.state == crate::kuma::ServiceState::Down)
         || state.git_ops.values().any(|o| !o.finished)
         || !state.run_progress.is_empty()
         || !state.push_watches.is_empty()

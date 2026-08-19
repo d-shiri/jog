@@ -99,6 +99,7 @@ pub fn parse(page_json: &str, heartbeat_json: &str) -> Result<Vec<Service>> {
 
     let mut out = Vec::new();
     for group in page.groups {
+        let group_name = crate::provider::emoji_width_safe(&group.name);
         for m in group.monitors.into_iter() {
             // Beats arrive oldest-first; the newest one is the verdict. A
             // monitor with no beats yet is genuinely pending, not down.
@@ -114,9 +115,9 @@ pub fn parse(page_json: &str, heartbeat_json: &str) -> Result<Vec<Service>> {
                 state,
                 ping_ms,
                 uptime24: hb.uptime.get(&format!("{}_24", m.id)).copied(),
-                group: group.name.clone(),
+                group: group_name.clone(),
                 tags: m.tags.into_iter().map(|t| t.name).collect(),
-                name: m.name,
+                name: crate::provider::emoji_width_safe(&m.name),
             });
         }
     }

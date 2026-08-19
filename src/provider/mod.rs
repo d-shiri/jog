@@ -33,6 +33,45 @@ impl Status {
     }
 }
 
+/// Names coming in from outside (workflow titles, job and step names, commit
+/// messages) pass through here before anything measures or draws them.
+///
+/// The problem it solves: a pictograph like 🛠 (U+1F6E0) defaults to *text*
+/// presentation, so unicode-width — the same crate ratatui budgets cells
+/// with — counts it as one column, while every terminal font draws it two
+/// wide. From that emoji to the end of the row, the screen is one cell right
+/// of where ratatui believes it is, and incremental redraws then land one
+/// cell off inside previously drawn text: colons overwritten by digits, stale
+/// glyphs never cleared. Appending VS16 (U+FE0F) asks for emoji presentation,
+/// which both unicode-width and the terminal agree is two columns.
+///
+/// Only pictographic-plane characters that measure one column get the
+/// treatment, and only when the crate actually counts the VS16 pair as two —
+/// checked by measuring, so this can never make the mismatch worse. A VS16
+/// already present is kept; a VS15 (text presentation, deliberately narrow)
+/// is respected by leaving its base character alone.
+pub fn emoji_width_safe(s: &str) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        let followed_by_selector =
+            matches!(chars.peek(), Some('\u{FE0E}') | Some('\u{FE0F}'));
+        if !followed_by_selector
+            && ('\u{1F000}'..='\u{1FAFF}').contains(&c)
+            && UnicodeWidthChar::width(c) == Some(1)
+        {
+            let mut pair = c.to_string();
+            pair.push('\u{FE0F}');
+            if UnicodeWidthStr::width(pair.as_str()) == 2 {
+                out.push('\u{FE0F}');
+            }
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct Workflow {
     pub name: String,
@@ -167,4 +206,41 @@ pub trait Provider: Send + Sync {
     async fn cancel(&self, run_id: u64) -> Result<()>;
     async fn rerun(&self, run_id: u64) -> Result<()>;
     async fn rerun_failed(&self, run_id: u64) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::emoji_width_safe;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn text_presentation_pictographs_get_widened() {
+        // 🛠 without VS16 measures one column but every terminal draws two —
+        // the live-strip row it sat on rendered its ETA and clock as garbage.
+        let fixed = emoji_width_safe("\u{1F6E0} CI for Backend");
+        assert_eq!(fixed, "\u{1F6E0}\u{FE0F} CI for Backend");
+        assert_eq!(UnicodeWidthStr::width(fixed.as_str()), 2 + 15);
+    }
+
+    #[test]
+    fn already_wide_or_selected_emoji_pass_through() {
+        // 🚧 and 💻 are emoji-presentation by default: two columns as-is.
+        assert_eq!(emoji_width_safe("🚧 Deploy"), "🚧 Deploy");
+        assert_eq!(emoji_width_safe("💻 Deploy"), "💻 Deploy");
+        // An explicit VS16 is not doubled; an explicit VS15 is respected.
+        assert_eq!(
+            emoji_width_safe("\u{1F6E0}\u{FE0F} CI"),
+            "\u{1F6E0}\u{FE0F} CI"
+        );
+        assert_eq!(
+            emoji_width_safe("\u{1F6E0}\u{FE0E} CI"),
+            "\u{1F6E0}\u{FE0E} CI"
+        );
+    }
+
+    #[test]
+    fn plain_text_is_untouched() {
+        let s = "Run tests with pytest · main ~3:48 left";
+        assert_eq!(emoji_width_safe(s), s);
+    }
 }

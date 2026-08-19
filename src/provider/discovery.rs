@@ -70,7 +70,8 @@ fn parse_workflow(path: &Path) -> Result<Workflow> {
 pub fn parse_workflow_str(raw: &str, file_name: &str) -> Result<Workflow> {
     let parsed: WorkflowYaml =
         serde_yml::from_str(raw).with_context(|| format!("parse YAML {file_name}"))?;
-    let name = parsed.name.unwrap_or_else(|| file_name.to_string());
+    let name =
+        super::emoji_width_safe(&parsed.name.unwrap_or_else(|| file_name.to_string()));
     let triggerable = has_workflow_dispatch(parsed.on.as_ref());
     let inputs = parse_inputs(parsed.on.as_ref());
     Ok(Workflow {

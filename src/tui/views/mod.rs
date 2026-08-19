@@ -475,6 +475,18 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     }
 }
 
+/// The down-banner's heart, mid-beat: lub, dub, rest, on the 100ms tick.
+///
+/// Filled and bright on the two beats, hollow and dim between — motion in the
+/// corner of the eye, so a down service is noticed without being read. The
+/// words next to it hold still and stay legible.
+fn beating_heart(tick: u64, theme: &Theme) -> (&'static str, Color) {
+    match tick % 12 {
+        0 | 1 | 4 | 5 => ("♥ ", theme.failure),
+        _ => ("♡ ", theme.failure_dim),
+    }
+}
+
 /// What is happening right now, for the middle of the header.
 ///
 /// One line, and only ever one: a header that grows a list is a header you have
@@ -498,8 +510,9 @@ fn now_playing(state: &AppState) -> Vec<Span<'static>> {
         .filter(|s| s.state == crate::kuma::ServiceState::Down)
         .collect();
     if let Some(first) = down.first() {
+        let (heart, heart_fg) = beating_heart(state.tick_count, theme);
         let mut out = vec![
-            Span::styled("♥ ", Style::default().fg(theme.failure).bold()),
+            Span::styled(heart, Style::default().fg(heart_fg).bold()),
             Span::styled(
                 format!("{} down", first.name),
                 Style::default().fg(theme.failure).bold(),
@@ -5429,6 +5442,12 @@ mod tests {
             text(workspace_tallies(&st)).contains("♥1/2"),
             "one down is a fraction, not a calm total"
         );
+
+        // And the banner's heart beats: filled on the beat, hollow between.
+        st.tick_count = 0;
+        assert!(text(now_playing(&st)).starts_with("♥"), "tick 0 is a beat");
+        st.tick_count = 8;
+        assert!(text(now_playing(&st)).starts_with("♡"), "tick 8 is the rest");
     }
 
     #[test]

@@ -389,7 +389,7 @@ impl GitHubProvider {
             .context("list pull requests")?;
         Ok(page.items.into_iter().next().map(|pr| crate::provider::PrInfo {
             number: pr.number,
-            title: pr.title.unwrap_or_default(),
+            title: crate::provider::emoji_width_safe(&pr.title.unwrap_or_default()),
             url: pr
                 .html_url
                 .map(|u| u.to_string())
@@ -606,10 +606,12 @@ impl GitHubProvider {
 
 fn map_run(r: gh_workflows::Run) -> Run {
     let status = parse_run_status(&r.status, r.conclusion.as_deref());
-    let commit_msg = r.head_commit.message.lines().next().unwrap_or("").to_string();
+    let commit_msg = super::emoji_width_safe(
+        r.head_commit.message.lines().next().unwrap_or(""),
+    );
     Run {
         id: r.id.0,
-        display_title: r.name.clone(),
+        display_title: super::emoji_width_safe(&r.name),
         head_branch: r.head_branch,
         commit_msg,
         status,
@@ -657,7 +659,7 @@ fn map_job_status(s: &gh_workflows::Status, c: Option<&gh_workflows::Conclusion>
 
 fn map_step(s: gh_workflows::Step) -> Step {
     Step {
-        name: s.name,
+        name: super::emoji_width_safe(&s.name),
         status: map_job_status(&s.status, s.conclusion.as_ref()),
         started_at: s.started_at,
         completed_at: s.completed_at,
@@ -668,7 +670,7 @@ fn map_job(j: gh_workflows::Job) -> Job {
     let status = map_job_status(&j.status, j.conclusion.as_ref());
     Job {
         id: j.id.0,
-        name: j.name,
+        name: super::emoji_width_safe(&j.name),
         status,
         steps: j.steps.into_iter().map(map_step).collect(),
     }
@@ -711,7 +713,7 @@ impl Provider for GitHubProvider {
                 .ok()
                 .and_then(|raw| super::discovery::parse_workflow_str(&raw, &file_name).ok());
             parsed.unwrap_or(Workflow {
-                name: wf.name,
+                name: super::emoji_width_safe(&wf.name),
                 file_name,
                 triggerable: false,
                 last_status: None,
