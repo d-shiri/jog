@@ -3857,6 +3857,19 @@ fn diff_columns(width: usize, rows: &[DiffRow]) -> Option<(usize, usize, usize)>
 /// The rule between the two columns.
 const DIFF_RULE: &str = " │ ";
 
+/// How far a changed line's ground is carried toward its own colour, and how
+/// far again under the span that actually differs. Two tones of one hue rather
+/// than a tint and an inversion: the deeper block says "here" without the row
+/// having to change what colour its text is.
+///
+/// `DIFF_SPAN_LIFT` is how far that span's text is lifted toward white, which
+/// is what keeps it legible on the deeper ground. On a 256-colour terminal
+/// none of these can be blended — the row snaps to its own colour and the
+/// span's mark comes down to the bold, which is the honest degradation.
+const DIFF_ROW_TINT: f64 = 0.16;
+const DIFF_SPAN_TINT: f64 = 0.38;
+const DIFF_SPAN_LIFT: f64 = 0.45;
+
 /// One side-by-side row as a drawn line.
 fn diff_row_line(row: &DiffRow, gutter: usize, left: usize, right: usize, theme: &Theme) -> Line<'static> {
     let width = 2 * (gutter + 1) + DIFF_RULE.len() + left + right;
@@ -3870,30 +3883,26 @@ fn diff_row_line(row: &DiffRow, gutter: usize, left: usize, right: usize, theme:
             diff_line_style(t, theme),
         )),
         DiffRow::Pair { old, new } => {
-            // Tinted grounds rather than coloured text alone: in two columns
-            // the question is which *side* changed, and a block of colour
-            // answers it from the corner of the eye. The gap opposite an added
-            // or removed line is a third ground — nothing was there.
-            let removed = mix(theme.surface, theme.failure, 0.16);
-            let added = mix(theme.surface, theme.success, 0.16);
+            // The gap opposite an added or removed line: a ground of its own,
+            // because nothing was there — neither the file's ordinary ground
+            // nor a change.
             let gap = mix(theme.surface, theme.overlay, 0.5);
 
-            let cell = |s: Option<&DiffSide>, side: usize, changed_bg: Color| -> Vec<Span<'static>> {
+            let cell = |s: Option<&DiffSide>, side: usize, tint: Color| -> Vec<Span<'static>> {
                 let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
                 let Some(s) = s else {
-                    // No line here at all: gutter and text are one flat gap.
                     spans.push(Span::styled(
                         " ".repeat(gutter + 1 + side),
                         Style::default().bg(gap),
                     ));
                     return spans;
                 };
-                let bg = if s.changed { changed_bg } else { theme.surface };
-                let fg = if s.changed {
-                    if changed_bg == removed { theme.failure } else { theme.success }
+                let bg = if s.changed {
+                    mix(theme.surface, tint, DIFF_ROW_TINT)
                 } else {
-                    theme.text
+                    theme.surface
                 };
+                let fg = if s.changed { tint } else { theme.text };
                 let num = match s.num {
                     Some(n) => format!("{n:>gutter$} "),
                     None => " ".repeat(gutter + 1),
@@ -3905,16 +3914,23 @@ fn diff_row_line(row: &DiffRow, gutter: usize, left: usize, right: usize, theme:
                 let text = truncate(&s.text, side);
                 let pad = " ".repeat(side.saturating_sub(disp_width(&text)));
                 let style = Style::default().fg(fg).bg(bg);
-                // The span git's diff-highlight would reverse — only while the
-                // line is whole, since a truncated line's byte offsets no
-                // longer point at what they were measured against.
+                // The part that actually differs, in the two-tone scheme every
+                // diff a reader already knows uses: the line keeps its tint and
+                // the span deepens it, with the text lifted rather than
+                // inverted. Reversing it would turn the words most worth
+                // reading into the darkest text on the row, and next to a
+                // ground that is already coloured it reads as a selection.
+                //
+                // Only while the line is whole: a truncated line's byte offsets
+                // no longer point at what they were measured against.
                 match s.emph.filter(|(_, e)| *e <= text.len() && text == s.text) {
                     Some((a, b)) => {
+                        let mark = Style::default()
+                            .fg(mix(tint, Color::Rgb(255, 255, 255), DIFF_SPAN_LIFT))
+                            .bg(mix(theme.surface, tint, DIFF_SPAN_TINT))
+                            .bold();
                         spans.push(Span::styled(text[..a].to_string(), style));
-                        spans.push(Span::styled(
-                            text[a..b].to_string(),
-                            style.add_modifier(Modifier::REVERSED),
-                        ));
+                        spans.push(Span::styled(text[a..b].to_string(), mark));
                         spans.push(Span::styled(text[b..].to_string(), style));
                     }
                     None => spans.push(Span::styled(text, style)),
@@ -3922,12 +3938,12 @@ fn diff_row_line(row: &DiffRow, gutter: usize, left: usize, right: usize, theme:
                 spans.push(Span::styled(pad, style));
                 spans
             };
-            let mut spans = cell(old.as_ref(), left, removed);
+            let mut spans = cell(old.as_ref(), left, theme.failure);
             spans.push(Span::styled(
                 DIFF_RULE,
                 Style::default().fg(theme.border_dim),
             ));
-            spans.extend(cell(new.as_ref(), right, added));
+            spans.extend(cell(new.as_ref(), right, theme.success));
             Line::from(spans)
         }
     }
@@ -5798,14 +5814,39 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
         term.draw(|f| render_git_diff(f, f.area(), &st)).unwrap();
         let buf = term.backend().buffer().clone();
+        let cells = || (0..buf.area.height).flat_map(|y| (0..buf.area.width).map(move |x| (x, y)));
+        // The row holding the pair — the title and the hunk header are bold in
+        // their own right, and neither is what is being asked about here.
+        let row = (0..buf.area.height)
+            .find(|&y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("let x = 1;")
+            })
+            .unwrap();
+
         // The only difference between the two lines is the digit, so exactly
-        // the digits should be reversed — one on each side of the rule.
-        let reversed: String = (0..buf.area.height)
-            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-            .filter(|&(x, y)| buf[(x, y)].modifier.contains(Modifier::REVERSED))
-            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+        // the digits carry the mark — one on each side of the rule.
+        let marked: Vec<(u16, u16)> = (0..buf.area.width)
+            .map(|x| (x, row))
+            .filter(|&p| buf[p].modifier.contains(Modifier::BOLD))
             .collect();
-        assert_eq!(reversed, "12", "got {reversed:?}");
+        let text: String = marked.iter().map(|&p| buf[p].symbol().to_string()).collect();
+        assert_eq!(text, "12", "got {text:?}");
+
+        // Two tones of one hue, not an inversion: the span's ground is deeper
+        // than the line's, and its text is lifted rather than swapped with the
+        // ground — reversing it would make the words most worth reading the
+        // darkest on the row.
+        let (mx, my) = marked[0];
+        let row_bg = buf[(mx - 1, my)].bg;
+        assert_ne!(buf[(mx, my)].bg, row_bg, "the span sits on the line's own ground");
+        assert_ne!(buf[(mx, my)].fg, buf[(mx - 1, my)].fg, "the span's text was not lifted");
+        assert!(
+            !cells().any(|p| buf[p].modifier.contains(Modifier::REVERSED)),
+            "reverse video is for the unified fallback, which has no tint to deepen"
+        );
     }
 
     #[test]
