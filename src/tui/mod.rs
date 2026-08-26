@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Timelike;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -20,8 +20,9 @@ use tokio::sync::mpsc;
 use rayon::prelude::*;
 
 use crate::app::state::{
-    AppState, BatchCommit, BatchPhase, DetailItem, Finder, FinderKind, GitOp, PushPrompt,
-    PushWatch, RepoCard, Theme, TriggerPrompt, View, build_detail_items,
+    AppState, BatchCommit, BatchPhase, DetailItem, FailureDigest, Finder, FinderKind, GitOp, Hit,
+    PushPrompt, PushWatch, RepoCard, Theme, TriggerPrompt, View, build_detail_items,
+    classify_log_severity,
 };
 use crate::config::KeymapConfig;
 use crate::config::{Config, NotifyMode};
@@ -77,6 +78,16 @@ pub enum AppEvent {
     /// Service health from the Uptime Kuma status page, or why it couldn't be
     /// read.
     KumaLoaded(Result<Vec<crate::kuma::Service>, String>),
+    /// The extracted "why it failed" window for a failed run open in the
+    /// detail view — see [`FailureDigest`]. Empty `lines` means the log had
+    /// nothing to say (or could not be fetched); the pane just stays absent.
+    DigestLoaded {
+        run_id: u64,
+        job: String,
+        step: Option<String>,
+        lines: Vec<String>,
+        errors: Vec<usize>,
+    },
     /// The active repo changed: new label, default branch, and workflow list.
     RepoSwitched {
         label: String,
@@ -120,6 +131,14 @@ pub async fn run(
     if let Some(icon) = config.ui.github_icon.clone() {
         state.forge_icon = icon;
     }
+    if let Some(icon) = config.ui.bell_icon.clone() {
+        state.bell_icon = icon;
+    }
+    if let Some(icon) = config.ui.bell_off_icon.clone() {
+        state.bell_off_icon = icon;
+    }
+    state.notify_enabled = config.ui.notify_mode() != NotifyMode::Never
+        && (config.ui.notify_sound || config.ui.notify_desktop);
     resolve_theme(&mut state, &config);
     state.workspace_root = opts.workspace_root.clone();
     state.repos = if opts.workspace.is_empty() {
@@ -141,6 +160,9 @@ pub async fn run(
         }
     state.view = opts.initial_view;
     if state.view == View::Repos {
+        // The dashboard's rows sweep in from the top on the first frame, the
+        // same entrance they play on every later return to the view.
+        state.dash_opened_tick = Some(state.tick_count);
         // Start the cursor on the repo we were launched in, if it's listed.
         if let Some(i) = state.repos.iter().position(|r| r.spec == state.repo_label) {
             state.repo_cursor = i;
@@ -386,6 +408,12 @@ async fn event_loop(
                                 let _ = handle_key(state, key, &mut provider, &tx, &km).await;
                             }
                         }
+                        // A click is the same gesture as moving to a row and
+                        // pressing Enter — selecting on the first click,
+                        // opening on a click at the selection.
+                        if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                            handle_click(state, m.column, m.row, &mut provider, &tx, &km).await;
+                        }
                     }
                     _ => {}
                 }
@@ -476,6 +504,7 @@ async fn event_loop(
                         };
                         state.run_detail = Some(detail);
                         state.pending = state.pending.saturating_sub(1);
+                        maybe_spawn_digest(&provider, state, &tx);
                     }
                     AppEvent::RunPreviewLoaded(run_id, detail) => {
                         if let Some(file) = state.workflow_for_runs.as_deref() {
@@ -636,7 +665,7 @@ async fn event_loop(
                             if state.api_held() && q.used >= q.limit {
                                 state.hold_api(Some(q.reset));
                             }
-                            if record_quota(state, q) {
+                            if record_quota(state, q) && !state.notify_snoozed() {
                                 play_quota_alarm(&config);
                             }
                         }
@@ -701,10 +730,25 @@ async fn event_loop(
                         state.pending = state.pending.saturating_sub(1);
                         settle_push_watch(state, &spec, &runs, &config);
                     }
+                    AppEvent::DigestLoaded { run_id, job, step, lines, errors } => {
+                        if state.digest_pending == Some(run_id) {
+                            state.digest_pending = None;
+                        }
+                        if !lines.is_empty() {
+                            state.failure_digest = Some(FailureDigest {
+                                run_id,
+                                job_name: job,
+                                step_name: step,
+                                lines,
+                                error_rows: errors,
+                            });
+                        }
+                    }
                     AppEvent::WatchTailLoaded(job_id, job_name, lines) => {
                         state.watch_tail_pending = false;
-                        // Only worth holding while Watch is the view asking.
-                        if state.view == View::Watch {
+                        // Only worth holding while a view showing a tail is
+                        // asking: Watch's pane, or the dashboard's side pane.
+                        if matches!(state.view, View::Watch | View::Repos) {
                             // "Nothing to serve yet" keeps what the last fetch
                             // showed rather than blanking a pane the user is
                             // reading — the endpoint flickers between the two
@@ -781,7 +825,7 @@ async fn event_loop(
                         // Only commit/push are in the map, and only those are
                         // worth a sound: a failed `git add` is instant and its
                         // message is already on screen.
-                        if failed && had_op {
+                        if failed && had_op && !state.notify_snoozed() {
                             play_op_failed_sound(&config);
                         }
                         // A commit landing is the other thing worth flashing a
@@ -795,11 +839,13 @@ async fn event_loop(
                         // to do overwrites it with what it moved on to.
                         batch_on_op_done(state, &tx, &spec, &result);
                         match result {
-                            Ok(msg) => state.set_status(match msg.strip_prefix(BATCH_NOTHING) {
-                                Some(why) => format!("{spec}: {why}"),
-                                None => msg,
-                            }),
-                            Err(err) => state.set_status(err),
+                            // "Nothing to commit" is a refusal, not a result —
+                            // it stays plain rather than claiming a success.
+                            Ok(msg) => match msg.strip_prefix(BATCH_NOTHING) {
+                                Some(why) => state.set_status(format!("{spec}: {why}")),
+                                None => state.set_status_ok(msg),
+                            },
+                            Err(err) => state.set_status_err(err),
                         }
                         state.pending = state.pending.saturating_sub(1);
                         if !failed && verb.as_deref() == Some("commit") {
@@ -825,7 +871,7 @@ async fn event_loop(
                                 gv.pr = None;
                                 if published {
                                     let key = state.keymap.open_browser.clone();
-                                    state.set_status(format!(
+                                    state.set_status_ok(format!(
                                         "branch published — {key} opens a pull request"
                                     ));
                                 }
@@ -889,13 +935,20 @@ async fn event_loop(
                                     .collect();
                                 state.services = services;
                                 state.kuma_fetched_at = Some(chrono::Utc::now());
+                                // Fresh readings landing on an open card get
+                                // the same entrance the card itself had: the
+                                // verdicts on screen are new, and a silent
+                                // swap would let a changed one go unnoticed.
+                                if state.show_services {
+                                    state.services_opened_tick = Some(state.tick_count);
+                                }
                             }
                             // Said once, not once per poll: a URL typo and a
                             // server reboot read the same from here, and the
                             // stale readings (if any) stay on screen either way.
                             Err(e) => {
                                 if !state.kuma_error_shown {
-                                    state.set_status(format!("uptime kuma: {e}"));
+                                    state.set_status_err(format!("uptime kuma: {e}"));
                                     state.kuma_error_shown = true;
                                 }
                             }
@@ -905,7 +958,7 @@ async fn event_loop(
                         state.set_status(msg);
                     }
                     AppEvent::TaskError(msg) => {
-                        state.set_status(msg);
+                        state.set_status_err(msg);
                         state.pending = state.pending.saturating_sub(1);
                     }
                 }
@@ -915,7 +968,11 @@ async fn event_loop(
                 // Animations earn the 10fps; a still screen redraws once a
                 // second, which is what keeps the header clock and the poll
                 // countdown moving. Every non-tick branch redraws regardless.
-                redraw = state.tick_count % 10 == 0 || animations_active(state);
+                redraw = state.tick_count % 10 == 0
+                    || animations_active(state)
+                    || views::services_revealing(state)
+                    || views::help_revealing(state)
+                    || views::dash_revealing(state);
                 if state.status_msg.is_some() && state.tick_count.saturating_sub(state.status_msg_tick) > 30 {
                     state.status_msg = None;
                     redraw = true;
@@ -928,9 +985,9 @@ async fn event_loop(
                     // same bucket, and a meter that stops moving when you walk
                     // into the logs is worse than none — that is exactly where
                     // the budget goes. It also keeps going while everything else
-                    // is held off after a refusal: one request per poll, exempt
-                    // from the limit it reports, and the meter is how you tell
-                    // which of the two limits you are actually waiting on.
+                    // is held off after a refusal: at most one request per
+                    // poll, exempt from the limit it reports, and the meter is
+                    // how you tell which of the two limits you are waiting on.
                     spawn_quota_probe(&provider, state, &tx);
                     // Same standing as the quota probe: every view cares
                     // whether production is up, it spends nothing from the
@@ -956,6 +1013,11 @@ async fn event_loop(
                         match state.view {
                             View::Repos => {
                                 spawn_fetch_repo_cards(&provider, state, &tx);
+                                // The side pane's live tail, only while the
+                                // terminal is wide enough to be showing one.
+                                if !held {
+                                    spawn_dash_tail(&provider, state, &tx);
+                                }
                             }
                             _ if held => {}
                             View::Watch => {
@@ -1065,18 +1127,22 @@ async fn handle_key(
     // above — while it's open it swallows keys rather than acting on the view
     // behind it.
     if state.show_help {
+        // Clamped to what the card last drew, not merely saturated: notches
+        // counted past the bottom would all have to be scrolled back through
+        // before anything moved, which reads as a stuck wheel.
+        let max = state.last_help_max_scroll.get();
+        let down = |s: u16, by: u16| s.saturating_add(by).min(max);
         match key.code {
-            KeyCode::Down => state.help_scroll = state.help_scroll.saturating_add(1),
+            KeyCode::Down => state.help_scroll = down(state.help_scroll, 1),
             KeyCode::Up => state.help_scroll = state.help_scroll.saturating_sub(1),
-            KeyCode::PageDown => state.help_scroll = state.help_scroll.saturating_add(10),
+            KeyCode::PageDown => state.help_scroll = down(state.help_scroll, 10),
             KeyCode::PageUp => state.help_scroll = state.help_scroll.saturating_sub(10),
-            _ if key_is(&key, km.down) => {
-                state.help_scroll = state.help_scroll.saturating_add(1)
-            }
+            _ if key_is(&key, km.down) => state.help_scroll = down(state.help_scroll, 1),
             _ if key_is(&key, km.up) => state.help_scroll = state.help_scroll.saturating_sub(1),
             // Anything else — `?`, Esc, q, Enter — dismisses it.
             _ => {
                 state.show_help = false;
+                state.help_opened_tick = None;
                 state.needs_clear = true;
             }
         }
@@ -1087,11 +1153,12 @@ async fn handle_key(
     // so any key puts it away — except refresh, which re-asks Kuma right now
     // instead of waiting out the cadence.
     if state.show_services {
-        if key_is(&key, km.git_refresh) {
+        if key_is(&key, km.refresh) {
             spawn_kuma_probe(state, tx, true);
             return None;
         }
         state.show_services = false;
+        state.services_opened_tick = None;
         state.needs_clear = true;
         return None;
     }
@@ -1100,12 +1167,34 @@ async fn handle_key(
     if key_is(&key, km.help) {
         state.show_help = true;
         state.help_scroll = 0;
+        // The entrance is timed from the keypress, like the services card's —
+        // and once help has been found, the footer's beacon retires.
+        state.help_opened_tick = Some(state.tick_count);
+        state.help_seen = true;
+        return None;
+    }
+
+    // Global: ask for whatever this screen shows, again. One key, one meaning,
+    // on every view — the card that re-fetches its monitors above is the same
+    // key doing the same thing, and a dashboard that only ever refreshed on
+    // its own schedule was the odd one out.
+    if key_is(&key, km.refresh) {
+        refresh_current(state, provider, tx);
         return None;
     }
 
     // Global: service health by name, wherever you are.
     if key_is(&key, km.services) {
         state.show_services = true;
+        // The reveal is timed from the keypress, so the card plays its
+        // entrance every time it is asked for rather than once a session.
+        state.services_opened_tick = Some(state.tick_count);
+        return None;
+    }
+
+    // Global: snooze notifications — 30m, then 60m, then back on.
+    if key_is(&key, km.snooze) {
+        toggle_snooze(state);
         return None;
     }
 
@@ -1335,7 +1424,7 @@ async fn handle_key(
                     let ellipsis = if text.chars().count() > 50 { "…" } else { "" };
                     state.set_status(format!("yanked: {preview}{ellipsis}"));
                 }
-                Err(e) => state.set_status(format!("yank failed: {e}")),
+                Err(e) => state.set_status_err(format!("yank failed: {e}")),
             }
         }
         return None;
@@ -1432,11 +1521,6 @@ async fn handle_key(
                 begin_commit(state);
             } else if key_is(&key, km.git_push) {
                 push_current(state, tx);
-            } else if key_is(&key, km.git_refresh) {
-                if let Some(g) = state.git_view.as_ref() {
-                    let (spec, path) = (g.spec.clone(), g.path.clone());
-                    spawn_git_status(spec, path, tx.clone(), state);
-                }
             } else if key_is(&key, km.trigger) {
                 // Hand off to CI: switch the app to this repo and show its
                 // workflows, where `t` triggers as usual.
@@ -1478,8 +1562,6 @@ async fn handle_key(
                 // Staging from here is the whole point of reading the diff:
                 // decide, act, move on without a round trip through the list.
                 toggle_stage_at_cursor(state, tx);
-            } else if key_is(&key, km.git_refresh) {
-                open_git_diff(state, tx);
             }
         }
         View::Workflows => {
@@ -2881,11 +2963,16 @@ fn settle_push_watch(state: &mut AppState, spec: &str, runs: &[Run], config: &Co
         // stops carrying a run that has already settled.
         state.watch_seen_running.remove(&run.id);
         let _ = notify_run_finished(state, &run, spec, config);
-        state.set_status(format!(
+        let msg = format!(
             "{spec}: {} {}",
             if run.status.is_failure() { "✗" } else { "✓" },
             run.display_title,
-        ));
+        );
+        if run.status.is_failure() {
+            state.set_status_err(msg);
+        } else {
+            state.set_status_ok(msg);
+        }
     } else {
         if newly {
             state.set_status(format!(
@@ -2952,10 +3039,95 @@ fn move_cursor(cursor: &mut usize, len: usize, delta: i32) {
     *cursor = new as usize;
 }
 
+/// Route a left click: find what the last frame drew under the pointer and
+/// treat it as "move there — and open, if the cursor is already there". The
+/// second click goes through `handle_key` as Enter, so every view keeps its
+/// own idea of what opening means.
+///
+/// Overlays get what any key would give them: help and the services card are
+/// dismissed, and the modal inputs (finder, prompts, text editors) keep the
+/// screen — a stray click must not commit or cancel anything on their behalf.
+async fn handle_click(
+    state: &mut AppState,
+    x: u16,
+    y: u16,
+    provider: &mut Arc<GitHubProvider>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+    km: &Keymap,
+) {
+    if state.show_help {
+        state.show_help = false;
+        state.help_opened_tick = None;
+        state.needs_clear = true;
+        return;
+    }
+    if state.show_services {
+        state.show_services = false;
+        state.services_opened_tick = None;
+        state.needs_clear = true;
+        return;
+    }
+    if state.finder.is_some()
+        || state.push_prompt.is_some()
+        || state.log_search_input.is_some()
+        || state
+            .git_view
+            .as_ref()
+            .is_some_and(|g| g.commit_input.is_some())
+        || state.batch.as_ref().is_some_and(|b| b.input.is_some())
+        || state.trigger_prompt.as_ref().is_some_and(|p| p.editing)
+    {
+        return;
+    }
+    let hit = state
+        .hits
+        .borrow()
+        .iter()
+        .find(|(r, _)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+        .map(|(_, h)| *h);
+    let Some(hit) = hit else { return };
+    // The view guard looks redundant — hits come from the frame this view just
+    // drew — but it keeps a click racing a view switch from moving a cursor it
+    // can no longer see.
+    let mut open = false;
+    match hit {
+        Hit::Repo(i) if state.view == View::Repos => {
+            open = state.repo_cursor == i;
+            state.repo_cursor = i;
+        }
+        Hit::Workflow(i) if state.view == View::Workflows => {
+            open = state.workflow_cursor == i;
+            state.workflow_cursor = i;
+            maybe_fetch_workflow_preview(state, provider, tx);
+        }
+        Hit::Run(i) if state.view == View::Runs => {
+            open = state.run_cursor == i;
+            state.run_cursor = i;
+            maybe_fetch_preview(state, provider, tx);
+        }
+        Hit::DetailItem(i) if state.view == View::RunDetail => {
+            open = state.detail_cursor == i;
+            state.detail_cursor = i;
+        }
+        Hit::GitEntry(i) if state.view == View::GitStatus => {
+            if let Some(g) = state.git_view.as_mut() {
+                open = g.cursor == i;
+                g.cursor = i;
+            }
+        }
+        _ => {}
+    }
+    if open {
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let _ = handle_key(state, enter, provider, tx, km).await;
+    }
+}
+
 struct Keymap {
     quit: (KeyCode, KeyModifiers),
     back: (KeyCode, KeyModifiers),
     help: (KeyCode, KeyModifiers),
+    refresh: (KeyCode, KeyModifiers),
     down: (KeyCode, KeyModifiers),
     up: (KeyCode, KeyModifiers),
     confirm: (KeyCode, KeyModifiers),
@@ -2974,6 +3146,7 @@ struct Keymap {
     finder: (KeyCode, KeyModifiers),
     repos_view: (KeyCode, KeyModifiers),
     services: (KeyCode, KeyModifiers),
+    snooze: (KeyCode, KeyModifiers),
     repo_mark: (KeyCode, KeyModifiers),
     batch_commit: (KeyCode, KeyModifiers),
     batch_retry: (KeyCode, KeyModifiers),
@@ -2983,7 +3156,6 @@ struct Keymap {
     git_stage_all: (KeyCode, KeyModifiers),
     git_commit: (KeyCode, KeyModifiers),
     git_push: (KeyCode, KeyModifiers),
-    git_refresh: (KeyCode, KeyModifiers),
     git_diff: (KeyCode, KeyModifiers),
     trigger: (KeyCode, KeyModifiers),
     watch: (KeyCode, KeyModifiers),
@@ -3057,6 +3229,7 @@ fn resolve_keymap(cfg: &KeymapConfig) -> Result<Keymap> {
         quit:          parse_key(&cfg.quit)?,
         back:          parse_key(&cfg.back)?,
         help:          parse_key(&cfg.help)?,
+        refresh:       parse_key(&cfg.refresh)?,
         down:          parse_key(&cfg.down)?,
         up:            parse_key(&cfg.up)?,
         confirm:       parse_key(&cfg.confirm)?,
@@ -3075,6 +3248,7 @@ fn resolve_keymap(cfg: &KeymapConfig) -> Result<Keymap> {
         finder:        parse_key(&cfg.finder)?,
         repos_view:    parse_key(&cfg.repos_view)?,
         services:      parse_key(&cfg.services)?,
+        snooze:        parse_key(&cfg.snooze)?,
         repo_mark:     parse_key(&cfg.repo_mark)?,
         batch_commit:  parse_key(&cfg.batch_commit)?,
         batch_retry:   parse_key(&cfg.batch_retry)?,
@@ -3084,7 +3258,6 @@ fn resolve_keymap(cfg: &KeymapConfig) -> Result<Keymap> {
         git_stage_all: parse_key(&cfg.git_stage_all)?,
         git_commit:    parse_key(&cfg.git_commit)?,
         git_push:      parse_key(&cfg.git_push)?,
-        git_refresh:   parse_key(&cfg.git_refresh)?,
         git_diff:      parse_key(&cfg.git_diff)?,
         trigger:       parse_key(&cfg.trigger)?,
         watch:         parse_key(&cfg.watch)?,
@@ -3431,6 +3604,127 @@ fn find_section_by_time(raw: &[String], start_hms: &str) -> Option<usize> {
 
 /// Refresh every dashboard row. One request per repo; they land independently so
 /// a slow or broken repo doesn't hold up the rest.
+/// Everything the screen in front of you is showing, asked for again.
+///
+/// One key with one meaning on every view: the dashboard re-reads every repo's
+/// working tree and re-fetches its CI, a run list re-fetches its runs, a log
+/// re-fetches its job. Nothing in here mutates anything — the point of the key
+/// is to distrust what is on screen, not to act on it.
+///
+/// The poll's gates do not apply. A poll is the app guessing when you want to
+/// know; this is you saying so, which is exactly the moment to jump Kuma's
+/// slower clock and the preview caches. The one gate that survives is a
+/// rate-limit hold: asking again there is what extends the wait, so the local
+/// half still happens and the header keeps counting the refusal down.
+fn refresh_current(
+    state: &mut AppState,
+    provider: &Arc<GitHubProvider>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    let held = state.api_held();
+    // Feedback first: most of these are quiet round trips that change nothing
+    // on screen when the answer matches what is already there, and a key that
+    // appears to do nothing reads as a key that is not bound. A hold replaces
+    // this with its countdown below.
+    if !matches!(state.view, View::BatchCommit | View::TriggerPrompt) {
+        state.set_status("refreshing…".into());
+    }
+    match state.view {
+        View::Repos => {
+            // Every row's working tree, ungated, plus its CI unless held —
+            // `spawn_fetch_repo_cards` splits those two halves itself.
+            spawn_fetch_repo_cards(provider, state, tx);
+            if !held {
+                spawn_dash_tail(provider, state, tx);
+            }
+            // The Live column comes from Kuma, which runs on a clock of
+            // minutes. Forced: waiting one out is the thing being asked past.
+            spawn_kuma_probe(state, tx, true);
+        }
+        View::Workflows => {
+            if held {
+                return held_status(state);
+            }
+            spawn_repo_status_fetch(provider.clone(), tx.clone());
+            if let Some(w) = state.selected_workflow().cloned() {
+                spawn_fetch_workflow_preview(provider.clone(), w.file_name, tx.clone(), state);
+            }
+        }
+        View::Runs => {
+            if held {
+                return held_status(state);
+            }
+            if let Some(file) = state.workflow_for_runs.clone() {
+                spawn_fetch_runs(provider.clone(), file, tx.clone(), state);
+            }
+            // The preview pane is keyed by run id and would otherwise consider
+            // itself already correct for the run the cursor is on.
+            if let Some(r) = state.selected_run().cloned() {
+                spawn_fetch_run_preview(provider.clone(), r.id, tx.clone(), state);
+            }
+        }
+        // The diff reads the run detail that is already loaded, so refreshing
+        // it is refreshing that.
+        View::RunDetail | View::Diff => {
+            if held {
+                return held_status(state);
+            }
+            let id = state
+                .run_detail
+                .as_ref()
+                .map(|d| d.run.id)
+                .or_else(|| state.selected_run().map(|r| r.id));
+            if let Some(id) = id {
+                spawn_fetch_run_detail(provider.clone(), id, tx.clone(), state);
+            }
+        }
+        View::Logs => {
+            if held {
+                return held_status(state);
+            }
+            // A running job's log grows; the archive it is read from serves
+            // whatever exists so far, so this is how you see the rest of it.
+            let job = state
+                .log_job_idx
+                .and_then(|i| state.run_detail.as_ref()?.jobs.get(i))
+                .map(|j| j.id);
+            if let Some(id) = job {
+                spawn_fetch_logs(provider.clone(), id, tx.clone(), state);
+            }
+        }
+        View::Watch => {
+            if held {
+                return held_status(state);
+            }
+            if let Some(file) = state.workflow_for_runs.clone() {
+                spawn_fetch_runs(provider.clone(), file, tx.clone(), state);
+            }
+            if let Some(run) = state.runs.first().cloned() {
+                spawn_fetch_run_detail(provider.clone(), run.id, tx.clone(), state);
+            }
+            spawn_watch_tail(provider, state, tx);
+        }
+        View::GitStatus => {
+            if let Some(g) = state.git_view.as_ref() {
+                let (spec, path) = (g.spec.clone(), g.path.clone());
+                spawn_git_status(spec, path, tx.clone(), state);
+            }
+        }
+        View::GitDiff => open_git_diff(state, tx),
+        // A batch mid-run and a trigger prompt mid-answer are showing you what
+        // you typed, not something fetched. There is nothing to ask again.
+        View::BatchCommit | View::TriggerPrompt => {}
+    }
+}
+
+/// What a refresh says when GitHub has told us to wait — the same countdown
+/// the header is already showing, in the place you just pressed a key.
+fn held_status(state: &mut AppState) {
+    if let Some(left) = state.api_hold_left() {
+        state.set_status(format!("holding off GitHub for {left}s — rate limited"));
+    }
+}
+
 fn spawn_fetch_repo_cards(
     provider: &Arc<GitHubProvider>,
     state: &mut AppState,
@@ -3552,8 +3846,9 @@ fn spawn_kuma_probe(
 /// Re-read the API budget: what the header meter shows, and what tells a
 /// rate-limited dashboard how long it will stay that way.
 ///
-/// Free of the budget it reports, but not of a round trip — so it goes out once
-/// per poll, never once per row.
+/// Usually free of a round trip as well as of the budget — the reading comes
+/// off the headers of answers the poll was fetching anyway. Still once per
+/// poll and never once per row, for the polls that fall back to `/rate_limit`.
 fn spawn_quota_probe(
     provider: &Arc<GitHubProvider>,
     state: &mut AppState,
@@ -4063,6 +4358,47 @@ fn spawn_watch_tail(
     });
 }
 
+/// Widths below this cannot fit the dashboard's live pane, so nothing is
+/// fetched for one either. 160 leaves the table at least 104 columns — enough
+/// to keep every optional column it would have on a plain wide terminal.
+pub(crate) const DASH_SPLIT_MIN_WIDTH: u16 = 160;
+
+/// Live-tail fetch for the dashboard's side pane: the same endpoint, cap and
+/// cadence as the Watch view's pane, aimed at whichever run
+/// `dash_tail_target` picks. Skipped entirely on a terminal too narrow to
+/// show the pane — the fetch would spend API budget on an invisible log.
+fn spawn_dash_tail(
+    provider: &Arc<GitHubProvider>,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    if state.watch_tail_pending || state.last_frame_width.get() < DASH_SPLIT_MIN_WIDTH {
+        return;
+    }
+    let (id, name) = match state.dash_tail_target() {
+        Some((_, _, job)) => (job.id, job.name.clone()),
+        None => return,
+    };
+    state.watch_tail_pending = true;
+    let (p, tx) = (provider.clone(), tx.clone());
+    tokio::spawn(async move {
+        let lines = match p.stream_logs(id).await {
+            Ok(stream) => {
+                let mut lines: Vec<String> = stream
+                    .filter_map(|c| async { c.ok().map(|c| c.line) })
+                    .collect()
+                    .await;
+                if lines.len() > WATCH_TAIL_KEEP {
+                    lines.drain(..lines.len() - WATCH_TAIL_KEEP);
+                }
+                Some(lines)
+            }
+            Err(_) => None,
+        };
+        let _ = tx.send(AppEvent::WatchTailLoaded(id, name, lines));
+    });
+}
+
 fn spawn_repo_status_fetch(
     provider: Arc<GitHubProvider>,
     tx: mpsc::UnboundedSender<AppEvent>,
@@ -4183,6 +4519,111 @@ fn spawn_fetch_logs(
             }
         }
     });
+}
+
+/// How many lines of the failing step the failure digest keeps.
+const DIGEST_LINES: usize = 12;
+
+/// Fetch and boil down the failed job's log for the run open in the detail
+/// view — the panel that answers "why is it red" before the log is opened.
+///
+/// Once per run: the digest is kept and the fetch marked in flight, so
+/// re-entering the same red run costs nothing. Deliberately not counted in
+/// `state.pending` — it is background reading, and pausing the polls for it
+/// would trade live data for a convenience.
+fn maybe_spawn_digest(
+    provider: &Arc<GitHubProvider>,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(detail) = &state.run_detail else {
+        return;
+    };
+    if !detail.run.status.is_failure() {
+        return;
+    }
+    let run_id = detail.run.id;
+    if state
+        .failure_digest
+        .as_ref()
+        .is_some_and(|d| d.run_id == run_id)
+        || state.digest_pending == Some(run_id)
+    {
+        return;
+    }
+    let Some(job) = detail.jobs.iter().find(|j| j.status == Status::Failure) else {
+        return;
+    };
+    let job_id = job.id;
+    let job_name = job.name.clone();
+    let steps = job.steps.clone();
+    let step_name = steps
+        .iter()
+        .find(|s| s.status == Status::Failure)
+        .map(|s| s.name.clone());
+    state.digest_pending = Some(run_id);
+    let (p, tx) = (provider.clone(), tx.clone());
+    tokio::spawn(async move {
+        let mut lines = Vec::new();
+        if let Ok(mut s) = p.stream_logs(job_id).await {
+            while let Some(chunk) = s.next().await {
+                if let Ok(c) = chunk {
+                    lines.push(c.line);
+                }
+            }
+        }
+        let (digest, errors) = extract_failure_digest(&lines, &steps, step_name.as_deref());
+        let _ = tx.send(AppEvent::DigestLoaded {
+            run_id,
+            job: job_name,
+            step: step_name,
+            lines: digest,
+            errors,
+        });
+    });
+}
+
+/// Boil a failed job's log down to the window worth reading: the failed step's
+/// slice, opened a couple of lines above its first error — the error names the
+/// failure, the lines over it usually name the file. A slice where nothing
+/// classified as an error falls back to its tail, where test runners put their
+/// summaries.
+fn extract_failure_digest(
+    raw: &[String],
+    steps: &[Step],
+    failed_step: Option<&str>,
+) -> (Vec<String>, Vec<usize>) {
+    if raw.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    // The same step-slicing the log view uses, so the digest and the full log
+    // agree about where the step starts.
+    let slice: Vec<String> = failed_step
+        .and_then(|name| {
+            let (starts, names) = compute_step_line_starts(raw, steps);
+            let needle = name.trim().to_lowercase();
+            names
+                .iter()
+                .position(|s| s.trim().to_lowercase() == needle)
+                .map(|idx| extract_step_by_line_range(raw, idx, &starts))
+        })
+        .unwrap_or_else(|| raw.to_vec());
+    let (errors, _) = classify_log_severity(&slice);
+    let start = match errors.first() {
+        Some(&first) => first.saturating_sub(2),
+        None => slice.len().saturating_sub(DIGEST_LINES),
+    };
+    let end = (start + DIGEST_LINES).min(slice.len());
+    let window: Vec<String> = slice[start..end]
+        .iter()
+        .map(|l| strip_time_prefix(l).to_string())
+        .collect();
+    let error_rows = errors
+        .iter()
+        .filter(|&&e| e >= start && e < end)
+        .map(|&e| e - start)
+        .collect();
+    (window, error_rows)
 }
 
 fn trigger_workflow_at_cursor(
@@ -4392,8 +4833,40 @@ fn notify_run_finished(
     if !state.announced_runs.insert(run.id) {
         return false;
     }
+    // Snoozed: the run still counts as announced — a snooze mutes the moment,
+    // it must not queue the moment up for when the hour is over.
+    if state.notify_snoozed() {
+        return true;
+    }
     notify_now(run, repo_label, config);
     true
+}
+
+/// Cycle the notification snooze: off → 30 minutes → 60 minutes → off.
+///
+/// One key, pressed until it says what you want — the alternative is a prompt,
+/// and nobody entering a meeting wants a dialog about it.
+fn toggle_snooze(state: &mut AppState) {
+    let now = chrono::Utc::now();
+    let key = views::display_key(&state.keymap.snooze).to_string();
+    let left_min = state
+        .snooze_until
+        .filter(|t| *t > now)
+        .map(|t| (t - now).num_minutes());
+    match left_min {
+        None => {
+            state.snooze_until = Some(now + chrono::Duration::minutes(30));
+            state.set_status(format!("notifications snoozed for 30m — {key} again for 60m"));
+        }
+        Some(m) if m < 31 => {
+            state.snooze_until = Some(now + chrono::Duration::minutes(60));
+            state.set_status(format!("notifications snoozed for 60m — {key} again to unmute"));
+        }
+        Some(_) => {
+            state.snooze_until = None;
+            state.set_status_ok("notifications back on".into());
+        }
+    }
 }
 
 /// Raise the notification, with no questions asked about whether it is a repeat.
@@ -4419,13 +4892,19 @@ fn notify_now(run: &Run, repo_label: &str, config: &Config) {
             "{repo_label} · {} · {:?}",
             run.head_branch, run.status
         );
-        desktop_notify(summary, body, run.status.is_failure());
+        desktop_notify(summary, body, run.url.clone(), run.status.is_failure());
     }
 }
 
 /// Raise an OS notification off-thread. Failures (no notification daemon, no
 /// D-Bus session over SSH) are ignored — the sound and the TUI still work.
-fn desktop_notify(summary: String, body: String, is_failure: bool) {
+///
+/// On freedesktop daemons, clicking the notification body fires the reserved
+/// `default` action, so the run opens in the browser — but only if the app
+/// registered that action and stays around to hear the reply. The thread
+/// therefore parks in `wait_for_action` until the notification is clicked or
+/// dismissed; it is detached, so nothing waits on it.
+fn desktop_notify(summary: String, body: String, url: String, is_failure: bool) {
     std::thread::spawn(move || {
         let mut n = notify_rust::Notification::new();
         n.summary(&summary).body(&body).appname("jog");
@@ -4436,10 +4915,22 @@ fn desktop_notify(summary: String, body: String, is_failure: bool) {
             } else {
                 notify_rust::Urgency::Normal
             });
+            if !url.is_empty() {
+                n.action("default", "Open run");
+            }
+            if let Ok(handle) = n.show() {
+                handle.wait_for_action(|action| {
+                    if action == "default" {
+                        let _ = open::that(&url);
+                    }
+                });
+            }
         }
         #[cfg(not(all(unix, not(target_os = "macos"))))]
-        let _ = is_failure;
-        let _ = n.show();
+        {
+            let _ = (is_failure, url);
+            let _ = n.show();
+        }
     });
 }
 
@@ -4473,6 +4964,9 @@ fn animations_active(state: &AppState) -> bool {
         // A down service keeps the header's heart beating, and the beat needs
         // every tick, not the idle one-per-second redraw.
         || state.services.iter().any(|s| s.state == crate::kuma::ServiceState::Down)
+        // The footer's help beacon breathes for the first few seconds of a
+        // session — frames it stops earning the moment it retires.
+        || (!state.help_seen && tick < views::HELP_BEACON_TICKS)
         || state.git_ops.values().any(|o| !o.finished)
         || !state.run_progress.is_empty()
         || !state.push_watches.is_empty()
@@ -4530,6 +5024,54 @@ mod tests {
 
     fn quota(used: u32) -> Quota {
         Quota { limit: 100, used, reset: chrono::Utc::now() + chrono::Duration::minutes(20) }
+    }
+
+    #[test]
+    fn the_failure_digest_opens_a_little_above_the_first_error() {
+        let mut lines: Vec<String> = (0..30).map(|i| format!("building thing {i}")).collect();
+        lines[10] = "error[E0308]: mismatched types".into();
+        let (window, errors) = extract_failure_digest(&lines, &[], None);
+        assert_eq!(window.len(), DIGEST_LINES);
+        // Two lines of lead-in above the error, and the error marked within.
+        assert_eq!(window[0], "building thing 8");
+        assert_eq!(errors, vec![2]);
+        assert!(window[2].starts_with("error[E0308]"));
+    }
+
+    #[test]
+    fn a_digest_with_nothing_classified_keeps_the_tail() {
+        let lines: Vec<String> = (0..30).map(|i| format!("quiet line {i}")).collect();
+        let (window, errors) = extract_failure_digest(&lines, &[], None);
+        assert!(errors.is_empty());
+        assert_eq!(window.last().map(String::as_str), Some("quiet line 29"));
+        assert_eq!(window.len(), DIGEST_LINES);
+    }
+
+    #[test]
+    fn snooze_cycles_thirty_sixty_off() {
+        let mut st = dashboard();
+        assert!(!st.notify_snoozed());
+        toggle_snooze(&mut st);
+        assert!(st.notify_snoozed(), "first press mutes");
+        let first = st.snooze_until.unwrap();
+        toggle_snooze(&mut st);
+        assert!(st.snooze_until.unwrap() > first, "second press extends");
+        toggle_snooze(&mut st);
+        assert!(!st.notify_snoozed(), "third press unmutes");
+    }
+
+    #[test]
+    fn a_snoozed_run_is_announced_silently_and_only_once() {
+        let mut st = dashboard();
+        toggle_snooze(&mut st);
+        let run = run_with(7, Status::Failure);
+        let cfg = Config::default();
+        // Claims the announcement (so nothing replays it later) without a
+        // sound or a notification — which the test can only assert indirectly:
+        // the id is now in the ledger.
+        assert!(notify_run_finished(&mut st, &run, "acme/api", &cfg));
+        assert!(st.announced_runs.contains(&7));
+        assert!(!notify_run_finished(&mut st, &run, "acme/api", &cfg));
     }
 
     #[test]
@@ -5118,6 +5660,54 @@ mod tests {
         );
         poll_push_watches(&mut st, &provider, &tx);
         assert!(st.push_watches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_key_re_asks_for_whatever_the_screen_is_showing() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let provider = Arc::new(
+            GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "test-token".into())
+                .unwrap(),
+        );
+        let mut st = dashboard();
+        st.view = View::Runs;
+        st.workflow_for_runs = Some("ci.yml".into());
+        st.runs = vec![run_with(7, Status::Success)];
+
+        refresh_current(&mut st, &provider, &tx);
+        assert!(st.pending >= 1, "the run list was not asked for again");
+        // The key says so: several of these change nothing visible when the
+        // answer matches, and silence reads as an unbound key.
+        assert_eq!(st.status_msg.as_deref(), Some("refreshing…"));
+
+        // Turned away for pace: asking again is what extends the wait, so the
+        // refusal is reported instead of argued with.
+        st.pending = 0;
+        st.hold_api(None);
+        refresh_current(&mut st, &provider, &tx);
+        assert_eq!(st.pending, 0, "a rate-limit hold was spent through");
+        assert!(
+            st.status_msg.as_deref().is_some_and(|m| m.contains("rate limited")),
+            "got {:?}",
+            st.status_msg
+        );
+    }
+
+    #[test]
+    fn refresh_owns_r_everywhere_and_the_reruns_moved_off_it() {
+        let km = resolve_keymap(&KeymapConfig::default()).unwrap();
+        assert_eq!(km.refresh, (KeyCode::Char('r'), KeyModifiers::NONE));
+        // A hand that has learned `r` means refresh must not be able to start
+        // CI with it, nor resume a batch commit.
+        assert_ne!(km.rerun, km.refresh);
+        assert_ne!(km.rerun_failed, km.refresh);
+        assert_ne!(km.batch_retry, km.refresh);
+
+        // Configs written when the key only ever re-read a working tree keep
+        // working, under the name they used.
+        let cfg: KeymapConfig = toml::from_str(r#"git_refresh = "R""#).unwrap();
+        assert_eq!(cfg.refresh, "R");
+        assert_eq!(resolve_keymap(&cfg).unwrap().refresh.0, KeyCode::Char('R'));
     }
 
     #[test]

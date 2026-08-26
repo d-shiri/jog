@@ -4,7 +4,8 @@ One screen for every repo you're working in: what the working tree looks like,
 what CI is doing, and everything in between.
 
 - **Working tree** — stage, unstage, diff, commit and push, per repo or across
-  several at once, with `pre-commit` hook output on screen while it runs.
+  several at once, with `pre-commit` hook output on screen while it runs. Diffs
+  are side by side, numbered on each side, with the changed span marked.
 - **CI** — trigger workflows, watch runs step by step with the running job's
   log tailing live underneath and an ETA learned from the workflow's own recent
   durations, read logs with the errors already found, rerun or cancel.
@@ -344,20 +345,23 @@ view you're in floats to the top.
 
 | View      | Keys |
 |-----------|------|
-| Global    | `?` help · `q` quit · `Esc` back · `j`/`k` move · `Enter` open · `Ctrl-P` find · `H` repos · `y` yank |
+| Global    | `?` help · `q` quit · `Esc` back · `j`/`k` move · `Enter` open · `r` refresh this screen · `Ctrl-P` find · `H` repos · `y` yank |
 | Repos     | `Enter` open repo · `c` review changes · `Space` mark · `C` commit marked · `o` open in browser |
-| Batch commit | `r` retry · `s` skip · `c` open the failed repo · `P` push all · `Esc` stop |
-| Changes   | `d`/`Enter` diff the file · `Space` stage/unstage · `a` stage all · `c` commit · `P` push · `t` run CI · `r` refresh |
+| Batch commit | `t` retry · `s` skip · `c` open the failed repo · `P` push all · `Esc` stop |
+| Changes   | `d`/`Enter` diff the file · `Space` stage/unstage · `a` stage all · `c` commit · `P` push · `t` run CI |
 | Hook output | `j`/`k` scroll · `e`/`E` next/prev error · `g`/`G` top/tail · `y` yank · `Esc` dismiss |
-| Diff      | `j`/`k` scroll · `d`/`u` page · `g`/`G` top/bottom · `n`/`p` next/prev file · `Space` stage/unstage |
+| Diff      | side by side (unified on a narrow terminal) · `j`/`k` scroll · `d`/`u` page · `g`/`G` top/bottom · `n`/`p` next/prev file · `Space` stage/unstage |
 | Workflows | `t` trigger · `w` watch · `o` open in browser |
-| Runs      | `t` trigger · `r` rerun · `R` rerun-failed · `x` cancel · `w` watch |
+| Runs      | `t` trigger · `Ctrl-R` rerun · `R` rerun-failed · `x` cancel · `w` watch |
 | Run detail| `Enter`/`l` open logs · `D` diff vs last success |
 | Logs      | `j`/`k` scroll · `d`/`u` page · `g`/`G` top/bottom · `n`/`p` next/prev step · `a` all steps · `/` search · `e`/`E` next/prev error · `F` focus · `Enter` expand a fold |
 | Trigger   | `i`/`Enter` edit field · `Space` cycle choice · `t` submit |
 
 `S` opens the service-health card from anywhere (when Uptime Kuma is
-configured). All keys are remappable in `config.toml` (see [Config](#config)).
+configured). `r` re-fetches whatever the screen you are on is showing — the
+dashboard's repos and their monitors, a run list, a job's log — rather than
+waiting out the poll. All keys are remappable in `config.toml` (see
+[Config](#config)).
 
 ## Config
 
@@ -392,6 +396,7 @@ status_page = "default"                # the status page's slug
 quit = "q"
 back = "Esc"
 help = "?"
+refresh = "r"          # was `git_refresh`; the old name still works
 down = "j"
 up = "k"
 trigger = "t"

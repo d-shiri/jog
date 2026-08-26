@@ -1,8 +1,9 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 
@@ -12,13 +13,46 @@ use crate::config::KeymapConfig;
 use crate::git::RepoStatus;
 use crate::history::History;
 use crate::provider::github::{ApiError, Quota};
-use crate::provider::{PrInfo, Run, RunDetail, Status, Workflow};
+use crate::provider::{Job, PrInfo, Run, RunDetail, Status, Workflow};
 
 
 #[derive(Debug, Clone, Copy)]
 pub enum DetailItem {
     Job(usize),
     Step { job: usize, step: usize },
+}
+
+/// What a mouse click at some screen position would land on.
+///
+/// Each list view registers one of these per *visible* row while rendering, so
+/// the click handler never re-derives table offsets — it asks the frame that
+/// was actually drawn. The index is into the view's own list (repos, runs, …),
+/// not into table rows, so headings and scrolling are already accounted for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hit {
+    Repo(usize),
+    Workflow(usize),
+    Run(usize),
+    DetailItem(usize),
+    GitEntry(usize),
+}
+
+/// The part of a failed run's log worth reading before opening the log at all:
+/// a window around the first error of the first failed step. Fetched once per
+/// failed run when its detail view opens, and kept until another run's digest
+/// replaces it.
+#[derive(Debug, Clone)]
+pub struct FailureDigest {
+    /// Run this digest belongs to — the detail view shows it only while it is
+    /// looking at the same run.
+    pub run_id: u64,
+    pub job_name: String,
+    /// The failed step, when the job's step list named one.
+    pub step_name: Option<String>,
+    /// The extracted window, time prefixes stripped.
+    pub lines: Vec<String>,
+    /// Indices into `lines` that classified as errors, for highlighting.
+    pub error_rows: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +91,12 @@ pub enum View {
 /// GitHub's mark, as a Nerd Font glyph. Overridable, because a terminal without
 /// a patched font draws it as a box — see `ui.github_icon`.
 pub const DEFAULT_FORGE_ICON: &str = "\u{f09b}";
+
+/// The header's bell — notifications are live — and its slashed twin for a
+/// snooze. Nerd Font (Font Awesome bell / bell-slash), same tradeoff and
+/// override story as the forge mark: see `ui.bell_icon` / `ui.bell_off_icon`.
+pub const DEFAULT_BELL_ICON: &str = "\u{f0f3}";
+pub const DEFAULT_BELL_OFF_ICON: &str = "\u{f1f6}";
 
 /// The question a landed commit raises: push it?
 ///
@@ -360,6 +400,165 @@ pub enum DiffLine {
     Text(String),
 }
 
+/// One side of a side-by-side diff row: the text of the line with its marker
+/// column dropped, the number it has in its own file, and where inside it the
+/// edit actually happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffSide {
+    pub text: String,
+    /// The line's number in its own version of the file — `None` only when the
+    /// hunk header it belongs to could not be parsed.
+    pub num: Option<usize>,
+    /// Added or removed, as opposed to context carried by both sides.
+    pub changed: bool,
+    /// Byte range of the changed span within `text`.
+    pub emph: Option<ByteSpan>,
+}
+
+/// One row of the side-by-side diff.
+///
+/// Rows, not lines: a `-`/`+` pair is one row with two sides, which is the
+/// whole point of the layout — the old and the new sit at the same height and
+/// the eye compares across rather than remembering down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffRow {
+    /// A staged/unstaged banner.
+    Section(String),
+    /// A line belonging to neither side: a hunk header, a file header, a
+    /// `Binary files …` note, the blank between sections.
+    Meta(String),
+    /// A side each. `None` is the gap opposite a line the other side added or
+    /// removed — there is nothing there, and the layout says so.
+    Pair {
+        old: Option<DiffSide>,
+        new: Option<DiffSide>,
+    },
+}
+
+/// A tab, in columns. Expanded here rather than left to the terminal: in a
+/// two-column layout a raw tab jumps to the terminal's own stop, which is
+/// measured from the edge of the screen and lands wherever it likes inside a
+/// padded cell — one tab and the right-hand column stops lining up.
+const TAB_WIDTH: usize = 4;
+
+/// Where `i` lands once the tabs before it have been expanded.
+fn expanded_at(s: &str, i: usize) -> usize {
+    let Some(head) = s.get(..i) else { return i };
+    head.chars()
+        .map(|c| if c == '\t' { TAB_WIDTH } else { c.len_utf8() })
+        .sum()
+}
+
+fn expand_tabs(s: &str) -> String {
+    if s.contains('\t') {
+        s.replace('\t', &" ".repeat(TAB_WIDTH))
+    } else {
+        s.to_string()
+    }
+}
+
+/// One unified line as a side of a row: marker column dropped, tabs expanded,
+/// and the emphasis span moved to match both.
+fn diff_side(raw: &str, emph: Option<ByteSpan>, num: usize, changed: bool) -> DiffSide {
+    let body = raw.get(1..).unwrap_or("");
+    let emph = emph
+        // Spans are measured against the line including its marker byte.
+        .map(|(a, b)| (a.saturating_sub(1), b.saturating_sub(1)))
+        .filter(|(a, b)| *b <= body.len() && a < b)
+        .map(|(a, b)| (expanded_at(body, a), expanded_at(body, b)));
+    DiffSide {
+        text: expand_tabs(body),
+        num: Some(num),
+        changed,
+        emph,
+    }
+}
+
+/// `@@ -12,7 +30,9 @@` → the first line number on each side.
+fn hunk_starts(t: &str) -> Option<(usize, usize)> {
+    let rest = t.strip_prefix("@@ ")?;
+    let mut parts = rest.split_whitespace();
+    let (old, new) = (parts.next()?, parts.next()?);
+    let first = |s: &str, mark: char| {
+        s.strip_prefix(mark)?
+            .split(',')
+            .next()?
+            .parse::<usize>()
+            .ok()
+    };
+    Some((first(old, '-')?, first(new, '+')?))
+}
+
+/// Fold a unified diff into rows with a side each.
+///
+/// A run of removals followed by a run of additions is zipped position by
+/// position — the same pairing the emphasis uses, extended to unequal runs,
+/// where the longer side simply runs on opposite gaps. Anything else keeps a
+/// row to itself: context appears on both sides, everything else on neither.
+pub fn diff_rows(lines: &[DiffLine], emphasis: &[Option<ByteSpan>]) -> Vec<DiffRow> {
+    let text_at = |i: usize| match &lines[i] {
+        DiffLine::Text(t) => Some(t.as_str()),
+        DiffLine::Section(_) => None,
+    };
+    let marked = |i: usize, mark: char, header: &str| {
+        text_at(i).is_some_and(|t| t.starts_with(mark) && !t.starts_with(header))
+    };
+    let emph_at = |i: usize| emphasis.get(i).copied().flatten();
+
+    let mut rows: Vec<DiffRow> = Vec::with_capacity(lines.len());
+    let (mut old_no, mut new_no) = (0usize, 0usize);
+    let mut i = 0;
+    while i < lines.len() {
+        if let DiffLine::Section(label) = &lines[i] {
+            rows.push(DiffRow::Section(label.clone()));
+            i += 1;
+            continue;
+        }
+        if marked(i, '-', "---") || marked(i, '+', "+++") {
+            let del = i;
+            while i < lines.len() && marked(i, '-', "---") {
+                i += 1;
+            }
+            let add = i;
+            while i < lines.len() && marked(i, '+', "+++") {
+                i += 1;
+            }
+            let (dn, an) = (add - del, i - add);
+            for k in 0..dn.max(an) {
+                let old = (k < dn).then(|| {
+                    diff_side(text_at(del + k).unwrap_or(""), emph_at(del + k), old_no + k + 1, true)
+                });
+                let new = (k < an).then(|| {
+                    diff_side(text_at(add + k).unwrap_or(""), emph_at(add + k), new_no + k + 1, true)
+                });
+                rows.push(DiffRow::Pair { old, new });
+            }
+            old_no += dn;
+            new_no += an;
+            continue;
+        }
+        let t = text_at(i).unwrap_or("");
+        if let Some((o, n)) = hunk_starts(t) {
+            // The header numbers the line *after* it, so the counters sit one
+            // behind and are stepped as each line is taken.
+            old_no = o.saturating_sub(1);
+            new_no = n.saturating_sub(1);
+            rows.push(DiffRow::Meta(t.to_string()));
+        } else if t.starts_with(' ') {
+            old_no += 1;
+            new_no += 1;
+            rows.push(DiffRow::Pair {
+                old: Some(diff_side(t, None, old_no, false)),
+                new: Some(diff_side(t, None, new_no, false)),
+            });
+        } else {
+            rows.push(DiffRow::Meta(t.to_string()));
+        }
+        i += 1;
+    }
+    rows
+}
+
 /// The diff for a single file, opened from the working-tree view.
 #[derive(Debug, Clone)]
 pub struct GitDiffView {
@@ -369,7 +568,21 @@ pub struct GitDiffView {
     pub spec: String,
     pub file: String,
     pub lines: Vec<DiffLine>,
+    /// Per-line byte range of the changed span inside a paired `-`/`+` line,
+    /// parallel to `lines`. Computed once here rather than per frame, for the
+    /// same reason the render slices to the viewport: the pairing has to look
+    /// at the whole diff, and a redraw should not.
+    pub emphasis: Vec<Option<ByteSpan>>,
+    /// The same diff folded into side-by-side rows. Built once here, with the
+    /// emphasis and for the same reason: the pairing has to look at whole runs
+    /// of the diff, and a redraw must not.
+    pub rows: Vec<DiffRow>,
     pub scroll: usize,
+    /// Scrollable units the last frame drew — rows where the terminal was wide
+    /// enough for two columns, lines where it was not. `Cell` because the
+    /// render is what knows which layout the width allowed, and the key
+    /// handler has to stop at the same bottom the eye can see.
+    pub units: Cell<usize>,
     pub loading: bool,
 }
 
@@ -379,7 +592,10 @@ impl GitDiffView {
             spec,
             file,
             lines: Vec::new(),
+            emphasis: Vec::new(),
+            rows: Vec::new(),
             scroll: 0,
+            units: Cell::new(0),
             loading: true,
         }
     }
@@ -404,6 +620,9 @@ impl GitDiffView {
                 self.lines.push(DiffLine::Text(line.to_string()));
             }
         }
+        self.emphasis = diff_emphasis(&self.lines);
+        self.rows = diff_rows(&self.lines, &self.emphasis);
+        self.units.set(0);
     }
 
     /// Added and removed line counts, for the title.
@@ -422,13 +641,98 @@ impl GitDiffView {
     /// Largest useful scroll offset: stop when the last line reaches the top of
     /// the viewport, so scrolling never runs off into empty space.
     pub fn max_scroll(&self, viewport: usize) -> usize {
-        self.lines.len().saturating_sub(viewport.max(1))
+        // Whatever the last frame counted; before the first one, the unified
+        // line count is the only answer there is.
+        let total = match self.units.get() {
+            0 => self.lines.len(),
+            n => n,
+        };
+        total.saturating_sub(viewport.max(1))
     }
 
     pub fn scroll_by(&mut self, delta: isize, viewport: usize) {
         let next = self.scroll as isize + delta;
         self.scroll = next.clamp(0, self.max_scroll(viewport) as isize) as usize;
     }
+}
+
+/// Byte range of the changed span within one diff line.
+pub type ByteSpan = (usize, usize);
+
+/// The changed span inside each diff line, as a byte range, for lines with
+/// something finer than the line itself to say.
+///
+/// Only balanced runs — N `-` lines followed directly by N `+` lines — are
+/// paired, the i-th with the i-th. Positional pairing on unequal runs is a
+/// guess, and a wrong guess marks two unrelated lines as an edit of each
+/// other. The `---`/`+++` file headers are never content, so they neither
+/// join nor split a run they sit next to — in practice they only ever appear
+/// outside hunks anyway.
+fn diff_emphasis(lines: &[DiffLine]) -> Vec<Option<ByteSpan>> {
+    let mut out = vec![None; lines.len()];
+    let is = |i: usize, mark: char, header: &str| {
+        matches!(&lines[i], DiffLine::Text(t) if t.starts_with(mark) && !t.starts_with(header))
+    };
+    let mut i = 0;
+    while i < lines.len() {
+        if !is(i, '-', "---") {
+            i += 1;
+            continue;
+        }
+        let del = i;
+        while i < lines.len() && is(i, '-', "---") {
+            i += 1;
+        }
+        let add = i;
+        while i < lines.len() && is(i, '+', "+++") {
+            i += 1;
+        }
+        if i - add != add - del {
+            continue;
+        }
+        for k in 0..(add - del) {
+            let (DiffLine::Text(old), DiffLine::Text(new)) = (&lines[del + k], &lines[add + k])
+            else {
+                continue;
+            };
+            // `+ 1` puts the range back past the `-`/`+` marker byte the
+            // comparison skipped.
+            if let Some((o, n)) = changed_spans(&old[1..], &new[1..]) {
+                out[del + k] = o.map(|(s, e)| (s + 1, e + 1));
+                out[add + k] = n.map(|(s, e)| (s + 1, e + 1));
+            }
+        }
+    }
+    out
+}
+
+/// Each side's differing byte span once the common prefix and suffix are
+/// peeled off.
+///
+/// A side's span is `None` when it is empty — the other line grew or shrank at
+/// that point, and there is nothing on this side to mark. The whole answer is
+/// `None` when the lines share no edge at all: those are different lines, not
+/// an edit of one, and marking all of both would only restate the line colour.
+fn changed_spans(old: &str, new: &str) -> Option<(Option<ByteSpan>, Option<ByteSpan>)> {
+    let prefix: usize = old
+        .chars()
+        .zip(new.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a.len_utf8())
+        .sum();
+    // Over the remainders, so the suffix can never reclaim prefix bytes.
+    let suffix: usize = old[prefix..]
+        .chars()
+        .rev()
+        .zip(new[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a.len_utf8())
+        .sum();
+    if prefix == 0 && suffix == 0 {
+        return None;
+    }
+    let span = |len: usize| (prefix < len - suffix).then_some((prefix, len - suffix));
+    Some((span(old.len()), span(new.len())))
 }
 
 /// One row of the multi-repo dashboard: a repo plus its most recent runs.
@@ -1326,6 +1630,16 @@ impl Theme {
     }
 }
 
+/// What the footer message is reporting, so the colour can say it before the
+/// words do: an op that failed and "opened in browser" should not read the
+/// same at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusKind {
+    Info,
+    Success,
+    Error,
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub view: View,
@@ -1397,6 +1711,7 @@ pub struct AppState {
     /// Index into `log_search_matches`.
     pub log_search_match_idx: Option<usize>,
     pub status_msg: Option<String>,
+    pub status_kind: StatusKind,
     pub status_msg_tick: u64,
     pub repo_label: String,
     /// True while `repo_label` is a bootstrap guess rather than a repo the user
@@ -1500,6 +1815,23 @@ pub struct AppState {
     /// Keybinding reference overlay.
     pub show_help: bool,
     pub help_scroll: u16,
+    /// The tick the help card went up on — the clock its rows reveal
+    /// themselves against, exactly like the services card's. `None` while it
+    /// is closed (or on screen without an entrance to play — a test).
+    pub help_opened_tick: Option<u64>,
+    /// The tick the multi-repo dashboard was last landed on — the clock its
+    /// rows arrive against, the same sweep the help and services cards play.
+    /// Set on startup when the dashboard is the landing view and on every
+    /// return to it; `None` when the entrance is not to be played (a test).
+    pub dash_opened_tick: Option<u64>,
+    /// Help has been opened at least once this session. What retires the
+    /// footer's beacon: an invitation to a place you have already been is
+    /// just blinking.
+    pub help_seen: bool,
+    /// How far the help card could scroll at last render, so the key and
+    /// wheel handlers can stop at the bottom instead of counting past it
+    /// into a distance that has to be scrolled back through.
+    pub last_help_max_scroll: Cell<u16>,
     /// Directory the workspace scan was rooted at, when running outside a repo.
     pub workspace_root: Option<PathBuf>,
     /// Ticks between polls, and the tick the last one went out on.
@@ -1558,6 +1890,10 @@ pub struct AppState {
     /// The service-health overlay: every monitor by name, with its ping and
     /// day's uptime — including the ones no dashboard row claims.
     pub show_services: bool,
+    /// The tick the services card went up on — the clock its rows reveal
+    /// themselves against. `None` while it is closed, and while it is on
+    /// screen without an entrance to play (a redraw, a test).
+    pub services_opened_tick: Option<u64>,
     /// When the readings on screen were fetched — what the card's "updated
     /// Ns ago" is measured from. `None` until Kuma first answers.
     pub kuma_fetched_at: Option<DateTime<Utc>>,
@@ -1567,6 +1903,32 @@ pub struct AppState {
     /// The `[uptime_kuma]` config, copied in at startup so the card's manual
     /// refresh can fire a fetch without threading `Config` through every key.
     pub kuma: Option<crate::config::UptimeKumaConfig>,
+    /// Clickable regions of the frame on screen, rebuilt on every render.
+    /// `RefCell` because views write it through `&AppState`, like the viewport
+    /// cells above.
+    pub hits: RefCell<Vec<(Rect, Hit)>>,
+    /// Notifications (sounds and desktop) are muted until this moment — the
+    /// meeting-mode switch. `None` when not snoozed. Runs that settle while
+    /// muted are still marked announced, so the end of a snooze does not
+    /// release a backlog of stale dings.
+    pub snooze_until: Option<DateTime<Utc>>,
+    /// Whether config would announce anything at all. When it wouldn't
+    /// (`notify = "never"`, or both channels off), the header wears no bell:
+    /// a permanently slashed bell would nag about a choice already made.
+    pub notify_enabled: bool,
+    /// Header bell glyphs — live and snoozed. See `DEFAULT_BELL_ICON`.
+    pub bell_icon: String,
+    pub bell_off_icon: String,
+    /// Width of the last frame drawn. What lets the event loop skip fetching a
+    /// live tail for the dashboard's side pane when the terminal is too narrow
+    /// to ever show one.
+    pub last_frame_width: Cell<u16>,
+    /// Why the failed run open in the detail view failed — see
+    /// [`FailureDigest`].
+    pub failure_digest: Option<FailureDigest>,
+    /// A digest log fetch is in flight for this run, so a re-entered detail
+    /// view doesn't fetch the same log twice.
+    pub digest_pending: Option<u64>,
 }
 
 /// What the Watch view's live log pane holds: whose log it is and the last
@@ -1623,6 +1985,7 @@ impl AppState {
             log_search_matches: Vec::new(),
             log_search_match_idx: None,
             status_msg: None,
+            status_kind: StatusKind::Info,
             status_msg_tick: 0,
             repo_label,
             repo_label_implicit: false,
@@ -1663,6 +2026,10 @@ impl AppState {
             fetch_started_tick: Cell::new(0),
             show_help: false,
             help_scroll: 0,
+            help_opened_tick: None,
+            dash_opened_tick: None,
+            help_seen: false,
+            last_help_max_scroll: Cell::new(0),
             workspace_root: None,
             poll_ticks: 50,
             last_poll_tick: 0,
@@ -1678,10 +2045,36 @@ impl AppState {
             kuma_pending: false,
             kuma_error_shown: false,
             show_services: false,
+            services_opened_tick: None,
             kuma_fetched_at: None,
             kuma_last_poll_tick: 0,
             kuma: None,
+            hits: RefCell::new(Vec::new()),
+            snooze_until: None,
+            notify_enabled: true,
+            bell_icon: DEFAULT_BELL_ICON.to_string(),
+            bell_off_icon: DEFAULT_BELL_OFF_ICON.to_string(),
+            last_frame_width: Cell::new(0),
+            failure_digest: None,
+            digest_pending: None,
         }
+    }
+
+    /// Whether notifications are currently snoozed.
+    pub fn notify_snoozed(&self) -> bool {
+        self.snooze_until.is_some_and(|t| Utc::now() < t)
+    }
+
+    /// The run the dashboard's live pane should follow: the first in-flight run
+    /// (in table order, so the target doesn't jump between polls) that has a
+    /// job actually producing a log right now.
+    pub fn dash_tail_target(&self) -> Option<(&str, &RunDetail, &Job)> {
+        self.active_progress().into_iter().find_map(|(card, d)| {
+            d.jobs
+                .iter()
+                .find(|j| j.status == Status::Running)
+                .map(|j| (card.spec.as_str(), d, j))
+        })
     }
 
     /// The monitors watching one dashboard repo, in status-page order.
@@ -1757,11 +2150,33 @@ impl AppState {
         if self.view != v {
             self.view = v;
             self.needs_clear = true;
+            // Coming back to the dashboard replays its entrance, so the sweep
+            // is a property of arriving at the view rather than of starting
+            // the program — the same rule the help and services cards follow.
+            if v == View::Repos {
+                self.dash_opened_tick = Some(self.tick_count);
+            }
         }
     }
 
     pub fn set_status(&mut self, msg: String) {
+        self.set_status_of(msg, StatusKind::Info);
+    }
+
+    /// An op that completed — the footer says so in green.
+    pub fn set_status_ok(&mut self, msg: String) {
+        self.set_status_of(msg, StatusKind::Success);
+    }
+
+    /// An op that failed — red, kept for actual failures rather than guards
+    /// and refusals, so the colour still means something.
+    pub fn set_status_err(&mut self, msg: String) {
+        self.set_status_of(msg, StatusKind::Error);
+    }
+
+    fn set_status_of(&mut self, msg: String, kind: StatusKind) {
         self.status_msg = Some(msg);
+        self.status_kind = kind;
         self.status_msg_tick = self.tick_count;
     }
 
@@ -3201,6 +3616,118 @@ mod tests {
         // `---`/`+++` name the files; counting them would add a phantom +1/-1
         // to every single file's summary.
         assert_eq!(dv.stats(), (1, 1));
+    }
+
+    #[test]
+    fn the_changed_word_is_marked_on_both_sides_of_a_pair() {
+        let mut dv = GitDiffView::new("acme/api".into(), "src/a.rs".into());
+        dv.set_sections(vec![section("unstaged", "-let x = 1;\n+let x = 2;\n")]);
+        // Everything but the digit is shared; the mark lands on the digit,
+        // offset by one for the `-`/`+` marker.
+        assert_eq!(dv.emphasis, vec![Some((9, 10)), Some((9, 10))]);
+    }
+
+    #[test]
+    fn rows_pair_the_old_and_new_and_number_each_side() {
+        let mut dv = GitDiffView::new("acme/api".into(), "src/a.rs".into());
+        dv.set_sections(vec![section(
+            "unstaged",
+            "@@ -12,3 +12,4 @@\n ctx\n-old\n+new\n+extra\n ctx2\n",
+        )]);
+        let sides = |r: &DiffRow| match r {
+            DiffRow::Pair { old, new } => (
+                old.as_ref().map(|s| (s.text.clone(), s.num)),
+                new.as_ref().map(|s| (s.text.clone(), s.num)),
+            ),
+            _ => panic!("not a pair: {r:?}"),
+        };
+        assert_eq!(dv.rows[0], DiffRow::Meta("@@ -12,3 +12,4 @@".into()));
+        // Context counts on both sides and keeps its own number on each.
+        assert_eq!(
+            sides(&dv.rows[1]),
+            (Some(("ctx".into(), Some(12))), Some(("ctx".into(), Some(12))))
+        );
+        // The replaced line is one row, read across.
+        assert_eq!(
+            sides(&dv.rows[2]),
+            (Some(("old".into(), Some(13))), Some(("new".into(), Some(13))))
+        );
+        // The run is longer on one side, so the row opposite the extra line is
+        // a gap rather than someone else's line pulled up into it.
+        assert_eq!(sides(&dv.rows[3]), (None, Some(("extra".into(), Some(14)))));
+        // And the numbering has diverged by exactly the line that was added.
+        assert_eq!(
+            sides(&dv.rows[4]),
+            (Some(("ctx2".into(), Some(14))), Some(("ctx2".into(), Some(15))))
+        );
+    }
+
+    #[test]
+    fn tabs_are_expanded_and_the_mark_moves_with_them() {
+        let mut dv = GitDiffView::new("acme/api".into(), "src/a.rs".into());
+        dv.set_sections(vec![section("unstaged", "-\tlet x = 1;\n+\tlet x = 2;\n")]);
+        let DiffRow::Pair { old: Some(old), new: Some(new) } = &dv.rows[0] else {
+            panic!("not a pair: {:?}", dv.rows[0]);
+        };
+        // A raw tab jumps to the terminal's own stop, measured from the edge of
+        // the screen — inside a padded column it lands anywhere.
+        assert_eq!(old.text, "    let x = 1;");
+        assert_eq!(new.text, "    let x = 2;");
+        // And the emphasis still points at the digit it was measured against,
+        // three bytes further along on each side.
+        let at = |s: &DiffSide| s.emph.map(|(a, b)| s.text[a..b].to_string());
+        assert_eq!(at(old).as_deref(), Some("1"));
+        assert_eq!(at(new).as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn wholly_different_lines_are_left_to_the_line_colour() {
+        // No common edge at all: these are different lines, not an edit of
+        // one, and marking all of both would just restate the colour.
+        assert_eq!(changed_spans("abc", "xyz"), None);
+    }
+
+    #[test]
+    fn unbalanced_runs_are_not_guessed_at() {
+        let mut dv = GitDiffView::new("acme/api".into(), "src/a.rs".into());
+        // Two deletions, one addition: pairing the first `-` with the `+`
+        // would be a guess, and a wrong one marks unrelated lines.
+        dv.set_sections(vec![section("unstaged", "-let a = 1;\n-let b = 1;\n+let a = 2;\n")]);
+        assert_eq!(dv.emphasis, vec![None, None, None]);
+    }
+
+    #[test]
+    fn a_pure_insertion_marks_only_the_side_that_grew() {
+        // "ab" → "axb": the old line has no span of its own to mark.
+        assert_eq!(changed_spans("ab", "axb"), Some((None, Some((1, 2)))));
+    }
+
+    #[test]
+    fn emphasis_lands_on_char_boundaries_in_multibyte_text() {
+        // "héllo" → "hällo": the changed char is 2 bytes wide, and a range
+        // that split it would panic at render time when sliced.
+        assert_eq!(
+            changed_spans("héllo", "hällo"),
+            Some((Some((1, 3)), Some((1, 3))))
+        );
+    }
+
+    #[test]
+    fn the_footer_kind_follows_the_message() {
+        let mut st = AppState::new(
+            "acme/api".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        st.set_status_err("push failed".into());
+        assert_eq!(st.status_kind, StatusKind::Error);
+        // A plain note afterwards must not stay dressed in red.
+        st.set_status("opened in browser".into());
+        assert_eq!(st.status_kind, StatusKind::Info);
+        st.set_status_ok("pushed".into());
+        assert_eq!(st.status_kind, StatusKind::Success);
     }
 
     #[test]

@@ -14,8 +14,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::animated_glyph;
 use super::motion::{Motion, mix};
 use crate::app::state::{
-    AppState, BatchPhase, DetailItem, GitOp, ItemState, Theme, View, ansi_line_to_spans,
-    build_detail_items,
+    AppState, BatchPhase, ByteSpan, DetailItem, DiffLine, DiffRow, DiffSide, GitOp, Hit, ItemState,
+    StatusKind, Theme, View, ansi_line_to_spans, build_detail_items,
 };
 use crate::history::HistoryEntry;
 use crate::provider::github::{ApiFault, CRITICAL_PERCENT};
@@ -23,6 +23,9 @@ use crate::provider::{Run, Status};
 
 pub fn render(f: &mut Frame, state: &AppState) {
     let area = f.area();
+    // The click map describes the frame being drawn now, not any earlier one.
+    state.hits.borrow_mut().clear();
+    state.last_frame_width.set(area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -59,6 +62,185 @@ pub fn render(f: &mut Frame, state: &AppState) {
     render_help_overlay(f, area, state);
 }
 
+/// The services card's entrance, in ticks at the app's 100ms clock.
+///
+/// A card that arrives complete asks to be read all at once; one whose rows
+/// land in sequence hands the eye an order to read them in. Each row waits
+/// `REVEAL_STEP` ticks longer than the one above it, then brings its verdict
+/// up out of the card's own background over `REVEAL_TICKS`. Eight monitors
+/// are done inside a second: fast enough that the card is readable about as
+/// soon as the eye reaches it, slow enough to still read as one movement
+/// down the card rather than a flash.
+///
+/// The step is fractional on purpose. A stagger has to be shorter than a tick
+/// to keep a sweep this quick from collapsing into every row landing at once,
+/// and the fade each row plays is long enough that a sub-tick offset between
+/// two of them still shows up as two different frames.
+const REVEAL_STEP: f64 = 0.6;
+const REVEAL_TICKS: f64 = 3.0;
+
+/// How far row `i` is into that entrance, 0.0 → 1.0.
+///
+/// 1.0 when no opening tick was recorded: the card is on screen without the
+/// clock having been started (a test, a direct `show_services`), and a settled
+/// card is the honest answer there rather than a frozen first frame.
+fn reveal_at(state: &AppState, i: usize) -> f64 {
+    staggered_reveal(state.services_opened_tick, state.tick_count, i, REVEAL_STEP, REVEAL_TICKS)
+}
+
+/// How far row `i` of a card opened at `opened` is into its entrance,
+/// 0.0 → 1.0 — the one clock behind every card that arrives row by row.
+fn staggered_reveal(opened: Option<u64>, tick: u64, i: usize, step: f64, ticks: f64) -> f64 {
+    let Some(opened) = opened else {
+        return 1.0;
+    };
+    let since = tick.saturating_sub(opened) as f64;
+    let delay = i as f64 * step;
+    ((since - delay) / ticks).clamp(0.0, 1.0)
+}
+
+/// Whether the card still has rows arriving — the redraw loop's question.
+pub fn services_revealing(state: &AppState) -> bool {
+    state.show_services && reveal_at(state, state.services.len()) < 1.0
+}
+
+/// The help card's entrance: the same sweep as the services card's, at a
+/// brisker step — a reference has several dozen rows where the services card
+/// has eight, and the same pace would hold the bottom half hostage.
+const HELP_REVEAL_STEP: f64 = 0.25;
+const HELP_REVEAL_TICKS: f64 = 3.0;
+
+/// A generous ceiling on how long that entrance can run, in ticks — the
+/// redraw loop's question, answered without measuring the card's content.
+const HELP_REVEAL_HORIZON: u64 = 25;
+
+fn help_reveal_at(state: &AppState, i: usize) -> f64 {
+    staggered_reveal(
+        state.help_opened_tick,
+        state.tick_count,
+        i,
+        HELP_REVEAL_STEP,
+        HELP_REVEAL_TICKS,
+    )
+}
+
+/// Whether the help card is still mid-entrance.
+pub fn help_revealing(state: &AppState) -> bool {
+    state.show_help
+        && state
+            .help_opened_tick
+            .is_some_and(|o| state.tick_count.saturating_sub(o) < HELP_REVEAL_HORIZON)
+}
+
+/// The dashboard's entrance: the same sweep the cards play, on the view you
+/// actually land on. A step between the services card's and the help card's —
+/// a dashboard is a handful of rows on most screens but forty on a wall
+/// monitor, and a pace that reads as one movement down eight rows would leave
+/// the bottom of a long list arriving well after the eye got there.
+const DASH_REVEAL_STEP: f64 = 0.35;
+const DASH_REVEAL_TICKS: f64 = 3.0;
+
+/// How far screen line `i` of the table is into that entrance, 0.0 → 1.0.
+///
+/// Indexed by line on screen rather than by repo: the sweep is "the table
+/// arrives from the top", so a scrolled list still fills from its first
+/// visible row instead of starting part-way through its own animation.
+fn dash_reveal_at(state: &AppState, i: usize) -> f64 {
+    staggered_reveal(
+        state.dash_opened_tick,
+        state.tick_count,
+        i,
+        DASH_REVEAL_STEP,
+        DASH_REVEAL_TICKS,
+    )
+}
+
+/// Lines the table's header occupies: the labels, plus the blank one its
+/// `bottom_margin` puts between them and the first repo.
+const HEADER_LINES: u16 = 2;
+
+/// Whether the dashboard still has rows arriving — the redraw loop's question.
+///
+/// Bounded by the repo count plus the header and a few owner headings, so a
+/// long list keeps the loop at full rate exactly as long as its own sweep runs.
+pub fn dash_revealing(state: &AppState) -> bool {
+    state.view == View::Repos && dash_reveal_at(state, state.repos.len() + 4) < 1.0
+}
+
+/// How long the footer's `? help` beacon breathes after startup: ten seconds
+/// at the 100ms tick, or until help is opened, whichever comes first.
+pub(super) const HELP_BEACON_TICKS: u64 = 100;
+
+/// The chip colour for an environment's name.
+///
+/// Environments are read at a glance or not at all, and the glance is the
+/// colour: green is the one you don't touch, amber the one you do. Names
+/// nobody has a convention for still get a chip — an unlabelled section reads
+/// as a rendering failure, not as "no environment".
+fn env_color(label: &str, theme: &Theme) -> Color {
+    let lower = label.trim().to_ascii_lowercase();
+    let head = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .find(|w| !w.is_empty())
+        .unwrap_or("");
+    if head.starts_with("prod") || head == "prd" || head == "live" {
+        theme.success
+    } else if head.starts_with("stag") || head == "stg" || head.starts_with("pre") {
+        theme.warning
+    } else if head.starts_with("dev") || head == "local" {
+        theme.info
+    } else if head.starts_with("test") || head == "qa" || head.starts_with("sandbox") {
+        theme.primary
+    } else if head.is_empty() || head == "untagged" {
+        theme.unknown
+    } else {
+        theme.accent
+    }
+}
+
+/// A chip's own two colours: the fill, deepened until label text can sit on
+/// it, and the ink that reads against that fill.
+///
+/// The palette's `success` is a pastel meant for glyphs on a dark panel; used
+/// flat as a background it would wash out anything written over it.
+fn chip_colors(base: Color) -> (Color, Color) {
+    let fill = mix(base, Color::Rgb(0, 0, 0), 0.28);
+    let ink = match fill {
+        // Rec. 601 luma — green carries most of the perceived brightness, so
+        // a plain channel average picks the wrong ink on amber.
+        Color::Rgb(r, g, b) => {
+            let luma = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+            if luma > 150.0 { Color::Black } else { Color::White }
+        }
+        // 256-colour terminals never got the darkening (an indexed colour has
+        // no arithmetic), so the fill is still the pastel: dark ink on it.
+        _ => Color::Black,
+    };
+    (fill, ink)
+}
+
+/// One environment heading, drawn as a filled chip.
+///
+/// The half-blocks are the rounded ends: `▐` fills the right half of its cell
+/// and `▌` the left half of its own, so the fill runs off into a soft cap at
+/// each end instead of a hard rectangle. Block Elements, not Powerline — the
+/// shape survives a terminal without a patched font.
+fn env_chip(label: &str, p: f64, theme: &Theme) -> Vec<Span<'static>> {
+    let (fill, ink) = chip_colors(env_color(label, theme));
+    // Chips fade up out of the card the way their rows do, a step ahead of
+    // the first of them.
+    let fill = mix(theme.surface_alt, fill, p);
+    let ink = mix(fill, ink, p);
+    vec![
+        Span::styled("▐", Style::default().fg(fill)),
+        Span::styled(
+            format!(" {label} "),
+            Style::default().bg(fill).fg(ink).bold(),
+        ),
+        Span::styled("▌", Style::default().fg(fill)),
+    ]
+}
+
 /// Every monitor by name — the card behind the header's heart.
 ///
 /// The tally can only count and the Live column only decorates mapped rows;
@@ -85,7 +267,7 @@ fn render_services_overlay(f: &mut Frame, area: Rect, state: &AppState) {
             .unwrap_or(4);
         // What divides the card into sections, best evidence first: the status
         // page's own groups when it has more than one; failing that, the
-        // monitors' first tags — five rows each wearing the same #Prod chip
+        // monitors' first tags — five rows each wearing the same Prod chip
         // are a group that hasn't been drawn yet. One lone group under a card
         // already titled "Services" would just say the same word twice.
         let distinct_groups: std::collections::HashSet<&str> =
@@ -113,76 +295,79 @@ fn render_services_overlay(f: &mut Frame, area: Rect, state: &AppState) {
         }
 
         let mut out: Vec<Line> = Vec::new();
+        // Counted across sections, not within one: the reveal is a single
+        // sweep down the card, and a per-section counter would restart it at
+        // every heading.
+        let mut row = 0usize;
         for (i, (section, members)) in sections.iter().enumerate() {
             if sections.len() > 1 {
                 if i > 0 {
                     out.push(Line::from(""));
                 }
                 let label = if section.is_empty() { "untagged" } else { section };
-                out.push(Line::from(vec![
-                    Span::styled(format!(" {label}"), Style::default().fg(theme.text_faint)),
-                    Span::styled(" ╌╌╌", Style::default().fg(theme.border_dim)),
-                ]));
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(env_chip(label, reveal_at(state, row), theme));
+                out.push(Line::from(spans));
             }
             for s in members {
-            out.push({
-                use crate::kuma::ServiceState;
-                let (glyph, style, word) = match s.state {
-                    ServiceState::Up => ("●", Style::default().fg(theme.success), "up"),
-                    ServiceState::Down => (
-                        "✗",
-                        Style::default().fg(theme.failure).bold(),
-                        "down",
-                    ),
-                    ServiceState::Pending => {
-                        ("◌", Style::default().fg(theme.warning), "pending")
+                let p = reveal_at(state, row);
+                row += 1;
+                out.push({
+                    use crate::kuma::ServiceState;
+                    let (glyph, color, word) = match s.state {
+                        ServiceState::Up => ("●", theme.success, "up"),
+                        ServiceState::Down => ("✗", theme.failure, "down"),
+                        ServiceState::Pending => ("◌", theme.warning, "pending"),
+                        ServiceState::Maintenance => ("◒", theme.info, "maintenance"),
+                    };
+                    // The verdict grows into place: a dot out of the card's
+                    // own background, then the mark itself, then its word
+                    // written after it. The name is at full strength from the
+                    // first frame, so the card's shape never jumps.
+                    let mark = if p < 0.45 { "·" } else { glyph };
+                    let shown = (word.len() as f64 * p).ceil() as usize;
+                    let word = &word[..shown.min(word.len())];
+                    let mut style = Style::default().fg(mix(theme.surface_alt, color, p));
+                    if s.state == ServiceState::Down {
+                        style = style.bold();
                     }
-                    ServiceState::Maintenance => {
-                        ("◒", Style::default().fg(theme.info), "maintenance")
+                    let fade = |c: Color| Style::default().fg(mix(theme.surface_alt, c, p));
+                    let mut spans = vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("{:<name_w$}", s.name),
+                            Style::default().fg(theme.text_bright),
+                        ),
+                        // The dot rides with its word: colour and text answer
+                        // the same question in the same place.
+                        Span::styled(format!("  {mark} {word:<12}"), style),
+                        Span::styled(
+                            match s.ping_ms {
+                                Some(p) => format!("{p:>5}ms"),
+                                None => format!("{:>7}", "—"),
+                            },
+                            fade(theme.text),
+                        ),
+                        Span::styled(
+                            match s.uptime24 {
+                                Some(u) => format!("  {:>5.1}% today", u * 100.0),
+                                None => String::new(),
+                            },
+                            fade(theme.text_muted),
+                        ),
+                    ];
+                    // Tags, when the status page publishes them ("Show Tags"
+                    // in Kuma's page settings) — minus the one already serving
+                    // as this section's heading, which a chip would repeat.
+                    for tag in s.tags.iter().filter(|t| *t != section) {
+                        spans.push(Span::styled(format!("  #{tag}"), fade(theme.info)));
                     }
-                };
-                let mut spans = vec![
-                    Span::raw("  "),
-                    Span::styled(
-                        format!("{:<name_w$}", s.name),
-                        Style::default().fg(theme.text_bright),
-                    ),
-                    // The dot rides with its word: colour and text answer the
-                    // same question in the same place.
-                    Span::styled(format!("  {glyph} {word:<12}"), style),
-                    Span::styled(
-                        match s.ping_ms {
-                            Some(p) => format!("{p:>5}ms"),
-                            None => format!("{:>7}", "—"),
-                        },
-                        Style::default().fg(theme.text),
-                    ),
-                    Span::styled(
-                        match s.uptime24 {
-                            Some(u) => format!("  {:>5.1}% today", u * 100.0),
-                            None => String::new(),
-                        },
-                        Style::default().fg(theme.text_muted),
-                    ),
-                ];
-                // Tags, when the status page publishes them ("Show Tags" in
-                // Kuma's page settings) — minus the one already serving as
-                // this section's heading, which a chip would only repeat.
-                for tag in s.tags.iter().filter(|t| *t != section) {
-                    spans.push(Span::styled(
-                        format!("  #{tag}"),
-                        Style::default().fg(theme.info),
-                    ));
-                }
-                // Which dashboard row this monitor decorates, when one does.
-                if let Some(repo) = state.service_repos.get(&s.name) {
-                    spans.push(Span::styled(
-                        format!("  → {repo}"),
-                        Style::default().fg(theme.text_faint),
-                    ));
-                }
-                Line::from(spans)
-            });
+                    // Which dashboard row this monitor decorates, when one does.
+                    if let Some(repo) = state.service_repos.get(&s.name) {
+                        spans.push(Span::styled(format!("  → {repo}"), fade(theme.text_faint)));
+                    }
+                    Line::from(spans)
+                });
             }
         }
         out
@@ -194,7 +379,10 @@ fn render_services_overlay(f: &mut Frame, area: Rect, state: &AppState) {
         .max()
         .unwrap_or(40)
         .clamp(36, area.width.saturating_sub(4));
-    let h = (rows.len() as u16 + 2).min(area.height.saturating_sub(2));
+    // Borders, plus a blank line above the first row and below the last: the
+    // chips are filled shapes, and a chip that touches the frame reads as part
+    // of it rather than as something sitting inside it.
+    let h = (rows.len() as u16 + 4).min(area.height.saturating_sub(2));
     let slot = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -209,6 +397,7 @@ fn render_services_overlay(f: &mut Frame, area: Rect, state: &AppState) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.accent))
+        .padding(Padding::vertical(1))
         .title(Line::from(vec![
             Span::styled("─┤ ", Style::default().fg(theme.accent)),
             Span::styled("♥ Services", Style::default().fg(theme.accent).bold()),
@@ -400,7 +589,35 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     let tally = workspace_tallies(state);
     let dirty = uncommitted_span(state);
     let tail = {
-        let mut t = quota_spans(state);
+        let mut t = Vec::new();
+        // The bell wears the truth about notifications: quietly lit while a
+        // landing run would make noise, slashed with the countdown while
+        // snoozed. Muted is a state worth wearing — a silence that looks like
+        // "nothing failed" is the one lie this header must not tell. No bell
+        // at all when config never announces: a permanently slashed bell
+        // would nag about a choice already made.
+        if state.notify_enabled {
+            if let Some(until) = state.snooze_until.filter(|t| *t > Utc::now()) {
+                let mins = ((until - Utc::now()).num_seconds() + 59) / 60;
+                // An empty off-glyph still says "muted" in words: hiding the
+                // bell is a look, hiding the mute is a trap.
+                let icon = if state.bell_off_icon.is_empty() {
+                    "muted"
+                } else {
+                    state.bell_off_icon.as_str()
+                };
+                t.push(Span::styled(
+                    format!("{icon} {mins}m   "),
+                    Style::default().fg(theme.warning),
+                ));
+            } else if !state.bell_icon.is_empty() {
+                t.push(Span::styled(
+                    format!("{}   ", state.bell_icon),
+                    Style::default().fg(theme.text_faint),
+                ));
+            }
+        }
+        t.extend(quota_spans(state));
         t.extend([
             Span::styled(poll_clock(state), Style::default().fg(theme.text_faint)),
             Span::styled("   ", Style::default()),
@@ -708,8 +925,17 @@ fn uncommitted_span(state: &AppState) -> Vec<Span<'static>> {
 /// The full path is the same forty characters on every screen and answers a
 /// question nobody asks twice; the tail is what says which checkout you are in.
 fn short_path(p: &std::path::Path) -> String {
-    let full = p.display().to_string();
-    let shown = match dirs::home_dir().map(|h| h.display().to_string()) {
+    // Windows displays `\`, but the header always speaks `/` — normalising
+    // here also keeps the home-prefix match and the split below in one idiom.
+    let norm = |s: String| {
+        if cfg!(windows) {
+            s.replace('\\', "/")
+        } else {
+            s
+        }
+    };
+    let full = norm(p.display().to_string());
+    let shown = match dirs::home_dir().map(|h| norm(h.display().to_string())) {
         Some(home) if !home.is_empty() && full.starts_with(&home) => {
             format!("~{}", &full[home.len()..])
         }
@@ -901,6 +1127,7 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             if !state.repo_marks.is_empty() {
                 hints.push((display_key(&km.batch_commit).into(), "commit marked"));
             }
+            hints.push((display_key(&km.refresh).into(), "refresh"));
             hints.push((display_key(&km.finder).into(), "find"));
             // Advertised only while there is something behind it.
             if !state.services.is_empty() {
@@ -988,7 +1215,7 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                 };
                 hints.push((display_key(&km.open_browser).into(), label));
             }
-            hints.push((display_key(&km.git_refresh).into(), "refresh"));
+            hints.push((display_key(&km.refresh).into(), "refresh"));
             hints.push((display_key(&km.back).into(), "back"));
             hints
         }
@@ -1085,14 +1312,37 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
     let mut hints = hints;
     hints.push((display_key(&km.help).into(), "help"));
 
+    // For a new session's first seconds, `? help` breathes in the accent: the
+    // one hint a first run needs, announced without a banner. The breath
+    // shallows as the session ages and retires for good the moment help is
+    // opened — an invitation to a place you have been is just blinking.
+    let beacon = if !state.help_seen && state.tick_count < HELP_BEACON_TICKS {
+        let m = Motion::new(state.tick_count);
+        m.pulse(14) * (1.0 - state.tick_count as f64 / HELP_BEACON_TICKS as f64)
+    } else {
+        0.0
+    };
+
+    let last = hints.len() - 1;
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for (i, (key, desc)) in hints.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("  ", Style::default()));
         }
-        spans.push(Span::styled(key.clone(), Style::default().fg(theme.text_bright).bold()));
+        let (key_style, desc_style) = if i == last && beacon > 0.0 {
+            (
+                Style::default().fg(mix(theme.text_bright, theme.accent, beacon)).bold(),
+                Style::default().fg(mix(theme.text_muted, theme.accent, beacon)),
+            )
+        } else {
+            (
+                Style::default().fg(theme.text_bright).bold(),
+                Style::default().fg(theme.text_muted),
+            )
+        };
+        spans.push(Span::styled(key.clone(), key_style));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(*desc, Style::default().fg(theme.text_muted)));
+        spans.push(Span::styled(*desc, desc_style));
     }
 
     // What a batch commit would take, sitting beside the key that would take it
@@ -1113,7 +1363,12 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
 
     if let Some(msg) = &state.status_msg {
         spans.push(Span::styled("   │   ", Style::default().fg(theme.border)));
-        spans.push(Span::styled(msg.clone(), Style::default().fg(theme.text_bright)));
+        let color = match state.status_kind {
+            StatusKind::Error => theme.failure,
+            StatusKind::Success => theme.success,
+            StatusKind::Info => theme.text_bright,
+        };
+        spans.push(Span::styled(msg.clone(), Style::default().fg(color)));
     }
 
     f.render_widget(
@@ -1289,8 +1544,59 @@ fn format_countdown(secs: i64) -> String {
     }
 }
 
+/// Register the visible rows of a just-drawn table as click targets.
+///
+/// Replicates ratatui's ensure-visible scroll for a `TableState` built fresh
+/// each frame: offset starts at 0 and moves only as far as it must for the
+/// selected row to fit. Uniform `row_h` per table is an invariant of the
+/// call sites, not of ratatui. A table that never scrolls (rendered without
+/// state) passes `selected_row = 0`, which pins the offset to the top.
+fn register_table_hits(
+    state: &AppState,
+    inner: Rect,
+    header_rows: u16,
+    row_h: u16,
+    total_rows: usize,
+    selected_row: usize,
+    hit_for: impl Fn(usize) -> Option<Hit>,
+) {
+    let avail = inner.height.saturating_sub(header_rows);
+    if avail == 0 || row_h == 0 || total_rows == 0 {
+        return;
+    }
+    let visible = ((avail / row_h) as usize).max(1);
+    let offset = (selected_row + 1).saturating_sub(visible);
+    let mut hits = state.hits.borrow_mut();
+    for r in offset..total_rows.min(offset + visible) {
+        let Some(h) = hit_for(r) else { continue };
+        let y = inner.y + header_rows + ((r - offset) as u16) * row_h;
+        hits.push((
+            Rect { x: inner.x, y, width: inner.width, height: row_h },
+            h,
+        ));
+    }
+}
+
 fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
+
+    // On a wide terminal, anything mid-flight earns a live pane down the right
+    // edge: the dashboard stays the view, and the log of the run you most
+    // recently set moving scrolls beside it — the wall-monitor arrangement.
+    let (area, live_pane) = if area.width >= super::DASH_SPLIT_MIN_WIDTH
+        && state.dash_tail_target().is_some()
+    {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(56)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
+    if let Some(pa) = live_pane {
+        render_dash_live(f, pa, state);
+    }
 
     // Anything mid-flight gets its own strip along the bottom. It is given room
     // only when the table can still show a useful number of rows — the list is
@@ -1752,6 +2058,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         widths.push(Constraint::Length(spark_w as u16 + 9));
     }
 
+    let rows_len = rows.len();
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(2)
@@ -1773,6 +2080,120 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
     // or a heading — as soon as there were two owners.
     ts.select(row_of.get(state.repo_cursor).copied());
     f.render_stateful_widget(table, inner, &mut ts);
+
+    // The entrance: the table rises out of the dashboard's own ground one line
+    // at a time, top to bottom — the sweep the help and services cards play,
+    // on the view you actually land on rather than only on the ones you open.
+    //
+    // Done over the drawn buffer rather than over the rows: a built `Row` will
+    // not hand its cells back to be recoloured, and what sweeps here is where a
+    // line sits on screen, not which repo holds it. Only the lines the table
+    // really drew are touched — blending the empty space below the last row
+    // would paint a slab of ground there and then take it away again.
+    if state.dash_opened_tick.is_some() {
+        let body = inner.height.saturating_sub(HEADER_LINES) as usize;
+        let drawn = HEADER_LINES as usize + rows_len.saturating_sub(ts.offset()).min(body);
+        let ground = theme.row_idle;
+        let buf = f.buffer_mut();
+        for line in 0..drawn.min(inner.height as usize) {
+            let p = dash_reveal_at(state, line);
+            if p >= 1.0 {
+                continue;
+            }
+            let y = inner.y + line as u16;
+            for x in inner.x..inner.right() {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    // `Reset` is the terminal's own colour, which cannot be
+                    // blended and would snap to the card's ground — a slab of
+                    // paint appearing under the column heads and then leaving.
+                    // Those cells simply sit the sweep out.
+                    if cell.fg != Color::Reset {
+                        cell.fg = mix(ground, cell.fg, p);
+                    }
+                    if cell.bg != Color::Reset {
+                        cell.bg = mix(ground, cell.bg, p);
+                    }
+                }
+            }
+        }
+    }
+
+    // Click targets, through the same heading-aware map. Headings themselves
+    // register nothing — there is nothing selecting one could mean.
+    let total_rows = rows_len;
+    let mut repo_of_row: Vec<Option<usize>> = vec![None; total_rows];
+    for (repo, &row) in row_of.iter().enumerate() {
+        repo_of_row[row] = Some(repo);
+    }
+    register_table_hits(
+        state,
+        inner,
+        2,
+        1,
+        total_rows,
+        row_of.get(state.repo_cursor).copied().unwrap_or(0),
+        |r| repo_of_row.get(r).copied().flatten().map(Hit::Repo),
+    );
+}
+
+/// The dashboard's live pane: which run is being followed, where it stands,
+/// and the tail of its running job's log — the Watch view's pane, moved to
+/// where the eye already is when several repos are being minded at once.
+fn render_dash_live(f: &mut Frame, area: Rect, state: &AppState) {
+    let theme = &state.theme;
+    let Some((spec, detail, job)) = state.dash_tail_target() else {
+        return;
+    };
+    let blk = styled_block(&format!("Live — {spec}"), theme);
+    let inner = blk.inner(area);
+    f.render_widget(blk, area);
+    if inner.height < 4 {
+        return;
+    }
+
+    let step = detail.current_step().unwrap_or("—");
+    let head = vec![
+        Line::from(vec![
+            Span::styled(
+                animated_glyph(detail.run.status, state.tick_count),
+                style_for_status(detail.run.status, theme),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                detail.run.display_title.clone(),
+                Style::default().fg(theme.text_bright).bold(),
+            ),
+            Span::styled(
+                format!("  ({})", detail.run.head_branch),
+                Style::default().fg(theme.text_muted),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("step ", Style::default().fg(theme.text_faint)),
+            Span::styled(step.to_string(), Style::default().fg(theme.text)),
+            Span::styled(
+                format!("  ·  {}", format_elapsed(elapsed_seconds(&detail.run))),
+                Style::default().fg(theme.text_muted),
+            ),
+        ]),
+        Line::default(),
+    ];
+    let tail_rows = inner.height.saturating_sub(head.len() as u16) as usize;
+    let mut lines = head;
+    match &state.watch_tail {
+        Some(t) if t.job_id == job.id && !t.lines.is_empty() => {
+            // The tail follows the newest lines by definition; history is what
+            // entering the run is for.
+            lines.extend(t.lines.iter().rev().take(tail_rows).rev().map(|l| {
+                Line::from(ansi_line_to_spans(l, Style::default().fg(theme.text)))
+            }));
+        }
+        _ => lines.push(Line::from(Span::styled(
+            "waiting for GitHub to serve the log…",
+            Style::default().fg(theme.text_muted).italic(),
+        ))),
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The finished background for one dashboard row: its status tint, banded so
@@ -2388,10 +2809,13 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
                 ("↵".into(), "open / drill in"),
                 (k(&km.back), "back one view"),
                 (k(&km.finder), "fuzzy find in the current list"),
+                (k(&km.refresh), "re-fetch whatever this screen shows"),
                 (k(&km.repos_view), "multi-repo dashboard"),
                 (k(&km.services), "service health, by monitor name"),
+                (k(&km.snooze), "snooze notifications — 30m, 60m, off"),
                 (k(&km.open_browser), "open in browser"),
                 (k(&km.yank), "copy the selection to the clipboard"),
+                ("click".into(), "select a row — again to open; wheel scrolls"),
                 (k(&km.help), "this help"),
                 (k(&km.quit), "quit"),
             ],
@@ -2431,7 +2855,6 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
                 (k(&km.git_push), "push — sets upstream on first push"),
                 (k(&km.trigger), "open this repo's workflows to run CI"),
                 (k(&km.open_browser), "open the branch's PR — or the page that creates one"),
-                (k(&km.git_refresh), "re-read the working tree"),
                 (format!("{}/↵", k(&km.git_diff)), "diff the selected file"),
                 (
                     pair(&km.down, &km.up),
@@ -2445,12 +2868,12 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
         (
             "Diff — file changes",
             vec![
+                ("layout".into(), "side by side — unified when the terminal is narrow"),
                 (pair(&km.down, &km.up), "scroll"),
                 (pair(&km.page_down, &km.page_up), "page"),
                 (pair(&km.scroll_top, &km.scroll_bottom), "top / bottom"),
                 (pair(&km.next_step, &km.prev_step), "next / previous changed file"),
                 (k(&km.git_stage), "stage / unstage this file"),
-                (k(&km.git_refresh), "re-read the diff"),
                 (k(&km.back), "back to the file list"),
             ],
         ),
@@ -2602,9 +3025,11 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
         out.push(Line::from(header));
         for (key, desc) in rows {
             // The binding drawn as a key cap; the current section's caps pick
-            // up the accent so the eye finds its keys first.
+            // up the accent so the eye finds its keys first. Cut from the
+            // darker overlay tone, now that the card itself stands on
+            // `surface_alt` — a cap the colour of its card is no cap at all.
             let cap_style = Style::default()
-                .bg(theme.surface_alt)
+                .bg(theme.overlay)
                 .fg(if is_current { theme.accent } else { theme.text_bright })
                 .bold();
             for (i, seg) in wrap_words(desc, desc_w).into_iter().enumerate() {
@@ -2658,18 +3083,22 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     }
 
     let content_h = left.len().max(right.len()) as u16;
-    let dialog_h = (content_h + 2).min(area.height.saturating_sub(2)).max(8);
+    // + 2 borders + 2 rows of breathing room, like the services card: caps
+    // touching the frame read as part of it rather than as keys on a card.
+    let dialog_h = (content_h + 4).min(area.height.saturating_sub(2)).max(8);
     let x = area.x + area.width.saturating_sub(dialog_w) / 2;
     let y = area.y + area.height.saturating_sub(dialog_h) / 2;
     let popup = Rect { x, y, width: dialog_w, height: dialog_h };
 
-    let inner_h = dialog_h.saturating_sub(2);
+    let inner_h = dialog_h.saturating_sub(4);
     let max_scroll = content_h.saturating_sub(inner_h);
+    // What the scroll keys and the wheel clamp against.
+    state.last_help_max_scroll.set(max_scroll);
     let scroll = state.help_scroll.min(max_scroll);
 
     let footer = if max_scroll > 0 {
         format!(
-            " {}/{} scroll · {}–{} of {} · any other key closes ",
+            " {}/{} or wheel scroll · {}–{} of {} · any other key closes ",
             display_key(&state.keymap.down),
             display_key(&state.keymap.up),
             scroll + 1,
@@ -2680,18 +3109,59 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
         " any key closes ".to_string()
     };
 
+    // The same dress as the services card: a chip cut into an accent frame,
+    // floating on its own solid ground — Clear alone leaves default cells,
+    // which a translucent terminal renders as wallpaper behind the text.
     let block = Block::default()
-        .title(Span::styled(
-            format!(" jog v{} — keys ", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(theme.accent).bold(),
-        ))
+        .title(Line::from(vec![
+            Span::styled("─┤ ", Style::default().fg(theme.accent)),
+            Span::styled(
+                format!("? Help — jog v{}", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(theme.accent).bold(),
+            ),
+            Span::styled(" ├", Style::default().fg(theme.accent)),
+        ]))
         .title_alignment(ratatui::layout::Alignment::Center)
         .title_bottom(
             Line::from(Span::styled(footer, Style::default().fg(theme.text_faint))).centered(),
         )
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.accent));
+        .border_style(Style::default().fg(theme.accent))
+        .padding(Padding::vertical(1))
+        .style(Style::default().bg(theme.surface_alt));
+
+    // The entrance: rows rise out of the card's own ground in one sweep down
+    // the card, both columns abreast — colour and cap backgrounds arrive
+    // together, so the card's shape never jumps. Indexed by content row, not
+    // screen row: rows scrolled into view mid-entrance simply join the sweep.
+    let ground = theme.surface_alt;
+    let fade_rows = |rows: Vec<Line<'static>>| -> Vec<Line<'static>> {
+        rows.into_iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let p = help_reveal_at(state, i);
+                if p >= 1.0 {
+                    return line;
+                }
+                let spans: Vec<Span<'static>> = line
+                    .spans
+                    .into_iter()
+                    .map(|mut s| {
+                        if let Some(fg) = s.style.fg {
+                            s.style.fg = Some(mix(ground, fg, p));
+                        }
+                        if let Some(bg) = s.style.bg {
+                            s.style.bg = Some(mix(ground, bg, p));
+                        }
+                        s
+                    })
+                    .collect();
+                Line::from(spans)
+            })
+            .collect()
+    };
+    let (left, right) = (fade_rows(left), fade_rows(right));
 
     let inner = block.inner(popup);
     f.render_widget(Clear, popup);
@@ -2927,6 +3397,15 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
     let mut ts = TableState::default();
     ts.select(Some(gv.cursor));
     f.render_stateful_widget(table, chunks[1], &mut ts);
+    register_table_hits(
+        state,
+        chunks[1],
+        2,
+        1,
+        gv.entries().len(),
+        gv.cursor,
+        |r| Some(Hit::GitEntry(r)),
+    );
 }
 
 /// One dashboard row's note that this repo has a commit or push in it.
@@ -3341,7 +3820,149 @@ fn diff_line_style(text: &str, theme: &Theme) -> Style {
     }
 }
 
+/// The narrowest a column of diff text can be and still be worth reading. Below
+/// it the two columns are giving each other's width away to gutters and a rule,
+/// and one wide column of unified diff says more.
+const DIFF_SIDE_MIN: usize = 22;
+
+/// Where the two columns fall inside `width`: the line-number gutter each side
+/// gets, and the text width each side gets. `None` when the terminal cannot
+/// spare them — the unified layout is the honest answer on a narrow screen
+/// rather than two columns of ellipses.
+fn diff_columns(width: usize, rows: &[DiffRow]) -> Option<(usize, usize, usize)> {
+    let widest = rows
+        .iter()
+        .filter_map(|r| match r {
+            DiffRow::Pair { old, new } => Some(
+                old.as_ref()
+                    .and_then(|s| s.num)
+                    .max(new.as_ref().and_then(|s| s.num))
+                    .unwrap_or(0),
+            ),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    // Room for the number itself, never less than two columns so the gutter
+    // does not visibly shift as a diff scrolls from line 9 to line 10.
+    let gutter = widest.to_string().len().clamp(2, 6);
+    // Two gutters, a space after each, and the rule between the columns.
+    let text = width.checked_sub(2 * (gutter + 1) + DIFF_RULE.len())?;
+    // An odd column of width goes to the new side rather than being left
+    // unpainted at the edge: it is the half being read.
+    let (left, right) = (text / 2, text - text / 2);
+    (left >= DIFF_SIDE_MIN).then_some((gutter, left, right))
+}
+
+/// The rule between the two columns.
+const DIFF_RULE: &str = " │ ";
+
+/// One side-by-side row as a drawn line.
+fn diff_row_line(row: &DiffRow, gutter: usize, left: usize, right: usize, theme: &Theme) -> Line<'static> {
+    let width = 2 * (gutter + 1) + DIFF_RULE.len() + left + right;
+    match row {
+        DiffRow::Section(label) => Line::from(Span::styled(
+            truncate(&format!("── {label} "), width),
+            Style::default().fg(theme.accent).bold(),
+        )),
+        DiffRow::Meta(t) => Line::from(Span::styled(
+            truncate(t, width),
+            diff_line_style(t, theme),
+        )),
+        DiffRow::Pair { old, new } => {
+            // Tinted grounds rather than coloured text alone: in two columns
+            // the question is which *side* changed, and a block of colour
+            // answers it from the corner of the eye. The gap opposite an added
+            // or removed line is a third ground — nothing was there.
+            let removed = mix(theme.surface, theme.failure, 0.16);
+            let added = mix(theme.surface, theme.success, 0.16);
+            let gap = mix(theme.surface, theme.overlay, 0.5);
+
+            let cell = |s: Option<&DiffSide>, side: usize, changed_bg: Color| -> Vec<Span<'static>> {
+                let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+                let Some(s) = s else {
+                    // No line here at all: gutter and text are one flat gap.
+                    spans.push(Span::styled(
+                        " ".repeat(gutter + 1 + side),
+                        Style::default().bg(gap),
+                    ));
+                    return spans;
+                };
+                let bg = if s.changed { changed_bg } else { theme.surface };
+                let fg = if s.changed {
+                    if changed_bg == removed { theme.failure } else { theme.success }
+                } else {
+                    theme.text
+                };
+                let num = match s.num {
+                    Some(n) => format!("{n:>gutter$} "),
+                    None => " ".repeat(gutter + 1),
+                };
+                spans.push(Span::styled(
+                    num,
+                    Style::default().fg(theme.text_ghost).bg(bg),
+                ));
+                let text = truncate(&s.text, side);
+                let pad = " ".repeat(side.saturating_sub(disp_width(&text)));
+                let style = Style::default().fg(fg).bg(bg);
+                // The span git's diff-highlight would reverse — only while the
+                // line is whole, since a truncated line's byte offsets no
+                // longer point at what they were measured against.
+                match s.emph.filter(|(_, e)| *e <= text.len() && text == s.text) {
+                    Some((a, b)) => {
+                        spans.push(Span::styled(text[..a].to_string(), style));
+                        spans.push(Span::styled(
+                            text[a..b].to_string(),
+                            style.add_modifier(Modifier::REVERSED),
+                        ));
+                        spans.push(Span::styled(text[b..].to_string(), style));
+                    }
+                    None => spans.push(Span::styled(text, style)),
+                }
+                spans.push(Span::styled(pad, style));
+                spans
+            };
+            let mut spans = cell(old.as_ref(), left, removed);
+            spans.push(Span::styled(
+                DIFF_RULE,
+                Style::default().fg(theme.border_dim),
+            ));
+            spans.extend(cell(new.as_ref(), right, added));
+            Line::from(spans)
+        }
+    }
+}
+
+/// One unified diff line as a drawn line — the narrow-terminal layout.
+fn diff_unified_line(l: &DiffLine, emph: Option<ByteSpan>, theme: &Theme) -> Line<'static> {
+    match l {
+        DiffLine::Section(label) => Line::from(Span::styled(
+            format!("── {label} "),
+            Style::default().fg(theme.accent).bold(),
+        )),
+        DiffLine::Text(t) => {
+            let style = diff_line_style(t, theme);
+            // The line colour says added/removed; on a paired ±line the
+            // reverse-video span says *where* — the same scheme as git's
+            // own diff-highlight, so it needs no theme colour of its own.
+            match emph {
+                Some((s, e)) if e <= t.len() => Line::from(vec![
+                    Span::styled(t[..s].to_string(), style),
+                    Span::styled(t[s..e].to_string(), style.add_modifier(Modifier::REVERSED)),
+                    Span::styled(t[e..].to_string(), style),
+                ]),
+                _ => Line::from(Span::styled(t.clone(), style)),
+            }
+        }
+    }
+}
+
 /// The diff for one file from the working-tree view.
+///
+/// Side by side wherever the terminal can hold two columns: a diff is a
+/// comparison, and reading one as a single column asks you to hold the old
+/// line in your head while you scroll to the new one. The unified layout is
+/// kept for terminals too narrow to split.
 fn render_git_diff(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     // Inner area = area minus the rounded border (1 row/col on each side).
@@ -3364,13 +3985,6 @@ fn render_git_diff(f: &mut Frame, area: Rect, state: &AppState) {
         title.push_str(&format!("+{add} −{del}"));
     }
 
-    // Position, so a long diff says how much of it is off-screen.
-    let total = dv.lines.len();
-    if total > viewport as usize {
-        let last = (dv.scroll + viewport as usize).min(total);
-        title.push_str(&format!("   [{}–{} of {}]", dv.scroll + 1, last, total));
-    }
-
     if dv.lines.is_empty() {
         let msg = if dv.loading {
             "reading diff…"
@@ -3379,6 +3993,7 @@ fn render_git_diff(f: &mut Frame, area: Rect, state: &AppState) {
             // textual diff at all — say so rather than showing a blank pane.
             "no textual changes (mode change, rename, or an empty file)"
         };
+        dv.units.set(0);
         f.render_widget(
             Paragraph::new(Span::styled(msg, Style::default().fg(theme.text_faint).italic()))
                 .block(styled_block(&title, theme)),
@@ -3387,22 +4002,40 @@ fn render_git_diff(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let split = diff_columns(inner_w, &dv.rows);
+
+    // What the scroll offset counts, and what "how much is off-screen" means:
+    // rows when there are two columns, lines when there is one. Handed back to
+    // the key handler so paging stops where the eye does.
+    let total = match split {
+        Some(_) => dv.rows.len(),
+        None => dv.lines.len(),
+    };
+    dv.units.set(total);
+
+    // Position, so a long diff says how much of it is off-screen.
+    let scroll = dv.scroll.min(total.saturating_sub(1));
+    if total > viewport as usize {
+        let last = (scroll + viewport as usize).min(total);
+        title.push_str(&format!("   [{}–{} of {}]", scroll + 1, last, total));
+    }
+
     // Slicing to the viewport keeps the per-frame clone bounded rather than
     // copying a 10k-line diff on every redraw.
-    let first = dv.scroll.min(total);
-    let lines: Vec<Line> = dv.lines[first..]
-        .iter()
-        .take(viewport as usize)
-        .map(|l| match l {
-            crate::app::state::DiffLine::Section(label) => Line::from(Span::styled(
-                format!("── {label} "),
-                Style::default().fg(theme.accent).bold(),
-            )),
-            crate::app::state::DiffLine::Text(t) => {
-                Line::from(Span::styled(t.clone(), diff_line_style(t, theme)))
-            }
-        })
-        .collect();
+    let lines: Vec<Line> = match split {
+        Some((gutter, left, right)) => dv.rows[scroll..]
+            .iter()
+            .take(viewport as usize)
+            .map(|r| diff_row_line(r, gutter, left, right, theme))
+            .collect(),
+        None => dv.lines[scroll..]
+            .iter()
+            .take(viewport as usize)
+            .enumerate()
+            .map(|(i, l)| diff_unified_line(l, dv.emphasis.get(scroll + i).copied().flatten(), theme))
+            .collect(),
+    };
 
     // Deliberately not wrapped: a wrapped hunk reflows every line below it, so
     // a long line would push the rest of the diff out of alignment with the
@@ -3765,6 +4398,15 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
     }
     ts.select(Some(state.workflow_cursor));
     f.render_stateful_widget(table, inner, &mut ts);
+    register_table_hits(
+        state,
+        inner,
+        2,
+        1,
+        state.workflows.len(),
+        state.workflow_cursor,
+        |r| Some(Hit::Workflow(r)),
+    );
 }
 
 fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
@@ -3995,6 +4637,10 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
     }
     ts.select(Some(state.run_cursor));
     f.render_stateful_widget(table, inner, &mut ts);
+    // Runs rows are two lines tall (branch over commit message).
+    register_table_hits(state, inner, 2, 2, state.runs.len(), state.run_cursor, |r| {
+        Some(Hit::Run(r))
+    });
 }
 
 fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
@@ -4161,10 +4807,54 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
     let inner = blk.inner(area);
     f.render_widget(blk, area);
 
+    // The failure digest: the part of the log worth reading, above the step
+    // list rather than behind it. Only for the run on screen, only while it is
+    // red, and only when showing it still leaves the steps a useful share.
+    let digest = state
+        .failure_digest
+        .as_ref()
+        .filter(|d| d.run_id == detail.run.id && detail.run.status.is_failure());
+    let digest_h = digest
+        .map(|d| d.lines.len() as u16 + 2)
+        .filter(|h| inner.height >= h + 8)
+        .unwrap_or(0);
+
     let inner_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(digest_h),
+            Constraint::Min(0),
+        ])
         .split(inner);
+
+    if let (Some(d), true) = (digest, digest_h > 0) {
+        let what = d.step_name.as_deref().unwrap_or(d.job_name.as_str());
+        let dblk = Block::default()
+            .title(Span::styled(
+                format!(" why it failed — {} ", truncate(what, 48)),
+                Style::default().fg(theme.failure).bold(),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.failure_dim));
+        let dinner = dblk.inner(inner_chunks[1]);
+        f.render_widget(dblk, inner_chunks[1]);
+        let lines: Vec<Line> = d
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let base = if d.error_rows.contains(&i) {
+                    Style::default().fg(theme.failure).bold()
+                } else {
+                    Style::default().fg(theme.text_muted)
+                };
+                Line::from(ansi_line_to_spans(l, base))
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), dinner);
+    }
 
     let total_jobs = detail.jobs.len();
     let failed_jobs = detail.jobs.iter().filter(|j| j.status == Status::Failure).count();
@@ -4191,7 +4881,12 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
         Constraint::Fill(1),     // historical badge
     ])
     .column_spacing(1);
-    f.render_widget(table, inner_chunks[1]);
+    f.render_widget(table, inner_chunks[2]);
+    // This table never scrolls (drawn stateless from row 0), so the click map
+    // is pinned to the top with `selected_row = 0`.
+    register_table_hits(state, inner_chunks[2], 0, 1, items.len(), 0, |r| {
+        Some(Hit::DetailItem(r))
+    });
 }
 
 fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
@@ -5014,6 +5709,253 @@ mod tests {
     }
 
     #[test]
+    fn the_help_card_plays_an_entrance_then_settles() {
+        let mut st = noisy_log_state(false);
+        st.show_help = true;
+        st.help_opened_tick = Some(100);
+        st.tick_count = 100;
+        assert!(help_revealing(&st));
+        assert_eq!(help_reveal_at(&st, 0), 0.0, "nothing has arrived yet");
+        st.tick_count = 103;
+        assert_eq!(help_reveal_at(&st, 0), 1.0, "the first row has landed");
+        assert!(help_reveal_at(&st, 20) < 1.0, "later rows are still arriving");
+        st.tick_count = 100 + HELP_REVEAL_HORIZON;
+        assert!(!help_revealing(&st), "the entrance ends");
+        // Without an opening tick (a redraw, a test), the card is simply
+        // settled rather than frozen on its first frame.
+        st.help_opened_tick = None;
+        assert_eq!(help_reveal_at(&st, 30), 1.0);
+    }
+
+    fn diff_state(text: &str) -> AppState {
+        let mut st = noisy_log_state(false);
+        let mut dv = crate::app::state::GitDiffView::new("acme/api".into(), "src/api.rs".into());
+        dv.set_sections(vec![crate::git::DiffSection { label: "unstaged", text: text.into() }]);
+        st.git_diff = Some(dv);
+        st.view = View::GitDiff;
+        st
+    }
+
+    fn draw_diff(st: &AppState, w: u16, h: u16) -> String {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_git_diff(f, f.area(), st)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The hunk used by the diff tests: one line replaced, one added, context
+    /// either side.
+    const HUNK: &str = "@@ -12,7 +12,8 @@ fn main() {\n     let cfg = Config::load()?;\n-    let x = 1;\n+    let x = 2;\n+    log::info!(\"done\");\n     Ok(())\n";
+
+    #[test]
+    fn a_diff_reads_across_rather_than_down() {
+        let st = diff_state(HUNK);
+        let out = draw_diff(&st, 100, 12);
+        // Without the pane's own left border, so the first `│` left in the row
+        // is the rule between the two columns.
+        let row = out
+            .lines()
+            .find(|l| l.contains("let x = 1;"))
+            .unwrap_or_else(|| panic!("no row for the old line:\n{out}"))
+            .trim_start_matches('│');
+        // The whole point: the line that was and the line that is are the same
+        // row, so the comparison is a glance sideways and not a memory test.
+        assert!(row.contains("let x = 2;"), "got {row:?}");
+        // Each side numbered in its own file: line 13 became line 13.
+        assert!(row.starts_with("13 "), "no old line number: {row:?}");
+        assert!(row.contains("│ 13 "), "no new line number: {row:?}");
+
+        // A line with no counterpart leaves the other side empty rather than
+        // shifting everything below it out of step.
+        let added = out
+            .lines()
+            .find(|l| l.contains("log::info!"))
+            .unwrap()
+            .trim_start_matches('│');
+        let (before, _) = added.split_once('│').unwrap();
+        assert_eq!(before.trim(), "", "the gap opposite an addition was filled");
+
+        // Context is carried by both sides, so the eye never loses the file.
+        assert!(out.lines().any(|l| l.matches("Ok(())").count() == 2), "{out}");
+    }
+
+    #[test]
+    fn the_word_that_changed_is_still_marked_inside_the_pair() {
+        // Its own hunk: emphasis is only claimed for runs that pair up one for
+        // one, and the shared one adds a line as well as changing one.
+        let st = diff_state("@@ -13 +13 @@\n-    let x = 1;\n+    let x = 2;\n");
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+        term.draw(|f| render_git_diff(f, f.area(), &st)).unwrap();
+        let buf = term.backend().buffer().clone();
+        // The only difference between the two lines is the digit, so exactly
+        // the digits should be reversed — one on each side of the rule.
+        let reversed: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].modifier.contains(Modifier::REVERSED))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert_eq!(reversed, "12", "got {reversed:?}");
+    }
+
+    #[test]
+    fn a_terminal_too_narrow_to_split_gets_the_unified_diff() {
+        let st = diff_state(HUNK);
+        let out = draw_diff(&st, 44, 12);
+        // No rule down the middle, and the markers that carried the meaning in
+        // one column are back.
+        assert!(!out.contains(" │ "), "still split at 44 columns:\n{out}");
+        assert!(out.contains("-    let x = 1;"), "{out}");
+        assert!(out.contains("+    let x = 2;"), "{out}");
+    }
+
+    #[test]
+    fn the_scroll_counts_what_the_layout_actually_drew() {
+        let st = diff_state(HUNK);
+        let dv = st.git_diff.as_ref().unwrap();
+        // Six unified lines fold into five rows — the ± pair is one row.
+        assert_eq!(dv.lines.len(), 6);
+        assert_eq!(dv.rows.len(), 5);
+
+        draw_diff(&st, 100, 12);
+        assert_eq!(dv.units.get(), 5, "split: the offset counts rows");
+        assert_eq!(dv.max_scroll(3), 2);
+
+        draw_diff(&st, 44, 12);
+        assert_eq!(dv.units.get(), 6, "unified: it counts lines again");
+        assert_eq!(dv.max_scroll(3), 3);
+    }
+
+    #[test]
+    fn the_dashboard_arrives_from_the_top_and_then_settles() {
+        let mut st = noisy_log_state(false);
+        st.view = View::Repos;
+        st.tick_count = 100;
+        st.dash_opened_tick = Some(100);
+        assert!(dash_revealing(&st));
+        assert_eq!(dash_reveal_at(&st, 0), 0.0, "nothing has arrived yet");
+        st.tick_count = 103;
+        assert_eq!(dash_reveal_at(&st, 0), 1.0, "the first line has landed");
+        assert!(dash_reveal_at(&st, 20) < 1.0, "later lines are still arriving");
+        st.tick_count = 200;
+        assert!(!dash_revealing(&st), "the entrance ends");
+        // A dashboard on screen without the clock having been started (a test,
+        // a direct `view = Repos`) is settled rather than frozen dark.
+        st.dash_opened_tick = None;
+        assert_eq!(dash_reveal_at(&st, 30), 1.0);
+    }
+
+    #[test]
+    fn the_dashboards_first_frame_is_ground_and_its_empty_space_is_left_alone() {
+        let mut st = noisy_log_state(false);
+        for spec in ["acme/api", "acme/web"] {
+            let mut card = crate::app::state::RepoCard::new(spec.into());
+            card.path = Some(std::path::PathBuf::from("/tmp").join(spec));
+            card.git = Some(crate::git::parse_status("## main\0"));
+            card.loaded = true;
+            st.repos.push(card);
+        }
+        st.view = View::Repos;
+        st.tick_count = 100;
+        st.dash_opened_tick = Some(100);
+
+        let draw = |st: &AppState| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 12)).unwrap();
+            term.draw(|f| render_repos(f, f.area(), st)).unwrap();
+            term.backend().buffer().clone()
+        };
+        let row_of = |buf: &ratatui::buffer::Buffer, needle: &str| -> u16 {
+            (0..buf.area.height)
+                .find(|&y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .unwrap_or_else(|| panic!("no row for {needle}"))
+        };
+
+        // Frame one: the rows are on screen but painted in the dashboard's own
+        // ground, so the table reads as empty and then fills in.
+        let buf = draw(&st);
+        let y = row_of(&buf, "acme/api");
+        let name_x = (0..buf.area.width)
+            .find(|&x| buf[(x, y)].symbol() == "a")
+            .unwrap();
+        assert_eq!(buf[(name_x, y)].fg, st.theme.row_idle, "the name has not arrived");
+        // The space under the last row belongs to the terminal, not to the
+        // sweep: blending it would flash a slab of ground and take it away.
+        let below = buf.area.height - 1;
+        assert_eq!(buf[(2, below)].bg, Color::Reset, "empty space was painted");
+
+        // And once the entrance is over the row is its own colour again.
+        st.tick_count = 200;
+        let buf = draw(&st);
+        let y = row_of(&buf, "acme/api");
+        assert_ne!(buf[(name_x, y)].fg, st.theme.row_idle, "the name never landed");
+    }
+
+    #[test]
+    fn the_help_card_stands_on_its_own_ground_and_admits_to_scrolling() {
+        let mut st = noisy_log_state(false);
+        st.show_help = true; // no opening tick: drawn settled
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 24)).unwrap();
+        term.draw(|f| render_help_overlay(f, f.area(), &st)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let out: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(out.contains("? Help — jog v"), "chip title: {out}");
+        // Short terminal + long reference: the card must say how to move.
+        assert!(out.contains("wheel scroll"), "{out}");
+        // And the render told the key handler where the bottom is.
+        assert!(st.last_help_max_scroll.get() > 0);
+    }
+
+    #[test]
+    fn click_targets_match_the_rows_the_frame_would_draw() {
+        let st = noisy_log_state(false);
+        let inner = Rect { x: 2, y: 3, width: 60, height: 12 };
+        // 30 rows, 10 visible under a 2-row header, cursor at 20: the window
+        // must scroll exactly far enough for row 20 to be the bottom row.
+        register_table_hits(&st, inner, 2, 1, 30, 20, |r| Some(Hit::Workflow(r)));
+        let hits = st.hits.borrow();
+        assert_eq!(hits.len(), 10);
+        assert_eq!(hits.first().unwrap().1, Hit::Workflow(11));
+        assert_eq!(hits.first().unwrap().0.y, inner.y + 2);
+        assert_eq!(hits.last().unwrap().1, Hit::Workflow(20));
+        assert_eq!(hits.last().unwrap().0.y, inner.y + 11);
+        drop(hits);
+
+        // A short list under a tall viewport never scrolls, whatever is
+        // selected — and two-row rows step their rects by two.
+        st.hits.borrow_mut().clear();
+        register_table_hits(&st, inner, 2, 2, 3, 2, |r| Some(Hit::Run(r)));
+        let hits = st.hits.borrow();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].1, Hit::Run(0));
+        assert_eq!(hits[1].0.y, inner.y + 4);
+        assert_eq!(hits[1].0.height, 2);
+    }
+
+    #[test]
     #[ignore = "visual check: cargo test show_logs -- --ignored --nocapture"]
     fn show_logs() {
         println!("─── unfocused ───\n{}", draw_logs(&noisy_log_state(false), 80, 12));
@@ -5404,10 +6346,104 @@ mod tests {
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(out.contains("Prod ╌╌╌"), "the shared tag heads its section\n{out}");
-        assert!(!out.contains("#Prod"), "…and is not repeated as a chip on every row\n{out}");
+        assert!(
+            out.contains("▐ Prod ▌"),
+            "the shared tag heads its section, as a chip\n{out}"
+        );
+        assert!(!out.contains("#Prod"), "…and is not repeated on every row\n{out}");
         assert!(out.contains("#critical"), "other tags stay as chips\n{out}");
-        assert!(out.contains("untagged ╌╌╌"), "the tagless get a section, at the end\n{out}");
+        assert!(out.contains("▐ untagged ▌"), "the tagless get a section, at the end\n{out}");
+    }
+
+    #[test]
+    fn the_verdicts_arrive_one_row_at_a_time_and_then_stand_still() {
+        let mut st = AppState::new(
+            "o/r".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        st.show_services = true;
+        let svc = |name: &str, state| crate::kuma::Service {
+            name: name.into(),
+            state,
+            ping_ms: Some(40),
+            uptime24: Some(1.0),
+            group: "Services".into(),
+            tags: Vec::new(),
+        };
+        st.services = vec![
+            svc("API", crate::kuma::ServiceState::Up),
+            svc("site", crate::kuma::ServiceState::Down),
+        ];
+        let card = |st: &AppState| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 10)).unwrap();
+            term.draw(|f| render_services_overlay(f, f.area(), st)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // A card put up without the clock is a settled card, not a first frame:
+        // every other test here draws one, and so does a redraw after a resize.
+        assert!(card(&st).contains("up"), "no opening tick, nothing to play");
+
+        // The frame the key was pressed on: names are already in place, so the
+        // card does not resize under the reveal, but no verdict has landed.
+        st.tick_count = 100;
+        st.services_opened_tick = Some(100);
+        let opening = card(&st);
+        assert!(opening.contains("API") && opening.contains("site"), "{opening}");
+        assert!(!opening.contains("down"), "the verdict is not there yet\n{opening}");
+
+        // Mid-entrance the top row has said its piece and the one under it has
+        // not — that stagger *is* the animation.
+        st.tick_count = 102;
+        let mid = card(&st);
+        assert!(mid.contains(" up "), "the first row is in\n{mid}");
+        assert!(!mid.contains("down"), "the second is still coming\n{mid}");
+        assert!(services_revealing(&st), "and the loop keeps redrawing for it");
+
+        // Then it stops: a card that kept animating would pull the eye back to
+        // it for as long as it was open.
+        st.tick_count = 120;
+        assert!(card(&st).contains("down"), "everyone has arrived");
+        assert!(!services_revealing(&st), "so the redraws stop");
+        st.show_services = false;
+        assert!(!services_revealing(&st), "a closed card animates nothing");
+    }
+
+    #[test]
+    fn an_environment_wears_its_own_colour() {
+        let theme = Theme::midnight();
+        // Green is the one you don't touch, amber the one you do — read at a
+        // glance or not at all.
+        assert_eq!(env_color("production", &theme), theme.success);
+        assert_eq!(env_color("Prod", &theme), theme.success);
+        assert_eq!(env_color("staging", &theme), theme.warning);
+        assert_eq!(env_color("Stage", &theme), theme.warning);
+        assert_eq!(env_color("dev", &theme), theme.info);
+        // A name with no convention behind it still gets a chip: an unlabelled
+        // section reads as a bug, not as "no environment".
+        assert_eq!(env_color("customers", &theme), theme.accent);
+        assert_eq!(env_color("untagged", &theme), theme.unknown);
+
+        // And the fill is deepened until white text can sit on it: the palette's
+        // own success is a pastel meant for glyphs, not for backgrounds.
+        let (fill, ink) = chip_colors(theme.success);
+        assert_eq!(ink, Color::White);
+        assert!(
+            matches!((fill, theme.success), (Color::Rgb(a, ..), Color::Rgb(b, ..)) if a < b),
+            "the chip is darker than the glyph colour it came from"
+        );
     }
 
     #[test]
@@ -5805,7 +6841,8 @@ mod tests {
     fn a_paused_batch_shows_the_failure_and_what_can_be_done_about_it() {
         let out = draw_batch(&batch_state(BatchPhase::Paused), 110, 16);
         assert!(out.contains("Paused on muufree/cms"), "got:\n{out}");
-        assert!(out.contains("r retry"), "got:\n{out}");
+        // `r` is the global refresh now; retry took the next free letter.
+        assert!(out.contains("t retry"), "got:\n{out}");
         assert!(out.contains("s skip"), "got:\n{out}");
         // Not just "it failed": the assertion that failed is on screen.
         assert!(out.contains("assert 1 == 2"), "got:\n{out}");
@@ -6194,6 +7231,25 @@ mod tests {
     }
 
     #[test]
+    fn the_header_bell_tells_live_from_muted_from_configured_off() {
+        use crate::app::state::{DEFAULT_BELL_ICON, DEFAULT_BELL_OFF_ICON};
+        let mut st = dashboard_with_live_ci();
+        let live = draw_header(&st, 120);
+        assert!(live.contains(DEFAULT_BELL_ICON), "{live}");
+        assert!(!live.contains(DEFAULT_BELL_OFF_ICON), "{live}");
+        st.snooze_until = Some(Utc::now() + chrono::Duration::minutes(25));
+        let muted = draw_header(&st, 120);
+        assert!(muted.contains(DEFAULT_BELL_OFF_ICON), "{muted}");
+        assert!(muted.contains("25m"), "{muted}");
+        // Config that never announces wears no bell at all — not even a
+        // slashed one, which would nag about a choice already made.
+        st.snooze_until = None;
+        st.notify_enabled = false;
+        let off = draw_header(&st, 120);
+        assert!(!off.contains(DEFAULT_BELL_ICON), "{off}");
+    }
+
+    #[test]
     fn the_reset_clock_shows_up_only_once_it_is_the_question() {
         let mut st = dashboard_with_live_ci();
         st.quota = Some(quota_at(40, Utc::now() + chrono::Duration::minutes(23)));
@@ -6458,6 +7514,27 @@ mod tests {
         };
         assert_ne!(row(&a), row(&b), "a still image cannot say 'still waiting'");
         assert!(row(&a).contains('─'), "got {:?}", row(&a));
+    }
+
+    #[test]
+    fn a_wide_dashboard_gets_a_live_pane_and_a_narrow_one_does_not() {
+        let mut st = dashboard_with_live_ci();
+        st.watch_tail = Some(crate::app::state::WatchTail {
+            job_id: st.dash_tail_target().map(|(_, _, j)| j.id).unwrap(),
+            job_name: "build".into(),
+            lines: vec!["cargo build --release".into()],
+        });
+        let wide = draw_repos(&st, 170, 20);
+        assert!(wide.contains("Live —"), "got:\n{wide}");
+        assert!(wide.contains("cargo build --release"), "got:\n{wide}");
+        // The table is still the view: its rows survive the split.
+        assert!(wide.contains("muufree/website"), "got:\n{wide}");
+        let narrow = draw_repos(&st, 150, 20);
+        assert!(!narrow.contains("Live —"), "got:\n{narrow}");
+        // With nothing in flight there is nothing to tail, however wide.
+        st.run_progress.clear();
+        let idle = draw_repos(&st, 170, 20);
+        assert!(!idle.contains("Live —"), "got:\n{idle}");
     }
 
     #[test]

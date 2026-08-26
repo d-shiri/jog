@@ -106,6 +106,18 @@ pub struct UiConfig {
     /// Raise an OS desktop notification when a run is announced.
     #[serde(default = "default_true")]
     pub notify_desktop: bool,
+    /// The header's bell while notifications are live, and its slashed twin
+    /// while they are snoozed.
+    ///
+    /// Unset uses Nerd Font bells, same convention as `github_icon`: a
+    /// terminal without a patched font draws boxes, so set your own strings
+    /// there (`"on"` / `"off"`, `"🔔"` / `"🔕"`), or `""` to hide the bell —
+    /// a snooze then still shows as text, because a mute nothing admits to
+    /// is how a failure goes unheard.
+    #[serde(default)]
+    pub bell_icon: Option<String>,
+    #[serde(default)]
+    pub bell_off_icon: Option<String>,
     /// Lines of surrounding context kept around each error/warning in log focus mode.
     #[serde(default = "default_focus_context")]
     pub log_focus_context: usize,
@@ -131,6 +143,8 @@ impl Default for UiConfig {
             notify: default_notify(),
             notify_sound: true,
             notify_desktop: true,
+            bell_icon: None,
+            bell_off_icon: None,
             log_focus_context: default_focus_context(),
             colors: std::collections::HashMap::new(),
         }
@@ -183,6 +197,11 @@ pub struct KeymapConfig {
     pub quit: String,
     pub back: String,
     pub help: String,
+    /// Fetch whatever the current screen shows, again. Global: it means the
+    /// same thing on every view, which is the whole point of it. `git_refresh`
+    /// is the name it had while it only ever re-read a working tree.
+    #[serde(alias = "git_refresh")]
+    pub refresh: String,
     // navigation (shared across list views and scroll)
     pub down: String,
     pub up: String,
@@ -210,6 +229,8 @@ pub struct KeymapConfig {
     pub repos_view: String,
     // service-health overlay (Uptime Kuma monitors by name)
     pub services: String,
+    // snooze notifications: 30m, press again for 60m, again for off
+    pub snooze: String,
     // batch commit: mark repos on the dashboard, commit them with one message
     pub repo_mark: String,
     pub batch_commit: String,
@@ -221,7 +242,6 @@ pub struct KeymapConfig {
     pub git_stage_all: String,
     pub git_commit: String,
     pub git_push: String,
-    pub git_refresh: String,
     pub git_diff: String,
     // workflow actions
     pub trigger: String,
@@ -247,6 +267,7 @@ impl Default for KeymapConfig {
             quit: "q".into(),
             back: "Esc".into(),
             help: "?".into(),
+            refresh: "r".into(),
             down: "j".into(),
             up: "k".into(),
             confirm: "Enter".into(),
@@ -265,22 +286,22 @@ impl Default for KeymapConfig {
             finder: "ctrl+p".into(),
             repos_view: "H".into(),
             services: "S".into(),
+            snooze: "Z".into(),
             repo_mark: "Space".into(),
             batch_commit: "C".into(),
-            batch_retry: "r".into(),
+            batch_retry: "t".into(),
             batch_skip: "s".into(),
             git_view: "c".into(),
             git_stage: "Space".into(),
             git_stage_all: "a".into(),
             git_commit: "c".into(),
             git_push: "P".into(),
-            git_refresh: "r".into(),
             git_diff: "d".into(),
             trigger: "t".into(),
             watch: "w".into(),
             open_browser: "o".into(),
             cancel_run: "x".into(),
-            rerun: "r".into(),
+            rerun: "ctrl+r".into(),
             rerun_failed: "R".into(),
             diff: "D".into(),
             yank: "y".into(),

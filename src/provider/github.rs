@@ -296,6 +296,32 @@ async fn gated<T>(f: impl std::future::Future<Output = T>) -> T {
     f.await
 }
 
+/// The budget GitHub stamped on one answer, from its `X-RateLimit-*` headers.
+///
+/// Every response carries them, 304s included, and they describe the very
+/// bucket the request was counted against — which `/rate_limit` does not
+/// always do. Seen on live github.com: `GET /rate_limit` answering
+/// `core: used 0, remaining 5000` with a reset an hour out, while calls made
+/// on the same token seconds apart came back `x-ratelimit-used: 29` and `30`
+/// against a window already running. A meter fed from the endpoint sat at 0%
+/// all session; one fed from these headers tracks what was actually spent.
+///
+/// `None` unless the headers are all there and describe the core bucket — the
+/// per-route buckets (`search`, `graphql`) are somebody else's budget, and a
+/// partial set is not a reading.
+fn quota_from_headers(headers: &http::HeaderMap) -> Option<Quota> {
+    let text = |name: &str| headers.get(name)?.to_str().ok();
+    if text("x-ratelimit-resource").is_some_and(|r| r != "core") {
+        return None;
+    }
+    let num = |name: &str| text(name)?.trim().parse::<u64>().ok();
+    Some(Quota {
+        limit: num("x-ratelimit-limit")? as u32,
+        used: num("x-ratelimit-used")? as u32,
+        reset: DateTime::from_timestamp(num("x-ratelimit-reset")? as i64, 0)?,
+    })
+}
+
 /// The ETag cache, poison notwithstanding: it holds nothing that can't be
 /// re-fetched, so a panic elsewhere must not turn every later poll into an
 /// unwrap panic of its own.
@@ -317,6 +343,12 @@ pub struct GitHubProvider {
     /// Kept so we can mint a sibling provider for another repo without
     /// re-resolving credentials (see `for_repo`).
     token: String,
+    /// The last budget GitHub stamped on an answer it actually gave us.
+    ///
+    /// Shared with `for_repo` siblings for the same reason the ETag cache is:
+    /// the dashboard mints a provider per repo per poll, and a reading that
+    /// died with the provider would never be read back.
+    budget: Arc<std::sync::Mutex<Option<Quota>>>,
     /// ETags (and the run lists they stand for) per `owner/repo#limit`.
     ///
     /// The dashboard re-asks the same question every poll, and most polls the
@@ -338,6 +370,7 @@ impl GitHubProvider {
             crab: Arc::new(crab),
             repo,
             token,
+            budget: Arc::new(std::sync::Mutex::new(None)),
             run_etags: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
@@ -353,6 +386,7 @@ impl GitHubProvider {
             crab: self.crab.clone(),
             repo,
             token: self.token.clone(),
+            budget: self.budget.clone(),
             run_etags: self.run_etags.clone(),
         }
     }
@@ -401,15 +435,31 @@ impl GitHubProvider {
         }))
     }
 
+    /// Bank the budget an answer arrived with, when it carried one.
+    fn note_budget(&self, headers: &http::HeaderMap) {
+        if let Some(q) = quota_from_headers(headers) {
+            *lock(&self.budget) = Some(q);
+        }
+    }
+
     /// How much of this token's hourly API budget is left.
     ///
-    /// Worth asking on a schedule rather than only after a refusal: `/rate_limit`
-    /// is exempt from the limit it reports, so watching the number costs nothing
-    /// against it — and a number you can watch fall is the only warning you get
-    /// before every row goes red at once. It is also the only way to learn the
-    /// reset time, since octocrab hands back the error body of a rejected call,
-    /// not the `X-RateLimit-Reset` header it came with.
+    /// Answered from the headers of the last real answer when there has been
+    /// one. The dashboard asks for every repo's runs every poll, so that
+    /// reading is a few seconds old at most, it costs no request of its own,
+    /// and — unlike `/rate_limit` — it is by construction the bucket jog's own
+    /// traffic is being counted against. See `quota_from_headers` for the
+    /// github.com behaviour that makes the difference matter.
+    ///
+    /// `/rate_limit` is the fallback, for the poll before the first answer
+    /// lands and for a workspace with no CI repo to ask about. It is exempt
+    /// from the limit it reports, so asking costs nothing against the budget,
+    /// and it is worth asking at all because a number you can watch fall is
+    /// the only warning before every row goes red at once.
     pub async fn quota(&self) -> Result<Quota> {
+        if let Some(q) = *lock(&self.budget) {
+            return Ok(q);
+        }
         let limits = gated(self.crab.ratelimit().get())
             .await
             .context("get rate limit")?;
@@ -468,6 +518,7 @@ impl GitHubProvider {
         let resp = gated(self.crab._get_with_headers(route.as_str(), Some(headers)))
             .await
             .context("list all repo runs")?;
+        self.note_budget(resp.headers());
         if resp.status() == http::StatusCode::NOT_MODIFIED {
             if let Some(cached) = lock(&self.run_etags).get(&key) {
                 return Ok(cached.runs.clone());
@@ -479,6 +530,7 @@ impl GitHubProvider {
             let plain = gated(self.crab._get_with_headers(route.as_str(), None))
                 .await
                 .context("list all repo runs")?;
+            self.note_budget(plain.headers());
             return self.digest_runs_page(&key, plain).await;
         }
         self.digest_runs_page(&key, resp).await
@@ -948,6 +1000,86 @@ mod tests {
             "a 304 must replay exactly what the 200 said"
         );
         assert!(!a.is_empty(), "cli/cli runs CI; an empty answer is a parse bug");
+    }
+
+    fn rate_headers(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn the_budget_is_read_off_the_answer_github_actually_gave() {
+        let q = quota_from_headers(&rate_headers(&[
+            ("x-ratelimit-limit", "5000"),
+            ("x-ratelimit-used", "1250"),
+            ("x-ratelimit-remaining", "3750"),
+            ("x-ratelimit-reset", "1787467570"),
+            ("x-ratelimit-resource", "core"),
+        ]))
+        .expect("a full set of core headers is a reading");
+        assert_eq!((q.limit, q.used), (5000, 1250));
+        assert_eq!(q.percent(), 25);
+        assert_eq!(q.reset.timestamp(), 1787467570);
+
+        // Somebody else's budget. Search gets thirty requests a minute; folding
+        // that into the meter would have it read 100% off one search.
+        assert!(
+            quota_from_headers(&rate_headers(&[
+                ("x-ratelimit-limit", "30"),
+                ("x-ratelimit-used", "30"),
+                ("x-ratelimit-reset", "1787467570"),
+                ("x-ratelimit-resource", "search"),
+            ]))
+            .is_none()
+        );
+        // Half a set is not a reading: a missing `used` defaulted to zero is
+        // exactly the 0% this whole path exists to stop showing.
+        assert!(
+            quota_from_headers(&rate_headers(&[
+                ("x-ratelimit-limit", "5000"),
+                ("x-ratelimit-reset", "1787467570"),
+            ]))
+            .is_none()
+        );
+        assert!(quota_from_headers(&http::HeaderMap::new()).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_banked_reading_beats_the_rate_limit_endpoint() {
+        // github.com has been seen answering `/rate_limit` with a core bucket
+        // reading zero while real calls on the same token came back with a
+        // window well underway. Whenever an answer has carried the headers,
+        // they are what the meter shows — and asking costs no request, which
+        // is why this test can make the claim without a network at all.
+        let p = GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "t".into()).unwrap();
+        p.note_budget(&rate_headers(&[
+            ("x-ratelimit-limit", "5000"),
+            ("x-ratelimit-used", "40"),
+            ("x-ratelimit-reset", "1787467570"),
+            ("x-ratelimit-resource", "core"),
+        ]));
+        assert_eq!(p.quota().await.unwrap().used, 40);
+
+        // And a sibling minted for another repo reads the same meter: the
+        // dashboard makes one per repo per poll, so a per-provider reading
+        // would be thrown away as fast as it was taken.
+        let sibling = p.for_repo(RepoSpec::parse("acme/web").unwrap());
+        assert_eq!(sibling.quota().await.unwrap().used, 40);
+
+        // A later answer moves it — that movement is the whole point of a meter.
+        sibling.note_budget(&rate_headers(&[
+            ("x-ratelimit-limit", "5000"),
+            ("x-ratelimit-used", "41"),
+            ("x-ratelimit-reset", "1787467570"),
+            ("x-ratelimit-resource", "core"),
+        ]));
+        assert_eq!(p.quota().await.unwrap().used, 41);
     }
 
     #[test]
