@@ -396,6 +396,9 @@ impl GitOp {
 /// styling never has to guess which is which from the characters alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffLine {
+    /// The banner opening one file's diff in the combined view, with that
+    /// file's own +/− counts so the divider says what the file cost.
+    File { path: String, add: usize, del: usize },
     Section(String),
     Text(String),
 }
@@ -422,6 +425,8 @@ pub struct DiffSide {
 /// the eye compares across rather than remembering down.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffRow {
+    /// The banner opening one file's diff in the combined view.
+    File { path: String, add: usize, del: usize },
     /// A staged/unstaged banner.
     Section(String),
     /// A line belonging to neither side: a hunk header, a file header, a
@@ -498,7 +503,7 @@ fn hunk_starts(t: &str) -> Option<(usize, usize)> {
 pub fn diff_rows(lines: &[DiffLine], emphasis: &[Option<ByteSpan>]) -> Vec<DiffRow> {
     let text_at = |i: usize| match &lines[i] {
         DiffLine::Text(t) => Some(t.as_str()),
-        DiffLine::Section(_) => None,
+        DiffLine::Section(_) | DiffLine::File { .. } => None,
     };
     let marked = |i: usize, mark: char, header: &str| {
         text_at(i).is_some_and(|t| t.starts_with(mark) && !t.starts_with(header))
@@ -511,6 +516,11 @@ pub fn diff_rows(lines: &[DiffLine], emphasis: &[Option<ByteSpan>]) -> Vec<DiffR
     while i < lines.len() {
         if let DiffLine::Section(label) = &lines[i] {
             rows.push(DiffRow::Section(label.clone()));
+            i += 1;
+            continue;
+        }
+        if let DiffLine::File { path, add, del } = &lines[i] {
+            rows.push(DiffRow::File { path: path.clone(), add: *add, del: *del });
             i += 1;
             continue;
         }
@@ -559,14 +569,45 @@ pub fn diff_rows(lines: &[DiffLine], emphasis: &[Option<ByteSpan>]) -> Vec<DiffR
     rows
 }
 
-/// The diff for a single file, opened from the working-tree view.
+/// The combined diff of the working tree, opened from the working-tree view.
+///
+/// Every changed file, one after another, each opened by a full-width file
+/// banner — so reading the whole change is one scroll, not a round trip
+/// through the file list per file.
 #[derive(Debug, Clone)]
 pub struct GitDiffView {
     /// Repo the diff was requested for. A response that arrives after the user
     /// has moved on to another repo is dropped rather than shown under the
     /// wrong heading.
     pub spec: String,
+    /// The file the view was opened on or last jumped to — where the initial
+    /// scroll lands, and the fallback when the scroll position has no banner
+    /// above it yet.
     pub file: String,
+    /// Paths in display order, parallel to `file_lines`/`file_rows`.
+    pub files: Vec<String>,
+    /// Index of each file's banner in `lines` — where a jump lands in the
+    /// unified layout.
+    pub file_lines: Vec<usize>,
+    /// The same banners' indices in `rows` — where a jump lands side by side.
+    pub file_rows: Vec<usize>,
+    /// A jump (open on a file, `n`/`p`) waiting for a frame: only the render
+    /// knows which layout the width allows, so only it can turn a file index
+    /// into a scroll offset. `Cell` for the same reason `units` is.
+    pub pending_jump: Cell<Option<usize>>,
+    /// Tick the view was opened on — the clock the band entrances run
+    /// against. `None` outside the app's event loop (a test, a direct
+    /// construction), where a settled band is the honest answer rather than a
+    /// frozen first frame.
+    pub opened_tick: Option<u64>,
+    /// Tick each file's band was first drawn, parallel to `files`. A band
+    /// plays its sweep when it first scrolls onto the screen, not invisibly
+    /// at open — so this is marked by the render, which is what knows;
+    /// `RefCell` for the same reason `units` is a `Cell`.
+    pub band_seen: RefCell<Vec<Option<u64>>>,
+    /// Which layout the last frame drew, so the key handler can map the scroll
+    /// offset back to the file under it.
+    pub side_by_side: Cell<bool>,
     pub lines: Vec<DiffLine>,
     /// Per-line byte range of the changed span inside a paired `-`/`+` line,
     /// parallel to `lines`. Computed once here rather than per frame, for the
@@ -577,7 +618,9 @@ pub struct GitDiffView {
     /// emphasis and for the same reason: the pairing has to look at whole runs
     /// of the diff, and a redraw must not.
     pub rows: Vec<DiffRow>,
-    pub scroll: usize,
+    /// `Cell` so the render can resolve a `pending_jump` into an offset once
+    /// the layout is known; every other mutation goes through `&mut` as usual.
+    pub scroll: Cell<usize>,
     /// Scrollable units the last frame drew — rows where the terminal was wide
     /// enough for two columns, lines where it was not. `Cell` because the
     /// render is what knows which layout the width allowed, and the key
@@ -591,38 +634,121 @@ impl GitDiffView {
         Self {
             spec,
             file,
+            files: Vec::new(),
+            file_lines: Vec::new(),
+            file_rows: Vec::new(),
+            pending_jump: Cell::new(None),
+            opened_tick: None,
+            band_seen: RefCell::new(Vec::new()),
+            side_by_side: Cell::new(false),
             lines: Vec::new(),
             emphasis: Vec::new(),
             rows: Vec::new(),
-            scroll: 0,
+            scroll: Cell::new(0),
             units: Cell::new(0),
             loading: true,
         }
     }
 
-    /// Flatten git's output into display lines, banner-per-section.
-    ///
-    /// The banner is dropped when there is only one section: with nothing to
-    /// tell apart, it is a row of screen space that says nothing.
+    /// One file's sections — the single-file shorthand the tests build views
+    /// with; the working-tree view loads every file at once via `set_files`.
+    #[cfg(test)]
     pub fn set_sections(&mut self, sections: Vec<crate::git::DiffSection>) {
+        let file = self.file.clone();
+        self.set_files(vec![(file, sections)]);
+    }
+
+    /// Flatten every file's diff into one run of display lines.
+    ///
+    /// Each file opens with a banner carrying its own +/− counts, set apart by
+    /// blank rows, so the combined diff reads as chapters rather than one
+    /// unbroken wall. Both banners follow the same rule: dropped when there is
+    /// only one file (or one section) — with nothing to tell apart, a banner
+    /// is a row of screen space that says nothing.
+    pub fn set_files(&mut self, files: Vec<(String, Vec<crate::git::DiffSection>)>) {
         self.loading = false;
-        self.scroll = 0;
+        self.scroll.set(0);
         self.lines.clear();
-        let labelled = sections.len() > 1;
-        for (i, s) in sections.iter().enumerate() {
-            if labelled {
-                if i > 0 {
+        self.files.clear();
+        self.file_lines.clear();
+        let bannered = files.len() > 1;
+        for (path, sections) in &files {
+            if bannered {
+                if !self.files.is_empty() {
+                    // The clear cut between files: two empty rows before the
+                    // next banner block, one after it before the diff resumes.
+                    self.lines.push(DiffLine::Text(String::new()));
                     self.lines.push(DiffLine::Text(String::new()));
                 }
-                self.lines.push(DiffLine::Section(s.label.to_string()));
+                let (add, del) = section_stats(sections);
+                self.file_lines.push(self.lines.len());
+                self.lines.push(DiffLine::File { path: path.clone(), add, del });
+                self.lines.push(DiffLine::Text(String::new()));
+            } else {
+                self.file_lines.push(self.lines.len());
             }
-            for line in s.text.lines() {
-                self.lines.push(DiffLine::Text(line.to_string()));
+            self.files.push(path.clone());
+            if bannered && sections.is_empty() {
+                // A mode change or pure rename: a real entry with no text.
+                // Under a banner, silence would read as a rendering bug.
+                self.lines.push(DiffLine::Text(
+                    "(no textual changes: mode change, rename, or an empty file)".into(),
+                ));
+            }
+            let labelled = sections.len() > 1;
+            for (i, s) in sections.iter().enumerate() {
+                if labelled {
+                    if i > 0 {
+                        self.lines.push(DiffLine::Text(String::new()));
+                    }
+                    self.lines.push(DiffLine::Section(s.label.to_string()));
+                }
+                for line in s.text.lines() {
+                    self.lines.push(DiffLine::Text(line.to_string()));
+                }
             }
         }
         self.emphasis = diff_emphasis(&self.lines);
         self.rows = diff_rows(&self.lines, &self.emphasis);
+        self.file_rows = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| matches!(r, DiffRow::File { .. }).then_some(i))
+            .collect();
+        if !bannered {
+            // No banner rows to find: the single file starts at the top in
+            // both layouts.
+            self.file_rows = vec![0; self.files.len()];
+        }
         self.units.set(0);
+        // Fresh content, fresh entrances: every band waits to be seen again.
+        *self.band_seen.borrow_mut() = vec![None; self.files.len()];
+        // Land on the file the view was opened on — resolved by the next
+        // frame, which knows the layout.
+        self.pending_jump
+            .set(self.files.iter().position(|f| *f == self.file));
+    }
+
+    /// Which file the viewport is scrolled into: the last banner at or above
+    /// the top of the screen.
+    pub fn current_file_idx(&self) -> Option<usize> {
+        let starts = if self.side_by_side.get() {
+            &self.file_rows
+        } else {
+            &self.file_lines
+        };
+        if starts.is_empty() {
+            return None;
+        }
+        let s = self.scroll.get();
+        Some(starts.iter().rposition(|&i| i <= s).unwrap_or(0))
+    }
+
+    /// Path of the file the viewport is scrolled into.
+    pub fn current_file(&self) -> Option<String> {
+        self.current_file_idx()
+            .and_then(|i| self.files.get(i).cloned())
     }
 
     /// Added and removed line counts, for the title.
@@ -651,9 +777,29 @@ impl GitDiffView {
     }
 
     pub fn scroll_by(&mut self, delta: isize, viewport: usize) {
-        let next = self.scroll as isize + delta;
-        self.scroll = next.clamp(0, self.max_scroll(viewport) as isize) as usize;
+        let next = self.scroll.get() as isize + delta;
+        self.scroll
+            .set(next.clamp(0, self.max_scroll(viewport) as isize) as usize);
     }
+}
+
+/// Added and removed line counts across one file's sections, `+++`/`---`
+/// headers excluded — the same rule as `GitDiffView::stats`, per file.
+fn section_stats(sections: &[crate::git::DiffSection]) -> (usize, usize) {
+    sections
+        .iter()
+        .flat_map(|s| s.text.lines())
+        .fold((0, 0), |(add, del), t| {
+            if t.starts_with("+++") || t.starts_with("---") {
+                (add, del)
+            } else if t.starts_with('+') {
+                (add + 1, del)
+            } else if t.starts_with('-') {
+                (add, del + 1)
+            } else {
+                (add, del)
+            }
+        })
 }
 
 /// Byte range of the changed span within one diff line.
@@ -807,6 +953,10 @@ pub struct BatchCommit {
     pub resume: BatchPhase,
     /// Tick the current repo started on, for its elapsed clock.
     pub started_tick: u64,
+    /// Tick the run finished on — the clock a clean batch takes itself off
+    /// screen against. `None` while it is still working, and after an abort:
+    /// see [`BatchCommit::returns_on_its_own`].
+    pub done_tick: Option<u64>,
 }
 
 /// What the batch has actually done, for the summary line.
@@ -829,6 +979,7 @@ impl BatchCommit {
             phase: BatchPhase::Compose,
             resume: BatchPhase::Committing,
             started_tick: tick,
+            done_tick: None,
         }
     }
 
@@ -878,6 +1029,9 @@ impl BatchCommit {
                 } else {
                     BatchPhase::Done
                 };
+                if self.phase == BatchPhase::Done {
+                    self.done_tick = Some(tick);
+                }
                 None
             }
         }
@@ -952,8 +1106,28 @@ impl BatchCommit {
 
     /// Start no further repos. Whatever already committed stays committed —
     /// there is no honest way to undo a hook that has already run.
+    ///
+    /// `done_tick` is deliberately left unset: a batch that ran itself out can
+    /// take itself off screen, but one you stopped is one you are standing in
+    /// front of, and the summary of what did and did not happen is the reason
+    /// you stopped it.
     pub fn abort(&mut self) {
         self.phase = BatchPhase::Done;
+    }
+
+    /// Whether this finished run has nothing left to tell anyone — a batch that
+    /// ran to its own end with every repo accounted for and none of them
+    /// failed. Those summaries are receipts, and the dashboard is where the
+    /// next thing happens, so they leave on their own.
+    ///
+    /// A failure, or a repo left unattempted by an abort, is the opposite: the
+    /// card is the only record of it, and it waits to be dismissed by hand.
+    pub fn returns_on_its_own(&self) -> bool {
+        if self.phase != BatchPhase::Done || self.done_tick.is_none() {
+            return false;
+        }
+        let t = self.tally();
+        t.failed == 0 && t.untouched == 0
     }
 
     pub fn tally(&self) -> BatchTally {
@@ -1743,6 +1917,9 @@ pub struct AppState {
     /// the default is a Nerd Font glyph, and a terminal without one would
     /// otherwise show a box where the logo should be.
     pub forge_icon: String,
+    /// Whether the combined diff's file bands carry a language mark — Nerd
+    /// Font glyphs, off for terminals whose font would draw boxes.
+    pub file_icons: bool,
     pub history: History,
     pub theme: Theme,
     /// Run IDs we have seen in a non-terminal state during this Watch session.
@@ -1791,6 +1968,10 @@ pub struct AppState {
     /// The push question a landed commit raised. Owns the keyboard while it is
     /// up, like the message box it follows.
     pub push_prompt: Option<PushPrompt>,
+    /// The question on screen has already been chimed for. A question is
+    /// announced on the edge it appears on, not on every frame it survives —
+    /// and switching Yes/No must not ring the bell again.
+    pub prompt_sounded: bool,
     /// Running and failed commits/pushes, keyed by repo.
     ///
     /// Held here rather than on `GitView` so a hook's output outlives the view
@@ -1869,12 +2050,17 @@ pub struct AppState {
     /// and a plain predicate would fire on every poll of a green morning.
     pub ci_was_busy: bool,
     /// Live tail of the running job on the watched run, refreshed once per
-    /// poll while Watch is open. GitHub serves a running job's log-so-far
-    /// from the same endpoint that serves the archive; some moments it has
-    /// nothing yet, which is what `available` reports.
+    /// poll while Watch is open. GitHub only materialises a job's log once
+    /// the job has finished, so on a run still in flight this usually stays
+    /// empty and the pane falls back to the job's step feed.
     pub watch_tail: Option<WatchTail>,
     /// A tail fetch is in flight — one per poll, not one per tick.
     pub watch_tail_pending: bool,
+    /// How many times running, per job id, GitHub has answered "no log here".
+    /// The archive endpoint is the only one a token can reach and it does not
+    /// exist until the job ends, so asking a running job forever is pure
+    /// budget: past `WATCH_TAIL_MAX_MISSES` the job is left alone.
+    pub watch_tail_misses: HashMap<u64, u8>,
     /// Service health from the configured Uptime Kuma status page, refreshed
     /// once per poll. Empty when Kuma is unconfigured or has never answered.
     pub services: Vec<crate::kuma::Service>,
@@ -2002,6 +2188,7 @@ impl AppState {
             trigger_prompt: None,
             keymap,
             forge_icon: DEFAULT_FORGE_ICON.to_string(),
+            file_icons: true,
             history,
             theme: Theme::default(),
             watch_seen_running: HashSet::new(),
@@ -2018,6 +2205,7 @@ impl AppState {
             finder: None,
             git_view: None,
             push_prompt: None,
+            prompt_sounded: false,
             git_ops: HashMap::new(),
             git_diff: None,
             last_diff_viewport_height: Cell::new(0),
@@ -2040,6 +2228,7 @@ impl AppState {
             ci_was_busy: false,
             watch_tail: None,
             watch_tail_pending: false,
+            watch_tail_misses: HashMap::new(),
             services: Vec::new(),
             service_repos: HashMap::new(),
             kuma_pending: false,
@@ -3738,22 +3927,74 @@ mod tests {
             &(0..50).map(|i| format!("+{i}\n")).collect::<String>(),
         )]);
         dv.scroll_by(1000, 10);
-        assert_eq!(dv.scroll, 40);
+        assert_eq!(dv.scroll.get(), 40);
         dv.scroll_by(-1000, 10);
-        assert_eq!(dv.scroll, 0);
+        assert_eq!(dv.scroll.get(), 0);
         // A diff shorter than the viewport cannot scroll at all.
         assert_eq!(dv.max_scroll(100), 0);
+    }
+
+    #[test]
+    fn the_combined_diff_gives_each_file_a_banner_and_room_to_breathe() {
+        let mut dv = GitDiffView::new("acme/api".into(), "b.rs".into());
+        dv.set_files(vec![
+            ("a.rs".into(), vec![section("unstaged", "+one\n")]),
+            ("b.rs".into(), vec![section("unstaged", "+two\n-x\n")]),
+        ]);
+        assert_eq!(dv.files, vec!["a.rs", "b.rs"]);
+        // Each band carries its own file's cost, not the total's.
+        assert!(matches!(
+            &dv.lines[dv.file_lines[0]],
+            DiffLine::File { path, add: 1, del: 0 } if path == "a.rs"
+        ));
+        assert!(matches!(
+            &dv.lines[dv.file_lines[1]],
+            DiffLine::File { path, add: 1, del: 1 } if path == "b.rs"
+        ));
+        // The clear cut: two empty rows before the next file's band.
+        assert_eq!(dv.lines[dv.file_lines[1] - 1], DiffLine::Text(String::new()));
+        assert_eq!(dv.lines[dv.file_lines[1] - 2], DiffLine::Text(String::new()));
+        // The bands survive the fold into side-by-side rows, where the jump
+        // indices point straight at them.
+        assert!(matches!(dv.rows[dv.file_rows[0]], DiffRow::File { .. }));
+        assert!(matches!(dv.rows[dv.file_rows[1]], DiffRow::File { .. }));
+        // Opened on `b.rs`: the jump waits for a frame that knows the layout.
+        assert_eq!(dv.pending_jump.get(), Some(1));
+    }
+
+    #[test]
+    fn the_current_file_follows_the_scroll() {
+        let mut dv = GitDiffView::new("acme/api".into(), "a.rs".into());
+        dv.set_files(vec![
+            ("a.rs".into(), vec![section("unstaged", "+one\n")]),
+            ("b.rs".into(), vec![section("unstaged", "+two\n")]),
+        ]);
+        // The unified layout until a frame says otherwise.
+        assert_eq!(dv.current_file().as_deref(), Some("a.rs"));
+        dv.scroll.set(dv.file_lines[1]);
+        assert_eq!(dv.current_file().as_deref(), Some("b.rs"));
+    }
+
+    #[test]
+    fn a_single_file_gets_no_banner() {
+        // With nothing to tell apart, a banner is a wasted row — and the tests
+        // above this one lean on the single-file layout staying bare.
+        let mut dv = GitDiffView::new("acme/api".into(), "a.rs".into());
+        dv.set_files(vec![("a.rs".into(), vec![section("unstaged", "+one\n")])]);
+        assert!(!dv.lines.iter().any(|l| matches!(l, DiffLine::File { .. })));
+        assert_eq!(dv.file_lines, vec![0]);
+        assert_eq!(dv.file_rows, vec![0]);
     }
 
     #[test]
     fn reloading_resets_the_offset() {
         let mut dv = GitDiffView::new("acme/api".into(), "src/a.rs".into());
         dv.set_sections(vec![section("unstaged", "+a\n+b\n+c\n+d\n")]);
-        dv.scroll = 3;
-        // Stepping to another file must start at its top, not wherever the
-        // previous file happened to be scrolled to.
+        dv.scroll.set(3);
+        // Reloading must start back at the top, not wherever the previous
+        // content happened to be scrolled to.
         dv.set_sections(vec![section("unstaged", "+z\n")]);
-        assert_eq!(dv.scroll, 0);
+        assert_eq!(dv.scroll.get(), 0);
     }
 
 

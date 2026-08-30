@@ -14,12 +14,13 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::animated_glyph;
 use super::motion::{Motion, mix};
 use crate::app::state::{
-    AppState, BatchPhase, ByteSpan, DetailItem, DiffLine, DiffRow, DiffSide, GitOp, Hit, ItemState,
+    AppState, BatchPhase, ByteSpan, DetailItem, DiffLine, DiffRow, DiffSide, GitDiffView, GitOp,
+    Hit, ItemState,
     StatusKind, Theme, View, ansi_line_to_spans, build_detail_items,
 };
 use crate::history::HistoryEntry;
 use crate::provider::github::{ApiFault, CRITICAL_PERCENT};
-use crate::provider::{Run, Status};
+use crate::provider::{Job, Run, Status};
 
 pub fn render(f: &mut Frame, state: &AppState) {
     let area = f.area();
@@ -473,10 +474,12 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
             Span::styled("Changes", Style::default().fg(theme.text_muted)),
             sep(),
             Span::styled(
+                // The file the viewport is scrolled into — the crumb follows
+                // the reading position through the combined diff.
                 state
                     .git_diff
                     .as_ref()
-                    .map(|d| d.file.clone())
+                    .map(|d| d.current_file().unwrap_or_else(|| d.file.clone()))
                     .unwrap_or_else(|| "?".into()),
                 Style::default().fg(theme.primary).bold(),
             ),
@@ -1159,7 +1162,16 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                 (display_key(&km.git_push).into(), "push all"),
                 (display_key(&km.back).into(), "done, don't push"),
             ],
-            Some(BatchPhase::Done) => vec![(display_key(&km.back).into(), "back to repos")],
+            // A clean run walks back to the dashboard by itself after a
+            // moment; "now" is the difference between the key being the way
+            // out and the key being a shortcut past the pause.
+            Some(BatchPhase::Done) => {
+                let leaving = state.batch.as_ref().is_some_and(|b| b.returns_on_its_own());
+                vec![(
+                    display_key(&km.back).into(),
+                    if leaving { "back to repos now" } else { "back to repos" },
+                )]
+            }
             _ => vec![
                 (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "scroll"),
                 (display_key(&km.yank).into(), "yank output"),
@@ -2136,6 +2148,58 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
     );
 }
 
+/// The live pane's content when there is no log body to show: the running
+/// job's own step list, newest at the bottom.
+///
+/// GitHub's REST log endpoint serves the archive, and a job's archive does
+/// not exist until the job ends — so for a run still in flight there is no
+/// tail to serve, and "waiting for GitHub" was a wait that never ended. The
+/// steps are the part that genuinely moves: the poll already carries them,
+/// with their own clocks, and they tick over every few seconds.
+fn live_step_lines(job: &Job, rows: usize, tick: u64, theme: &Theme) -> Vec<Line<'static>> {
+    if rows == 0 || job.steps.is_empty() {
+        return Vec::new();
+    }
+    // Anchored on the step in flight, showing the ones behind it: the same
+    // "newest at the bottom" reading a log tail has, so the eye lands in the
+    // same place whichever of the two the pane happens to be showing.
+    let end = job
+        .steps
+        .iter()
+        .position(|s| !s.status.is_terminal())
+        .map(|i| i + 1)
+        .unwrap_or(job.steps.len());
+    let start = end.saturating_sub(rows);
+    job.steps[start..end]
+        .iter()
+        .map(|s| {
+            let secs = s.started_at.map(|st| {
+                (s.completed_at.unwrap_or_else(Utc::now) - st).num_seconds().max(0)
+            });
+            let dur = secs.map(format_elapsed).unwrap_or_default();
+            Line::from(vec![
+                Span::styled(
+                    animated_glyph(s.status, tick),
+                    style_for_status(s.status, theme),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    s.name.clone(),
+                    if s.status == Status::Running {
+                        Style::default().fg(theme.text_bright)
+                    } else {
+                        Style::default().fg(theme.text)
+                    },
+                ),
+                Span::styled(
+                    if dur.is_empty() { String::new() } else { format!("  {dur}") },
+                    Style::default().fg(theme.text_muted),
+                ),
+            ])
+        })
+        .collect()
+}
+
 /// The dashboard's live pane: which run is being followed, where it stands,
 /// and the tail of its running job's log — the Watch view's pane, moved to
 /// where the eye already is when several repos are being minded at once.
@@ -2188,10 +2252,15 @@ fn render_dash_live(f: &mut Frame, area: Rect, state: &AppState) {
                 Line::from(ansi_line_to_spans(l, Style::default().fg(theme.text)))
             }));
         }
-        _ => lines.push(Line::from(Span::styled(
-            "waiting for GitHub to serve the log…",
-            Style::default().fg(theme.text_muted).italic(),
-        ))),
+        // No log body: show the steps instead, which are live where the log
+        // cannot be until the job has finished.
+        _ => match live_step_lines(job, tail_rows, state.tick_count, theme) {
+            steps if steps.is_empty() => lines.push(Line::from(Span::styled(
+                "waiting for the first step…",
+                Style::default().fg(theme.text_muted).italic(),
+            ))),
+            steps => lines.extend(steps),
+        },
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -2855,7 +2924,7 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
                 (k(&km.git_push), "push — sets upstream on first push"),
                 (k(&km.trigger), "open this repo's workflows to run CI"),
                 (k(&km.open_browser), "open the branch's PR — or the page that creates one"),
-                (format!("{}/↵", k(&km.git_diff)), "diff the selected file"),
+                (format!("{}/↵", k(&km.git_diff)), "diff every changed file, from this one"),
                 (
                     pair(&km.down, &km.up),
                     "scroll the hook output, while a commit/push is showing it",
@@ -3870,10 +3939,180 @@ const DIFF_ROW_TINT: f64 = 0.16;
 const DIFF_SPAN_TINT: f64 = 0.38;
 const DIFF_SPAN_LIFT: f64 = 0.45;
 
-/// One side-by-side row as a drawn line.
-fn diff_row_line(row: &DiffRow, gutter: usize, left: usize, right: usize, theme: &Theme) -> Line<'static> {
+/// How long a file band's entrance runs, in ticks at the app's 100ms clock.
+/// Long enough that the sweep is watched rather than glimpsed: at 100 columns
+/// the edge crosses about eight columns a frame, a motion the eye can follow.
+const BAND_WIPE_TICKS: f64 = 12.0;
+
+/// How far the band for file `fi` is into its entrance, 0.0 → 1.0 — marking
+/// the tick it was first drawn on the way through.
+///
+/// Per band, not per view: a band plays its sweep when it first scrolls onto
+/// the screen, so the tenth file's divider arrives when the reader does, not
+/// invisibly at open. 1.0 when the view has no opening tick (a test, a direct
+/// construction): a settled band is the honest answer there, the same rule
+/// every entrance in this file follows.
+fn band_wipe_at(dv: &GitDiffView, fi: usize, tick: u64) -> f64 {
+    if dv.opened_tick.is_none() {
+        return 1.0;
+    }
+    let mut seen = dv.band_seen.borrow_mut();
+    let Some(slot) = seen.get_mut(fi) else {
+        return 1.0;
+    };
+    let since = tick.saturating_sub(*slot.get_or_insert(tick)) as f64 + 1.0;
+    (since / BAND_WIPE_TICKS).clamp(0.0, 1.0)
+}
+
+/// Whether any band on the open diff is still mid-sweep — the redraw loop's
+/// question. Bands not yet seen don't count: they cost nothing until the
+/// scroll that reveals them, and that keypress redraws on its own.
+pub fn diff_bands_revealing(state: &AppState) -> bool {
+    matches!(state.view, View::GitDiff)
+        && state.git_diff.as_ref().is_some_and(|dv| {
+            dv.opened_tick.is_some()
+                && dv.band_seen.borrow().iter().flatten().any(|&t| {
+                    (state.tick_count.saturating_sub(t) as f64) < BAND_WIPE_TICKS
+                })
+        })
+}
+
+/// The Nerd Font mark for a file's language, by extension — the set the
+/// devicon-styled tools already made familiar, so a Rust gear or a Python
+/// snake on a band reads at a glance. Anything unrecognised gets a plain
+/// file, which is the honest mark for it; the same tradeoff and override
+/// story as the forge mark applies (`ui.file_icons`).
+fn lang_icon(path: &str) -> &'static str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if name.eq_ignore_ascii_case("dockerfile") {
+        return "\u{f308}"; // docker whale
+    }
+    if name.eq_ignore_ascii_case("makefile") {
+        return "\u{f489}"; // terminal
+    }
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "rs" => "\u{e7a8}",                          // rust gear
+        "py" => "\u{e73c}",                          // python
+        "ts" | "tsx" => "\u{e628}",                  // typescript
+        "js" | "jsx" | "mjs" | "cjs" => "\u{e74e}",  // javascript
+        "go" => "\u{e627}",                          // gopher
+        "java" => "\u{e738}",
+        "c" | "h" => "\u{e61e}",
+        "cpp" | "cc" | "cxx" | "hpp" => "\u{e61d}",
+        "rb" => "\u{e739}",                          // ruby
+        "php" => "\u{e73d}",
+        "lua" => "\u{e620}",
+        "swift" => "\u{e755}",
+        "kt" | "kts" => "\u{e634}",                  // kotlin
+        "html" | "htm" => "\u{e736}",
+        "css" | "scss" | "sass" | "less" => "\u{e749}",
+        "json" => "\u{e60b}",
+        "md" | "markdown" => "\u{e73e}",
+        "yml" | "yaml" | "toml" | "ini" | "conf" => "\u{e615}", // config cog
+        "sh" | "bash" | "zsh" | "fish" => "\u{f489}",           // terminal
+        "lock" => "\u{f023}",                                   // padlock
+        _ => "\u{f016}",                                        // plain file
+    }
+}
+
+/// The band naming one file in the combined view: a language mark, the
+/// filename and its own +/− counts on a solid run of the accent colour, the
+/// full width of the pane — a chapter head no row of diff text can be
+/// mistaken for, so where one file ends and the next begins is a glance, not
+/// a search.
+///
+/// `wipe` is how far the band is into its entrance: below 1.0 only that share
+/// of it has been painted, so the colour eats its way from the left edge to
+/// the right — the name and counts appearing as the sweep passes over them,
+/// a comet tail of fading blocks riding its leading edge so the motion is a
+/// thing on screen, not just ground appearing.
+fn file_banner(
+    path: &str,
+    add: usize,
+    del: usize,
+    width: usize,
+    wipe: f64,
+    icon: &str,
+    theme: &Theme,
+) -> Line<'static> {
+    // The same ground the help view sets its key caps on: accent under
+    // surface-coloured text, the highest-contrast pairing the theme owns.
+    let band = Style::default().bg(theme.accent).fg(theme.surface);
+    let lead = if icon.is_empty() {
+        " ".to_string()
+    } else {
+        format!(" {icon} ")
+    };
+    let stats = format!("  +{add} −{del}");
+    let path = truncate(
+        path,
+        width
+            .saturating_sub(disp_width(&lead) + 1 + disp_width(&stats))
+            .max(1),
+    );
+    let pad = width.saturating_sub(disp_width(&lead) + disp_width(&path) + disp_width(&stats));
+    if wipe >= 1.0 {
+        return Line::from(vec![
+            Span::styled(format!("{lead}{path}"), band.bold()),
+            Span::styled(stats, band),
+            Span::styled(" ".repeat(pad), band),
+        ]);
+    }
+    // Mid-sweep. Linear on purpose: an eased edge spends most of its life
+    // nearly done, and the whole point here is watching it travel.
+    let keep = (width as f64 * wipe).round() as usize;
+    let (head, head_w) = fit_columns(&format!("{lead}{path}"), keep);
+    let (mid, mid_w) = fit_columns(&stats, keep.saturating_sub(head_w));
+    let fill = keep.saturating_sub(head_w + mid_w);
+    // The comet tail ahead of the solid ground, densest where it leaves it.
+    let edge: String = ["▓", "▒", "░"]
+        .iter()
+        .take(width.saturating_sub(keep))
+        .copied()
+        .collect();
+    Line::from(vec![
+        Span::styled(head, band.bold()),
+        Span::styled(mid, band),
+        Span::styled(" ".repeat(fill), band),
+        Span::styled(edge, Style::default().fg(theme.accent)),
+    ])
+}
+
+/// Longest prefix of `s` that fits in `cols` terminal columns, and the width
+/// it actually takes. `truncate` is the wrong tool mid-sweep: its ellipsis
+/// would put a flickering `…` on the band's leading edge every frame.
+fn fit_columns(s: &str, cols: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > cols {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    (out, w)
+}
+
+/// One side-by-side row as a drawn line. `wipe` is the file band's entrance
+/// progress and `icon` its language mark; every other kind of row ignores
+/// both.
+fn diff_row_line(
+    row: &DiffRow,
+    gutter: usize,
+    left: usize,
+    right: usize,
+    wipe: f64,
+    icon: &str,
+    theme: &Theme,
+) -> Line<'static> {
     let width = 2 * (gutter + 1) + DIFF_RULE.len() + left + right;
     match row {
+        DiffRow::File { path, add, del } => {
+            file_banner(path, *add, *del, width, wipe, icon, theme)
+        }
         DiffRow::Section(label) => Line::from(Span::styled(
             truncate(&format!("── {label} "), width),
             Style::default().fg(theme.accent).bold(),
@@ -3950,8 +4189,19 @@ fn diff_row_line(row: &DiffRow, gutter: usize, left: usize, right: usize, theme:
 }
 
 /// One unified diff line as a drawn line — the narrow-terminal layout.
-fn diff_unified_line(l: &DiffLine, emph: Option<ByteSpan>, theme: &Theme) -> Line<'static> {
+/// `wipe` and `icon` as in `diff_row_line`.
+fn diff_unified_line(
+    l: &DiffLine,
+    emph: Option<ByteSpan>,
+    width: usize,
+    wipe: f64,
+    icon: &str,
+    theme: &Theme,
+) -> Line<'static> {
     match l {
+        DiffLine::File { path, add, del } => {
+            file_banner(path, *add, *del, width, wipe, icon, theme)
+        }
         DiffLine::Section(label) => Line::from(Span::styled(
             format!("── {label} "),
             Style::default().fg(theme.accent).bold(),
@@ -3994,7 +4244,12 @@ fn render_git_diff(f: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let (add, del) = dv.stats();
-    let mut title = format!("{}  ", dv.file);
+    // One file keeps its name in the title; more get a count, and the names
+    // live on the banners the pane scrolls through.
+    let mut title = match dv.files.len() {
+        0 | 1 => format!("{}  ", dv.file),
+        n => format!("{n} files  "),
+    };
     if dv.loading {
         title.push_str("loading…");
     } else {
@@ -4029,9 +4284,19 @@ fn render_git_diff(f: &mut Frame, area: Rect, state: &AppState) {
         None => dv.lines.len(),
     };
     dv.units.set(total);
+    dv.side_by_side.set(split.is_some());
+
+    // A jump waiting on the layout — opening on a file, `n`/`p` — resolves
+    // here, where which unit the offset counts is finally known.
+    if let Some(fi) = dv.pending_jump.take() {
+        let starts = if split.is_some() { &dv.file_rows } else { &dv.file_lines };
+        if let Some(&target) = starts.get(fi) {
+            dv.scroll.set(target.min(dv.max_scroll(viewport as usize)));
+        }
+    }
 
     // Position, so a long diff says how much of it is off-screen.
-    let scroll = dv.scroll.min(total.saturating_sub(1));
+    let scroll = dv.scroll.get().min(total.saturating_sub(1));
     if total > viewport as usize {
         let last = (scroll + viewport as usize).min(total);
         title.push_str(&format!("   [{}–{} of {}]", scroll + 1, last, total));
@@ -4039,17 +4304,45 @@ fn render_git_diff(f: &mut Frame, area: Rect, state: &AppState) {
 
     // Slicing to the viewport keeps the per-frame clone bounded rather than
     // copying a 10k-line diff on every redraw.
+    // A band's entrance progress, looked up as the render passes over it —
+    // which is also what marks it as seen for the first time.
+    let wipe_for = |path: &str| {
+        dv.files
+            .iter()
+            .position(|f| f == path)
+            .map_or(1.0, |fi| band_wipe_at(dv, fi, state.tick_count))
+    };
+    let icon_for = |path: &str| if state.file_icons { lang_icon(path) } else { "" };
     let lines: Vec<Line> = match split {
         Some((gutter, left, right)) => dv.rows[scroll..]
             .iter()
             .take(viewport as usize)
-            .map(|r| diff_row_line(r, gutter, left, right, theme))
+            .map(|r| {
+                let (wipe, icon) = match r {
+                    DiffRow::File { path, .. } => (wipe_for(path), icon_for(path)),
+                    _ => (1.0, ""),
+                };
+                diff_row_line(r, gutter, left, right, wipe, icon, theme)
+            })
             .collect(),
         None => dv.lines[scroll..]
             .iter()
             .take(viewport as usize)
             .enumerate()
-            .map(|(i, l)| diff_unified_line(l, dv.emphasis.get(scroll + i).copied().flatten(), theme))
+            .map(|(i, l)| {
+                let (wipe, icon) = match l {
+                    DiffLine::File { path, .. } => (wipe_for(path), icon_for(path)),
+                    _ => (1.0, ""),
+                };
+                diff_unified_line(
+                    l,
+                    dv.emphasis.get(scroll + i).copied().flatten(),
+                    inner_w,
+                    wipe,
+                    icon,
+                    theme,
+                )
+            })
             .collect(),
     };
 
@@ -5154,13 +5447,20 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
                     shown,
                 )
             }
-            _ => (
-                format!("Live log — {}", job.name),
-                vec![Line::from(Span::styled(
-                    "waiting for GitHub to serve the log…",
-                    Style::default().fg(theme.text_muted).italic(),
-                ))],
-            ),
+            // GitHub withholds a running job's log until it ends, so the
+            // pane shows the thing that does move: the job's own steps.
+            _ => {
+                let steps = live_step_lines(job, viewport, state.tick_count, theme);
+                let body = if steps.is_empty() {
+                    vec![Line::from(Span::styled(
+                        "waiting for the first step…",
+                        Style::default().fg(theme.text_muted).italic(),
+                    ))]
+                } else {
+                    steps
+                };
+                (format!("Live steps — {}", job.name), body)
+            }
         };
         f.render_widget(
             Paragraph::new(lines).block(styled_block(&title, &state.theme)),
@@ -5875,6 +6175,109 @@ mod tests {
         draw_diff(&st, 44, 12);
         assert_eq!(dv.units.get(), 6, "unified: it counts lines again");
         assert_eq!(dv.max_scroll(3), 3);
+    }
+
+    #[test]
+    fn the_combined_diff_opens_at_the_chosen_file_under_its_own_banner() {
+        let sec = |text: &str| crate::git::DiffSection { label: "unstaged", text: text.into() };
+        let long: String = (0..40).map(|i| format!("+l{i}\n")).collect();
+        let mut st = noisy_log_state(false);
+        let mut dv =
+            crate::app::state::GitDiffView::new("acme/api".into(), "src/b.rs".into());
+        dv.set_files(vec![
+            ("src/a.rs".into(), vec![sec(&format!("@@ -1 +1,40 @@\n{long}"))]),
+            ("src/b.rs".into(), vec![sec(&format!("@@ -1 +1,40 @@\n{long}\n-x\n"))]),
+        ]);
+        st.git_diff = Some(dv);
+        st.view = View::GitDiff;
+        let out = draw_diff(&st, 100, 20);
+
+        // The first frame resolves the jump: `d` was pressed on `src/b.rs`,
+        // so the view opens scrolled to it rather than at the top of `a`.
+        let dv = st.git_diff.as_ref().unwrap();
+        assert_eq!(dv.pending_jump.get(), None, "the jump was consumed");
+        assert!(dv.scroll.get() > 0, "still at the top of the first file");
+        assert_eq!(dv.current_file().as_deref(), Some("src/b.rs"));
+
+        // Each file opens under a full-width band naming it with its own +/−
+        // counts.
+        let band = out
+            .lines()
+            .find(|l| l.contains("src/b.rs"))
+            .unwrap_or_else(|| panic!("no band for src/b.rs:\n{out}"));
+        assert!(band.contains("src/b.rs  +40 −1"), "got {band:?}");
+    }
+
+    #[test]
+    fn a_file_band_sweeps_in_when_first_seen_then_settles() {
+        let sec = |text: &str| crate::git::DiffSection { label: "unstaged", text: text.into() };
+        let mut st = noisy_log_state(false);
+        let mut dv =
+            crate::app::state::GitDiffView::new("acme/api".into(), "src/a.rs".into());
+        dv.set_files(vec![
+            ("src/a.rs".into(), vec![sec("@@ -1 +1 @@\n+one\n")]),
+            ("src/b.rs".into(), vec![sec("@@ -1 +1 @@\n+two\n")]),
+        ]);
+        // The clock only runs inside the app's event loop; without it (every
+        // other test here) the bands draw settled.
+        dv.opened_tick = Some(0);
+        st.git_diff = Some(dv);
+        st.view = View::GitDiff;
+
+        // Widest run of the accent ground on any row — how far the sweep got.
+        let band_cols = |st: &AppState| -> usize {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+            term.draw(|f| render_git_diff(f, f.area(), st)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| (0..buf.area.width).filter(|&x| buf[(x, y)].bg == st.theme.accent).count())
+                .max()
+                .unwrap_or(0)
+        };
+
+        st.tick_count = 0;
+        let partial = band_cols(&st);
+        assert!(partial > 0, "the sweep starts with something on screen");
+        assert!(partial < 90, "the first frame already spans the pane: {partial}");
+        assert!(diff_bands_revealing(&st), "mid-sweep, the loop owes frames");
+
+        st.tick_count = 30;
+        let full = band_cols(&st);
+        assert_eq!(full, 98, "settled, the band runs edge to edge");
+        assert!(!diff_bands_revealing(&st), "settled, it stops asking for them");
+    }
+
+    #[test]
+    fn the_band_wears_its_languages_mark() {
+        assert_eq!(lang_icon("src/app/state.rs"), "\u{e7a8}");
+        assert_eq!(lang_icon("scripts/run.py"), "\u{e73c}");
+        assert_eq!(lang_icon("web/App.tsx"), "\u{e628}");
+        assert_eq!(lang_icon("Dockerfile"), "\u{f308}");
+        assert_eq!(lang_icon("Cargo.lock"), "\u{f023}");
+        // Unrecognised gets the plain file — the honest mark for it.
+        assert_eq!(lang_icon("LICENSE"), "\u{f016}");
+
+        let sec = |text: &str| crate::git::DiffSection { label: "unstaged", text: text.into() };
+        let mut st = noisy_log_state(false);
+        let mut dv =
+            crate::app::state::GitDiffView::new("acme/api".into(), "src/a.rs".into());
+        dv.set_files(vec![
+            ("src/a.rs".into(), vec![sec("@@ -1 +1 @@\n+one\n")]),
+            ("src/b.py".into(), vec![sec("@@ -1 +1 @@\n+two\n")]),
+        ]);
+        st.git_diff = Some(dv);
+        st.view = View::GitDiff;
+        let out = draw_diff(&st, 100, 20);
+        assert!(out.contains("\u{e7a8} src/a.rs"), "no rust mark:\n{out}");
+        assert!(out.contains("\u{e73c} src/b.py"), "no python mark:\n{out}");
+
+        // A terminal without the font can turn the marks off, same as the
+        // forge icon.
+        st.file_icons = false;
+        let out = draw_diff(&st, 100, 20);
+        assert!(!out.contains('\u{e7a8}'), "mark still drawn when off:\n{out}");
+        assert!(out.contains(" src/a.rs"), "the name must survive the mark:\n{out}");
     }
 
     #[test]
@@ -7576,6 +7979,21 @@ mod tests {
         st.run_progress.clear();
         let idle = draw_repos(&st, 170, 20);
         assert!(!idle.contains("Live —"), "got:\n{idle}");
+    }
+
+    #[test]
+    fn with_no_log_body_the_live_pane_shows_the_steps_instead() {
+        // GitHub does not serve a job's log until the job ends, so on a run in
+        // flight the pane has no tail to show. It shows the steps, which do
+        // move — the alternative was a "waiting…" line that never resolved.
+        let st = dashboard_with_live_ci();
+        assert!(st.watch_tail.is_none());
+        let out = draw_repos(&st, 170, 20);
+        assert!(out.contains("Live —"), "got:\n{out}");
+        assert!(out.contains("Run migrations"), "got:\n{out}");
+        assert!(!out.contains("waiting for GitHub"), "got:\n{out}");
+        // Steps past the one in flight are not news yet.
+        assert!(!out.contains("Push image"), "got:\n{out}");
     }
 
     #[test]

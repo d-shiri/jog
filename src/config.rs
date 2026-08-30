@@ -97,12 +97,22 @@ pub struct UiConfig {
     /// Empty means use the bundled quota alarm.
     #[serde(default)]
     pub quota_sound: String,
+    /// Sound file played when jog puts a question on screen and waits — the
+    /// push prompt after a commit lands. Empty means use the bundled chime.
+    #[serde(default)]
+    pub ask_sound: String,
     /// Which finished runs to announce: `always`, `failure`, or `never`.
     #[serde(default = "default_notify")]
     pub notify: String,
     /// Play a sound when a run is announced.
     #[serde(default = "default_true")]
     pub notify_sound: bool,
+    /// Play a sound when a question appears and waits for an answer. Separate
+    /// from `notify_sound`: a run finishing is news you can read later, a
+    /// question is a keystroke jog is holding still for, and someone who wants
+    /// the second without the first should be able to say so.
+    #[serde(default = "default_true")]
+    pub ask_sound_enabled: bool,
     /// Raise an OS desktop notification when a run is announced.
     #[serde(default = "default_true")]
     pub notify_desktop: bool,
@@ -118,6 +128,14 @@ pub struct UiConfig {
     pub bell_icon: Option<String>,
     #[serde(default)]
     pub bell_off_icon: Option<String>,
+    /// Language marks on the file bands of the combined diff — a Rust gear on
+    /// `.rs`, a snake on `.py`, and so on.
+    ///
+    /// Nerd Font glyphs, same convention as `github_icon`: a terminal without
+    /// a patched font draws them as boxes, so set this to `false` to turn
+    /// them off.
+    #[serde(default = "default_true")]
+    pub file_icons: bool,
     /// Lines of surrounding context kept around each error/warning in log focus mode.
     #[serde(default = "default_focus_context")]
     pub log_focus_context: usize,
@@ -139,12 +157,15 @@ impl Default for UiConfig {
             complete_sound: String::new(),
             fail_sound: String::new(),
             quota_sound: String::new(),
+            ask_sound: String::new(),
             github_icon: None,
             notify: default_notify(),
             notify_sound: true,
+            ask_sound_enabled: true,
             notify_desktop: true,
             bell_icon: None,
             bell_off_icon: None,
+            file_icons: true,
             log_focus_context: default_focus_context(),
             colors: std::collections::HashMap::new(),
         }

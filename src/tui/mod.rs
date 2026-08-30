@@ -54,8 +54,9 @@ pub enum AppEvent {
     RepoProgressLoaded(String, RunDetail),
     /// Working-tree state for a local checkout.
     GitStatusLoaded(String, crate::git::RepoStatus),
-    /// The diff for one file: repo spec, path, and one section per comparison.
-    GitDiffLoaded(String, String, Vec<crate::git::DiffSection>),
+    /// The combined working-tree diff: repo spec, then every changed file with
+    /// its sections, in status order.
+    GitDiffLoaded(String, Vec<(String, Vec<crate::git::DiffSection>)>),
     /// A git command finished. `Some(msg)` reports success, `Err` the failure;
     /// either way the status is refreshed afterwards.
     GitOpDone(String, Result<String, String>),
@@ -137,6 +138,7 @@ pub async fn run(
     if let Some(icon) = config.ui.bell_off_icon.clone() {
         state.bell_off_icon = icon;
     }
+    state.file_icons = config.ui.file_icons;
     state.notify_enabled = config.ui.notify_mode() != NotifyMode::Never
         && (config.ui.notify_sound || config.ui.notify_desktop);
     resolve_theme(&mut state, &config);
@@ -379,6 +381,8 @@ async fn event_loop(
             state.needs_clear = false;
             redraw = true;
         }
+        announce_prompt(state, &config);
+        batch_auto_return(state);
         if redraw {
             terminal.draw(|f| views::render(f, state))?;
         }
@@ -746,6 +750,19 @@ async fn event_loop(
                     }
                     AppEvent::WatchTailLoaded(job_id, job_name, lines) => {
                         state.watch_tail_pending = false;
+                        // Track refusals per job so a log GitHub will never
+                        // serve stops being asked for. A body that does arrive
+                        // clears the count — the same job answering again is
+                        // the archive having landed.
+                        match &lines {
+                            Some(_) => {
+                                state.watch_tail_misses.remove(&job_id);
+                            }
+                            None => {
+                                let n = state.watch_tail_misses.entry(job_id).or_insert(0);
+                                *n = n.saturating_add(1);
+                            }
+                        }
                         // Only worth holding while a view showing a tail is
                         // asking: Watch's pane, or the dashboard's side pane.
                         if matches!(state.view, View::Watch | View::Repos) {
@@ -764,15 +781,14 @@ async fn event_loop(
                             };
                         }
                     }
-                    AppEvent::GitDiffLoaded(spec, file, sections) => {
-                        // Only fold in a diff that still matches what the view
-                        // is asking for: cycling files quickly can land two
-                        // responses out of order.
+                    AppEvent::GitDiffLoaded(spec, files) => {
+                        // Only fold in a diff that still matches the repo the
+                        // view is asking for: switching repos quickly can land
+                        // two responses out of order.
                         if let Some(dv) = state.git_diff.as_mut()
                             && dv.spec == spec
-                            && dv.file == file
                         {
-                            dv.set_sections(sections);
+                            dv.set_files(files);
                         }
                         state.pending = state.pending.saturating_sub(1);
                     }
@@ -972,7 +988,8 @@ async fn event_loop(
                     || animations_active(state)
                     || views::services_revealing(state)
                     || views::help_revealing(state)
-                    || views::dash_revealing(state);
+                    || views::dash_revealing(state)
+                    || views::diff_bands_revealing(state);
                 if state.status_msg.is_some() && state.tick_count.saturating_sub(state.status_msg_tick) > 30 {
                     state.status_msg = None;
                     redraw = true;
@@ -1387,7 +1404,10 @@ async fn handle_key(
                     .and_then(|g| g.selected())
                     .map(|e| e.path.clone())
             }),
-            View::GitDiff => state.git_diff.as_ref().map(|d| d.file.clone()),
+            View::GitDiff => state
+                .git_diff
+                .as_ref()
+                .map(|d| d.current_file().unwrap_or_else(|| d.file.clone())),
             View::Workflows => state.selected_workflow().map(|w| w.file_name.clone()),
             View::Runs | View::Watch => state
                 .run_detail.as_ref().map(|d| d.run.url.clone())
@@ -1548,19 +1568,26 @@ async fn handle_key(
                 }
             } else if key_is(&key, km.scroll_top) {
                 if let Some(d) = state.git_diff.as_mut() {
-                    d.scroll = 0;
+                    d.scroll.set(0);
                 }
             } else if key_is(&key, km.scroll_bottom) {
                 if let Some(d) = state.git_diff.as_mut() {
-                    d.scroll = d.max_scroll(viewport);
+                    let bottom = d.max_scroll(viewport);
+                    d.scroll.set(bottom);
                 }
             } else if key_is(&key, km.next_step) {
-                step_diff_file(state, tx, 1);
+                step_diff_file(state, 1);
             } else if key_is(&key, km.prev_step) {
-                step_diff_file(state, tx, -1);
+                step_diff_file(state, -1);
             } else if key_is(&key, km.git_stage) {
                 // Staging from here is the whole point of reading the diff:
                 // decide, act, move on without a round trip through the list.
+                // The cursor is first pulled to the file under the scroll, so
+                // the toggle hits what the eye is on, not what `d` was
+                // pressed on screens ago.
+                if let Some(i) = state.git_diff.as_ref().and_then(|d| d.current_file_idx()) {
+                    sync_status_cursor_to(state, i);
+                }
                 toggle_stage_at_cursor(state, tx);
             }
         }
@@ -2491,6 +2518,52 @@ fn handle_batch_input(state: &mut AppState, key: KeyEvent, tx: &mpsc::UnboundedS
         }
         _ => {}
     }
+}
+
+/// How long a finished batch's summary stays on screen before it takes itself
+/// away — long enough to read one line of tally, short enough that it does not
+/// feel like it is waiting for you.
+const BATCH_DONE_DWELL_TICKS: u64 = 25;
+
+/// Put the dashboard back after a batch that worked.
+///
+/// The card at the end of a clean run is a receipt: three green rows saying
+/// "pushed" have nothing left to ask, and every next thing happens on the
+/// dashboard behind them. So it leaves on its own, taking the marks with it the
+/// way the back key does — and moving its tally to the status line, so the
+/// number outlives the card.
+///
+/// Anything that went wrong stays put. A failure, or repos an abort never got
+/// to, has no other record on screen, and a summary that scrolls itself away
+/// before it is read is worse than no summary.
+fn batch_auto_return(state: &mut AppState) {
+    // Only from the batch's own view: if the user has walked somewhere else,
+    // yanking them to the dashboard is a worse interruption than a stale card.
+    if state.view != View::BatchCommit {
+        return;
+    }
+    let Some(batch) = state.batch.as_ref() else {
+        return;
+    };
+    if !batch.returns_on_its_own() {
+        return;
+    }
+    let done = batch.done_tick.unwrap_or(state.tick_count);
+    if state.tick_count.saturating_sub(done) < BATCH_DONE_DWELL_TICKS {
+        return;
+    }
+    let t = batch.tally();
+    let mut parts = vec![format!("{} committed", t.committed)];
+    if t.pushed > 0 {
+        parts.push(format!("{} pushed", t.pushed));
+    }
+    if t.nothing > 0 {
+        parts.push(format!("{} had nothing to do", t.nothing));
+    }
+    state.batch = None;
+    state.repo_marks.clear();
+    state.switch_view(View::Repos);
+    state.set_status_ok(parts.join(" · "));
 }
 
 /// Start the next repo in the batch, or wind the batch up.
@@ -3989,58 +4062,92 @@ fn spawn_git_status(
     });
 }
 
-/// Show the diff for the file under the working-tree cursor.
+/// Show the combined diff of every changed file, opened at the file under the
+/// working-tree cursor.
 ///
-/// Re-entrant on purpose: called again to move to another file, and after a
-/// stage/unstage to redraw what actually changed.
+/// Re-entrant on purpose: called again after a stage/unstage to redraw what
+/// actually changed.
 fn open_git_diff(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
     let Some(gv) = state.git_view.as_ref() else {
         return;
     };
-    let Some(entry) = gv.selected().cloned() else {
+    let entries: Vec<crate::git::StatusEntry> = gv.entries().to_vec();
+    if entries.is_empty() {
         state.set_status("nothing to diff — the working tree is clean".into());
         return;
-    };
+    }
+    let opened_on = gv
+        .selected()
+        .map(|e| e.path.clone())
+        .unwrap_or_else(|| entries[0].path.clone());
     let (spec, path) = (gv.spec.clone(), gv.path.clone());
     // Keep the old text on screen while the new one loads: swapping to an empty
-    // pane and back makes fast `n`/`p` stepping flicker.
+    // pane and back makes a reload after staging flicker.
+    let tick = state.tick_count;
     match state.git_diff.as_mut() {
         Some(dv) if dv.spec == spec => {
-            dv.file = entry.path.clone();
+            dv.file = opened_on;
             dv.loading = true;
+            dv.opened_tick = Some(tick);
         }
         _ => {
-            state.git_diff = Some(crate::app::state::GitDiffView::new(
-                spec.clone(),
-                entry.path.clone(),
-            ))
+            let mut dv = crate::app::state::GitDiffView::new(spec.clone(), opened_on);
+            dv.opened_tick = Some(tick);
+            state.git_diff = Some(dv);
         }
     }
     state.switch_view(View::GitDiff);
 
     let tx = tx.clone();
-    let file = entry.path.clone();
     state.pending += 1;
     tokio::task::spawn_blocking(move || {
-        let evt = match crate::git::file_diff(&path, &entry) {
-            Ok(sections) => AppEvent::GitDiffLoaded(spec, file, sections),
-            Err(e) => AppEvent::TaskError(format!("git diff: {e:#}")),
-        };
-        let _ = tx.send(evt);
+        let mut files = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            match crate::git::file_diff(&path, entry) {
+                Ok(sections) => files.push((entry.path.clone(), sections)),
+                Err(e) => {
+                    let _ = tx.send(AppEvent::TaskError(format!("git diff: {e:#}")));
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(AppEvent::GitDiffLoaded(spec, files));
     });
 }
 
-/// Move to the next/previous changed file without leaving the diff.
-fn step_diff_file(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>, delta: i32) {
-    let Some(gv) = state.git_view.as_mut() else {
+/// Jump to the next/previous file's banner inside the combined diff.
+///
+/// The working-tree cursor follows along, so staging from here still acts on
+/// the file that is on screen.
+fn step_diff_file(state: &mut AppState, delta: i32) {
+    let Some(dv) = state.git_diff.as_mut() else {
         return;
     };
-    let len = gv.entries().len();
-    if len == 0 {
+    if dv.files.is_empty() {
         return;
     }
-    move_cursor(&mut gv.cursor, len, delta);
-    open_git_diff(state, tx);
+    let cur = dv.current_file_idx().unwrap_or(0) as i32;
+    let next = (cur + delta).clamp(0, dv.files.len() as i32 - 1) as usize;
+    dv.file = dv.files[next].clone();
+    dv.pending_jump.set(Some(next));
+    sync_status_cursor_to(state, next);
+}
+
+/// Point the working-tree cursor at the `i`th file of the open diff.
+fn sync_status_cursor_to(state: &mut AppState, i: usize) {
+    let Some(file) = state
+        .git_diff
+        .as_ref()
+        .and_then(|d| d.files.get(i))
+        .cloned()
+    else {
+        return;
+    };
+    if let Some(gv) = state.git_view.as_mut()
+        && let Some(pos) = gv.entries().iter().position(|e| e.path == file)
+    {
+        gv.cursor = pos;
+    }
 }
 
 /// Run one git mutation off-thread; the result refreshes the status view.
@@ -4309,6 +4416,14 @@ fn switch_to_selected_repo(
 /// Logs view is the archive.
 const WATCH_TAIL_KEEP: usize = 400;
 
+/// How many empty answers a job's log gets before jog stops asking for it.
+///
+/// GitHub's REST log endpoint serves the *archive*, which does not exist
+/// until the job finishes — a running job answers `BlobNotFound` every time.
+/// A couple of tries covers the case where the archive is mid-assembly; past
+/// that the pane shows the step feed instead and the poll keeps its budget.
+const WATCH_TAIL_MAX_MISSES: u8 = 3;
+
 /// Follow the running job's log while Watch is open: one fetch per poll, for
 /// the tail pane under the step list.
 ///
@@ -4336,10 +4451,32 @@ fn spawn_watch_tail(
         return;
     };
     let (id, name) = (job.id, job.name.clone());
+    if tail_given_up(state, id) {
+        return;
+    }
     state.watch_tail_pending = true;
-    let (p, tx) = (provider.clone(), tx.clone());
+    spawn_tail_fetch(provider.clone(), id, name, tx.clone());
+}
+
+/// Whether this job's log has already refused often enough to stop asking.
+fn tail_given_up(state: &AppState, job_id: u64) -> bool {
+    state
+        .watch_tail_misses
+        .get(&job_id)
+        .is_some_and(|n| *n >= WATCH_TAIL_MAX_MISSES)
+}
+
+/// The fetch both panes share: the whole log body, trimmed to the tail jog
+/// keeps. `None` covers every failure alike — "nothing there yet" and a hard
+/// error read the same from a pane, which keeps what it already had.
+fn spawn_tail_fetch(
+    provider: Arc<GitHubProvider>,
+    id: u64,
+    name: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
     tokio::spawn(async move {
-        let lines = match p.stream_logs(id).await {
+        let lines = match provider.stream_logs(id).await {
             Ok(stream) => {
                 let mut lines: Vec<String> = stream
                     .filter_map(|c| async { c.ok().map(|c| c.line) })
@@ -4350,8 +4487,6 @@ fn spawn_watch_tail(
                 }
                 Some(lines)
             }
-            // "Not available yet" and every other failure read the same from
-            // the pane: keep showing what we have and try again next poll.
             Err(_) => None,
         };
         let _ = tx.send(AppEvent::WatchTailLoaded(id, name, lines));
@@ -4375,28 +4510,30 @@ fn spawn_dash_tail(
     if state.watch_tail_pending || state.last_frame_width.get() < DASH_SPLIT_MIN_WIDTH {
         return;
     }
-    let (id, name) = match state.dash_tail_target() {
-        Some((_, _, job)) => (job.id, job.name.clone()),
+    let (label, id, name) = match state.dash_tail_target() {
+        Some((spec, _, job)) => (spec.to_string(), job.id, job.name.clone()),
         None => return,
     };
+    if tail_given_up(state, id) {
+        return;
+    }
+    // A job id belongs to the repo that produced it, not to the checkout jog
+    // was launched in. Every other dashboard fetch goes through `for_repo`;
+    // this one asking the launch repo for another repo's job was a flat 404,
+    // which the pane could only report as "still waiting".
+    let Some(remote) = state
+        .repos
+        .iter()
+        .find(|c| c.spec == label)
+        .and_then(|c| c.remote.clone())
+    else {
+        return;
+    };
+    let Ok(rspec) = RepoSpec::parse(&remote) else {
+        return;
+    };
     state.watch_tail_pending = true;
-    let (p, tx) = (provider.clone(), tx.clone());
-    tokio::spawn(async move {
-        let lines = match p.stream_logs(id).await {
-            Ok(stream) => {
-                let mut lines: Vec<String> = stream
-                    .filter_map(|c| async { c.ok().map(|c| c.line) })
-                    .collect()
-                    .await;
-                if lines.len() > WATCH_TAIL_KEEP {
-                    lines.drain(..lines.len() - WATCH_TAIL_KEEP);
-                }
-                Some(lines)
-            }
-            Err(_) => None,
-        };
-        let _ = tx.send(AppEvent::WatchTailLoaded(id, name, lines));
-    });
+    spawn_tail_fetch(Arc::new(provider.for_repo(rspec)), id, name, tx.clone());
 }
 
 fn spawn_repo_status_fetch(
@@ -4754,6 +4891,7 @@ const FINISHED_SOUND: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/finished.mp3"));
 const FAIL_SOUND: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fail.mp3"));
 const QUOTA_SOUND: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/quota.wav"));
+const ASK_SOUND: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ask.wav"));
 
 /// Play the appropriate notification sound for a finished run: the fail sound
 /// on failure/cancellation, otherwise the completion sound.
@@ -4792,6 +4930,37 @@ fn play_quota_alarm(config: &Config) {
         return;
     }
     if let Some(path) = sound_path(&config.ui.quota_sound, QUOTA_SOUND, "quota.wav") {
+        play_sound(&path);
+    }
+}
+
+/// A question has appeared and jog is holding still for an answer.
+///
+/// Called once per frame, so the chime hangs off the edge the dialog appears
+/// on rather than off the frames it stays up for: a push question that goes
+/// unanswered for a minute rings once, and walking Yes/No with ←/→ does not
+/// ring at all. The batch commit this usually follows can run for a while, and
+/// the whole point of asking is that you may not be watching when it lands.
+///
+/// Gated the same way every other sound is — `notify = "never"` and a snooze
+/// mute it — plus its own switch, because a question is a different kind of
+/// event from a run finishing.
+fn announce_prompt(state: &mut AppState, config: &Config) {
+    if state.push_prompt.is_none() {
+        state.prompt_sounded = false;
+        return;
+    }
+    if state.prompt_sounded {
+        return;
+    }
+    state.prompt_sounded = true;
+    if config.ui.notify_mode() == NotifyMode::Never
+        || !config.ui.ask_sound_enabled
+        || state.notify_snoozed()
+    {
+        return;
+    }
+    if let Some(path) = sound_path(&config.ui.ask_sound, ASK_SOUND, "ask.wav") {
         play_sound(&path);
     }
 }
@@ -5208,6 +5377,87 @@ mod tests {
         assert_eq!(st.batch.as_ref().unwrap().phase, BatchPhase::Pushing);
     }
 
+    /// A batch of two, driven to the end of its push phase.
+    fn pushed_batch() -> AppState {
+        let mut st = dashboard();
+        st.repo_marks.insert("acme/api".into());
+        st.repo_marks.insert("acme/web".into());
+        start_batch_commit(&mut st);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        {
+            let batch = st.batch.as_mut().unwrap();
+            batch.input = None;
+            batch.phase = BatchPhase::Pushing;
+            for item in &mut batch.items {
+                item.state = crate::app::state::ItemState::Pushed;
+            }
+        }
+        // The queue is empty, so this is the step that winds the batch up.
+        batch_step(&mut st, &tx);
+        st
+    }
+
+    #[test]
+    fn a_clean_batch_shows_its_receipt_and_then_goes_back_to_the_dashboard() {
+        let mut st = pushed_batch();
+        assert_eq!(st.batch.as_ref().unwrap().phase, BatchPhase::Done);
+        let done = st.batch.as_ref().unwrap().done_tick.expect("finishing marks the tick");
+
+        // The summary is there to be read: it does not blink out on the frame
+        // it appeared on.
+        st.tick_count = done + BATCH_DONE_DWELL_TICKS - 1;
+        batch_auto_return(&mut st);
+        assert!(st.batch.is_some(), "the receipt stays up long enough to read");
+        assert_eq!(st.view, View::BatchCommit);
+
+        st.tick_count = done + BATCH_DONE_DWELL_TICKS;
+        batch_auto_return(&mut st);
+        assert!(st.batch.is_none());
+        assert_eq!(st.view, View::Repos);
+        // The marks go with it, exactly as the back key would take them.
+        assert!(st.repo_marks.is_empty());
+        // …and the tally outlives the card it was drawn on.
+        let msg = st.status_msg.clone().unwrap_or_default();
+        assert!(msg.contains("2 committed"), "{msg}");
+        assert!(msg.contains("2 pushed"), "{msg}");
+    }
+
+    #[test]
+    fn a_batch_that_went_wrong_waits_to_be_dismissed() {
+        // An abort leaves repos unattempted, and the card is the only place
+        // that says which ones. It must not walk away from that.
+        let mut st = dashboard();
+        st.repo_marks.insert("acme/api".into());
+        st.repo_marks.insert("acme/web".into());
+        start_batch_commit(&mut st);
+        {
+            let batch = st.batch.as_mut().unwrap();
+            batch.input = None;
+            batch.phase = BatchPhase::Committing;
+            batch.items[0].state = crate::app::state::ItemState::Failed("hook said no".into());
+            batch.abort();
+        }
+        assert_eq!(st.batch.as_ref().unwrap().phase, BatchPhase::Done);
+        assert!(!st.batch.as_ref().unwrap().returns_on_its_own());
+        st.tick_count = 10_000;
+        batch_auto_return(&mut st);
+        assert!(st.batch.is_some(), "a failure is not a receipt");
+        assert_eq!(st.view, View::BatchCommit);
+    }
+
+    #[test]
+    fn a_finished_batch_left_behind_does_not_yank_the_view_back() {
+        // Walked off to a repo's working tree while the batch wound up: the
+        // dashboard can wait for the key rather than pulling you off the
+        // screen you chose.
+        let mut st = pushed_batch();
+        st.switch_view(View::GitStatus);
+        st.tick_count = 10_000;
+        batch_auto_return(&mut st);
+        assert_eq!(st.view, View::GitStatus);
+        assert!(st.batch.is_some());
+    }
+
     #[test]
     fn a_landed_commit_asks_about_pushing_with_yes_already_chosen() {
         let mut st = open_working_tree("## main...origin/main\0");
@@ -5601,8 +5851,39 @@ mod tests {
         let mut cfg = Config::default();
         // Keep tests silent and headless.
         cfg.ui.notify_sound = false;
+        cfg.ui.ask_sound_enabled = false;
         cfg.ui.notify_desktop = false;
         cfg
+    }
+
+    #[test]
+    fn a_question_chimes_when_it_appears_and_not_once_a_frame_after() {
+        let mut st = open_working_tree("## main...origin/main\0");
+        let cfg = quiet_config();
+
+        // Nothing asked, nothing owed.
+        announce_prompt(&mut st, &cfg);
+        assert!(!st.prompt_sounded);
+
+        offer_push(&mut st, "acme/api");
+        announce_prompt(&mut st, &cfg);
+        assert!(st.prompt_sounded, "the question that just appeared is announced");
+
+        // The dialog stays up for as many frames as it takes to answer, and
+        // ←/→ walks the buttons. Neither is a new question.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        handle_push_prompt(&mut st, press(KeyCode::Right), &tx);
+        announce_prompt(&mut st, &cfg);
+        announce_prompt(&mut st, &cfg);
+        assert!(st.prompt_sounded);
+
+        // Answered, the ledger clears — the next question gets its own chime.
+        handle_push_prompt(&mut st, press(KeyCode::Esc), &tx);
+        announce_prompt(&mut st, &cfg);
+        assert!(!st.prompt_sounded, "a closed dialog rearms the chime");
+        offer_push(&mut st, "acme/api");
+        announce_prompt(&mut st, &cfg);
+        assert!(st.prompt_sounded);
     }
 
     #[test]

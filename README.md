@@ -163,6 +163,13 @@ batch there and waits:
 Nothing is pushed as a side effect. When the last commit lands the batch reports
 what it did and asks: `P` pushes every repo it committed, `Esc` finishes.
 
+A run that finished clean shows its receipt — `Done · 3 committed · 3 pushed` —
+for a couple of seconds and then puts the dashboard back on its own, tally moved
+to the status line and the marks cleared, exactly as `Esc` would. `Esc` is still
+there to skip the wait. A run with a failure in it, or one you stopped with repos
+left unattempted, stays up instead: that card is the only record of which repos
+those were, and it waits for the key.
+
 The per-repo flow above is untouched — this is a second path, not a replacement.
 
 ## Watching a pre-commit hook
@@ -256,6 +263,24 @@ notify_desktop = true    # raise an OS notification
 `notify = "failure"` is the "only tell me when something breaks" mode. A run is
 only announced if `jog` saw it in flight first, so starting up never fires a
 burst of notifications for runs that finished hours ago.
+
+### Questions
+
+`jog` also chimes when it puts a question on screen and waits for you — the
+push prompt that follows a commit, and the one a batch raises when every repo
+in it has committed. Those land minutes after you started the thing, which is
+usually long enough to have switched windows; the chime is what tells you the
+terminal is holding a keystroke for you.
+
+```toml
+[ui]
+ask_sound_enabled = true   # chime when a question appears
+ask_sound = ""             # empty uses the bundled chime
+```
+
+It is its own switch because it is its own kind of event: a finished run is
+news you can read whenever you get back, a question is `jog` standing still.
+`notify = "never"` and a snooze mute it along with everything else.
 
 ## The API budget
 
@@ -375,11 +400,14 @@ favorites = ["ci.yml", "deploy.yml"]   # pinned to the top of the list
 complete_sound = "/usr/share/sounds/freedesktop/stereo/complete.oga"  # set to "" to disable
 fail_sound = ""                        # empty uses the bundled sound
 quota_sound = ""                       # alarm when the API budget is nearly spent
+ask_sound = ""                         # chime when a question waits for an answer
 notify = "always"                      # "always" · "failure" · "never"
 notify_sound = true
+ask_sound_enabled = true               # chime on questions (own switch, see above)
 notify_desktop = true
 log_focus_context = 2                  # context lines kept around each error in focus mode
 # github_icon = ""                    # hide the per-repo forge mark (default: the Nerd Font GitHub logo)
+# file_icons = false                   # drop the language marks on the diff's file bands (Nerd Font glyphs)
 
 [provider]
 kind = "github"
