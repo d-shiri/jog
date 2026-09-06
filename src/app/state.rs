@@ -396,8 +396,8 @@ impl GitOp {
 /// styling never has to guess which is which from the characters alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffLine {
-    /// The banner opening one file's diff in the combined view, with that
-    /// file's own +/− counts so the divider says what the file cost.
+    /// The banner opening one file's diff, with that file's own +/− counts
+    /// so the divider says what the file cost.
     File { path: String, add: usize, del: usize },
     Section(String),
     Text(String),
@@ -662,33 +662,29 @@ impl GitDiffView {
     ///
     /// Each file opens with a banner carrying its own +/− counts, set apart by
     /// blank rows, so the combined diff reads as chapters rather than one
-    /// unbroken wall. Both banners follow the same rule: dropped when there is
-    /// only one file (or one section) — with nothing to tell apart, a banner
-    /// is a row of screen space that says nothing.
+    /// unbroken wall. One file gets one too: the band is what names the file
+    /// on screen, and a lone diff opening straight into `@@ -1,7 +1,9 @@` is
+    /// the one view in the app that never says what it is looking at.
+    /// Section labels still stand down when there is only one of them.
     pub fn set_files(&mut self, files: Vec<(String, Vec<crate::git::DiffSection>)>) {
         self.loading = false;
         self.scroll.set(0);
         self.lines.clear();
         self.files.clear();
         self.file_lines.clear();
-        let bannered = files.len() > 1;
         for (path, sections) in &files {
-            if bannered {
-                if !self.files.is_empty() {
-                    // The clear cut between files: two empty rows before the
-                    // next banner block, one after it before the diff resumes.
-                    self.lines.push(DiffLine::Text(String::new()));
-                    self.lines.push(DiffLine::Text(String::new()));
-                }
-                let (add, del) = section_stats(sections);
-                self.file_lines.push(self.lines.len());
-                self.lines.push(DiffLine::File { path: path.clone(), add, del });
+            if !self.files.is_empty() {
+                // The clear cut between files: two empty rows before the
+                // next banner block, one after it before the diff resumes.
                 self.lines.push(DiffLine::Text(String::new()));
-            } else {
-                self.file_lines.push(self.lines.len());
+                self.lines.push(DiffLine::Text(String::new()));
             }
+            let (add, del) = section_stats(sections);
+            self.file_lines.push(self.lines.len());
+            self.lines.push(DiffLine::File { path: path.clone(), add, del });
+            self.lines.push(DiffLine::Text(String::new()));
             self.files.push(path.clone());
-            if bannered && sections.is_empty() {
+            if sections.is_empty() {
                 // A mode change or pure rename: a real entry with no text.
                 // Under a banner, silence would read as a rendering bug.
                 self.lines.push(DiffLine::Text(
@@ -716,11 +712,6 @@ impl GitDiffView {
             .enumerate()
             .filter_map(|(i, r)| matches!(r, DiffRow::File { .. }).then_some(i))
             .collect();
-        if !bannered {
-            // No banner rows to find: the single file starts at the top in
-            // both layouts.
-            self.file_rows = vec![0; self.files.len()];
-        }
         self.units.set(0);
         // Fresh content, fresh entrances: every band waits to be seen again.
         *self.band_seen.borrow_mut() = vec![None; self.files.len()];
@@ -1996,6 +1987,15 @@ pub struct AppState {
     /// Keybinding reference overlay.
     pub show_help: bool,
     pub help_scroll: u16,
+    /// What the help card is filtered down to. Empty means the whole
+    /// reference — the card is long enough that "which key stages a file?"
+    /// is a real question, and scanning eleven sections for it is a worse
+    /// answer than typing "stage".
+    pub help_search: String,
+    /// Whether keys are being typed into that filter rather than scrolling
+    /// the card. Held apart from the query so `↵` can put the keyboard back
+    /// on the card while the filter stays on screen.
+    pub help_typing: bool,
     /// The tick the help card went up on — the clock its rows reveal
     /// themselves against, exactly like the services card's. `None` while it
     /// is closed (or on screen without an entrance to play — a test).
@@ -2214,6 +2214,8 @@ impl AppState {
             fetch_started_tick: Cell::new(0),
             show_help: false,
             help_scroll: 0,
+            help_search: String::new(),
+            help_typing: false,
             help_opened_tick: None,
             dash_opened_tick: None,
             help_seen: false,
@@ -3771,9 +3773,10 @@ mod tests {
         let mut dv = GitDiffView::new("acme/api".into(), "src/a.rs".into());
         dv.set_sections(vec![section("unstaged", "@@ -1 +1 @@\n-a\n+b\n")]);
         assert!(!dv.loading);
-        // With nothing to tell it apart from, a banner is a wasted row.
+        // With nothing to tell it apart from, a section label is a wasted row
+        // — the file's own band above it is a different question.
         assert!(!dv.lines.iter().any(|l| matches!(l, DiffLine::Section(_))));
-        assert_eq!(dv.lines.len(), 3);
+        assert_eq!(dv.lines.len(), 5, "band, blank, and the three diff lines");
     }
 
     #[test]
@@ -3813,7 +3816,7 @@ mod tests {
         dv.set_sections(vec![section("unstaged", "-let x = 1;\n+let x = 2;\n")]);
         // Everything but the digit is shared; the mark lands on the digit,
         // offset by one for the `-`/`+` marker.
-        assert_eq!(dv.emphasis, vec![Some((9, 10)), Some((9, 10))]);
+        assert_eq!(dv.emphasis, vec![None, None, Some((9, 10)), Some((9, 10))]);
     }
 
     #[test]
@@ -3830,23 +3833,25 @@ mod tests {
             ),
             _ => panic!("not a pair: {r:?}"),
         };
-        assert_eq!(dv.rows[0], DiffRow::Meta("@@ -12,3 +12,4 @@".into()));
+        // Row 0 is the file's band and row 1 the blank under it; the diff
+        // itself starts at 2.
+        assert_eq!(dv.rows[2], DiffRow::Meta("@@ -12,3 +12,4 @@".into()));
         // Context counts on both sides and keeps its own number on each.
         assert_eq!(
-            sides(&dv.rows[1]),
+            sides(&dv.rows[3]),
             (Some(("ctx".into(), Some(12))), Some(("ctx".into(), Some(12))))
         );
         // The replaced line is one row, read across.
         assert_eq!(
-            sides(&dv.rows[2]),
+            sides(&dv.rows[4]),
             (Some(("old".into(), Some(13))), Some(("new".into(), Some(13))))
         );
         // The run is longer on one side, so the row opposite the extra line is
         // a gap rather than someone else's line pulled up into it.
-        assert_eq!(sides(&dv.rows[3]), (None, Some(("extra".into(), Some(14)))));
+        assert_eq!(sides(&dv.rows[5]), (None, Some(("extra".into(), Some(14)))));
         // And the numbering has diverged by exactly the line that was added.
         assert_eq!(
-            sides(&dv.rows[4]),
+            sides(&dv.rows[6]),
             (Some(("ctx2".into(), Some(14))), Some(("ctx2".into(), Some(15))))
         );
     }
@@ -3855,8 +3860,8 @@ mod tests {
     fn tabs_are_expanded_and_the_mark_moves_with_them() {
         let mut dv = GitDiffView::new("acme/api".into(), "src/a.rs".into());
         dv.set_sections(vec![section("unstaged", "-\tlet x = 1;\n+\tlet x = 2;\n")]);
-        let DiffRow::Pair { old: Some(old), new: Some(new) } = &dv.rows[0] else {
-            panic!("not a pair: {:?}", dv.rows[0]);
+        let DiffRow::Pair { old: Some(old), new: Some(new) } = &dv.rows[2] else {
+            panic!("not a pair: {:?}", dv.rows[2]);
         };
         // A raw tab jumps to the terminal's own stop, measured from the edge of
         // the screen — inside a padded column it lands anywhere.
@@ -3882,7 +3887,8 @@ mod tests {
         // Two deletions, one addition: pairing the first `-` with the `+`
         // would be a guess, and a wrong one marks unrelated lines.
         dv.set_sections(vec![section("unstaged", "-let a = 1;\n-let b = 1;\n+let a = 2;\n")]);
-        assert_eq!(dv.emphasis, vec![None, None, None]);
+        // Two leading `None`s for the file's band and the blank under it.
+        assert_eq!(dv.emphasis, vec![None, None, None, None, None]);
     }
 
     #[test]
@@ -3927,7 +3933,8 @@ mod tests {
             &(0..50).map(|i| format!("+{i}\n")).collect::<String>(),
         )]);
         dv.scroll_by(1000, 10);
-        assert_eq!(dv.scroll.get(), 40);
+        // 50 diff lines under the file's band and the blank row after it.
+        assert_eq!(dv.scroll.get(), 42);
         dv.scroll_by(-1000, 10);
         assert_eq!(dv.scroll.get(), 0);
         // A diff shorter than the viewport cannot scroll at all.
@@ -3976,12 +3983,16 @@ mod tests {
     }
 
     #[test]
-    fn a_single_file_gets_no_banner() {
-        // With nothing to tell apart, a banner is a wasted row — and the tests
-        // above this one lean on the single-file layout staying bare.
+    fn a_single_file_still_opens_under_its_own_banner() {
+        // The band is what names the file on screen: without it a lone diff
+        // opens straight into `@@` and never says what it is showing.
         let mut dv = GitDiffView::new("acme/api".into(), "a.rs".into());
         dv.set_files(vec![("a.rs".into(), vec![section("unstaged", "+one\n")])]);
-        assert!(!dv.lines.iter().any(|l| matches!(l, DiffLine::File { .. })));
+        assert_eq!(
+            dv.lines.first(),
+            Some(&DiffLine::File { path: "a.rs".into(), add: 1, del: 0 })
+        );
+        // And it is the top of the file in both layouts, as before.
         assert_eq!(dv.file_lines, vec![0]);
         assert_eq!(dv.file_rows, vec![0]);
     }

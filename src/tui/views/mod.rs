@@ -1186,26 +1186,23 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                 ("Esc".into(), "cancel"),
             ]
         }
-        // Hook output on screen: the movement keys drive it, so say so rather
-        // than list the file-list keys it has taken over.
+        // Hook output on screen: the pane writes its own keys along its own
+        // bottom border — scrolling, the error walk, yanking, the way out —
+        // so the footer carries what is left of the view behind it rather
+        // than saying the same six things two rows lower.
         View::GitStatus if state.current_op().is_some() => {
             let running = state.current_op().is_some_and(|o| !o.finished);
             let mut hints = vec![
-                (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "scroll"),
-                (
-                    format!("{}/{}", display_key(&km.next_error), display_key(&km.prev_error)),
-                    "next/prev error",
-                ),
                 (
                     format!("{}/{}", display_key(&km.scroll_top), display_key(&km.scroll_bottom)),
                     "top/tail",
                 ),
-                (display_key(&km.yank).into(), "yank output"),
             ];
-            hints.push((
-                display_key(&km.back).into(),
-                if running { "leave (keeps running)" } else { "dismiss" },
-            ));
+            // Refused while a git command is in flight, so not offered either.
+            if !running {
+                hints.push((display_key(&km.git_push).into(), "push"));
+            }
+            hints.push((display_key(&km.refresh).into(), "refresh"));
             hints
         }
         View::GitStatus => {
@@ -2876,7 +2873,7 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
             vec![
                 (pair(&km.down, &km.up), "move cursor"),
                 ("↵".into(), "open / drill in"),
-                (k(&km.back), "back one view"),
+                (format!("{}/⌫", k(&km.back)), "back one view"),
                 (k(&km.finder), "fuzzy find in the current list"),
                 (k(&km.refresh), "re-fetch whatever this screen shows"),
                 (k(&km.repos_view), "multi-repo dashboard"),
@@ -3035,6 +3032,62 @@ fn wrap_words(s: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Does one help row survive the card's filter? Every whitespace-separated
+/// term has to turn up somewhere in the binding or its description, so
+/// "push branch" narrows where either word alone would not. Substring, not
+/// fuzzy: on prose this short a subsequence match keeps almost every row,
+/// which is the one thing a filter must not do.
+fn help_row_matches(key: &str, desc: &str, query: &str) -> bool {
+    let hay = format!("{key} {desc}").to_lowercase();
+    query
+        .split_whitespace()
+        .all(|term| hay.contains(&term.to_lowercase()))
+}
+
+/// `s` cut into spans with every occurrence of a search term lifted into
+/// `hit` — the row shows *why* it survived, rather than leaving the eye to
+/// re-run the search the card just ran.
+fn highlight_terms(s: &str, query: &str, base: Style, hit: Style) -> Vec<Span<'static>> {
+    // One lowercase char per source char, so a position in the fold is a
+    // position in the original — `flat_map` over `to_lowercase` would not
+    // hold that, and the spans would slice at the wrong place.
+    let lower: Vec<char> = s
+        .chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
+    let src: Vec<char> = s.chars().collect();
+    let mut mark = vec![false; src.len()];
+    for term in query.split_whitespace() {
+        let t: Vec<char> = term
+            .chars()
+            .map(|c| c.to_lowercase().next().unwrap_or(c))
+            .collect();
+        if t.is_empty() || t.len() > lower.len() {
+            continue;
+        }
+        for i in 0..=(lower.len() - t.len()) {
+            if lower[i..i + t.len()] == t[..] {
+                mark[i..i + t.len()].iter_mut().for_each(|m| *m = true);
+            }
+        }
+    }
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut i = 0;
+    while i < src.len() {
+        let on = mark[i];
+        let start = i;
+        while i < src.len() && mark[i] == on {
+            i += 1;
+        }
+        let text: String = src[start..i].iter().collect();
+        out.push(Span::styled(text, if on { hit } else { base }));
+    }
+    if out.is_empty() {
+        out.push(Span::styled(String::new(), base));
+    }
+    out
+}
+
 fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     if !state.show_help {
         return;
@@ -3042,13 +3095,25 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     let current = help_section_for(state.view);
     let mut sections = help_sections(&state.keymap);
+    // The filter, applied before anything is measured: the key column and the
+    // two-column fold are both sized from what actually survives.
+    let query = state.help_search.trim().to_string();
+    if !query.is_empty() {
+        for (_, rows) in sections.iter_mut() {
+            rows.retain(|(k, d)| help_row_matches(k, d, &query));
+        }
+        sections.retain(|(_, rows)| !rows.is_empty());
+    }
     // Float the current view's section to just below Global, so "what can I do
     // here?" is answered from the top-left corner, before any reading order.
-    if let Some(i) = sections.iter().position(|(t, _)| *t == current)
-        && i > 1
-    {
-        let s = sections.remove(i);
-        sections.insert(1, s);
+    // Below Global, that is — unless a filter has taken Global away, in which
+    // case there is nothing left to float under and the section goes to the top.
+    if let Some(i) = sections.iter().position(|(t, _)| *t == current) {
+        let dest = usize::from(sections.first().is_some_and(|(t, _)| *t == "Global"));
+        if i > dest {
+            let s = sections.remove(i);
+            sections.insert(dest, s);
+        }
     }
 
     // Key column is sized to the widest binding so descriptions line up.
@@ -3101,20 +3166,24 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
                 .bg(theme.overlay)
                 .fg(if is_current { theme.accent } else { theme.text_bright })
                 .bold();
+            let base = Style::default().fg(theme.text);
+            let hit = Style::default().fg(theme.accent).bold();
             for (i, seg) in wrap_words(desc, desc_w).into_iter().enumerate() {
-                if i == 0 {
-                    out.push(Line::from(vec![
+                let mut line = if i == 0 {
+                    vec![
                         Span::raw(" "),
                         Span::styled(format!(" {key:>key_w$} "), cap_style),
                         Span::raw("  "),
-                        Span::styled(seg, Style::default().fg(theme.text)),
-                    ]));
+                    ]
                 } else {
-                    out.push(Line::from(vec![
-                        Span::raw(" ".repeat(key_w + 5)),
-                        Span::styled(seg, Style::default().fg(theme.text)),
-                    ]));
+                    vec![Span::raw(" ".repeat(key_w + 5))]
+                };
+                if query.is_empty() {
+                    line.push(Span::styled(seg, base));
+                } else {
+                    line.extend(highlight_terms(&seg, &query, base, hit));
                 }
+                out.push(Line::from(line));
             }
         }
         out.push(Line::default());
@@ -3150,6 +3219,17 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     while right.last().is_some_and(|l| l.spans.is_empty()) {
         right.pop();
     }
+    // A filter that matches nothing says so, rather than leaving an empty
+    // frame that looks like the card failed to draw.
+    if left.is_empty() && right.is_empty() {
+        left.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                format!("no binding matches “{query}”"),
+                Style::default().fg(theme.text_faint).italic(),
+            ),
+        ]));
+    }
 
     let content_h = left.len().max(right.len()) as u16;
     // + 2 borders + 2 rows of breathing room, like the services card: caps
@@ -3165,9 +3245,17 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     state.last_help_max_scroll.set(max_scroll);
     let scroll = state.help_scroll.min(max_scroll);
 
-    let footer = if max_scroll > 0 {
+    // The bottom rail doubles as the search field: while typing, it is the
+    // query and a cursor, and nothing else — a card that keeps offering
+    // "any key closes" while every key is going into a text field is lying.
+    let find = display_key(&state.keymap.search);
+    let footer = if state.help_typing {
+        format!(" {find} {}▏ · ↵ keeps it · Esc clears ", state.help_search)
+    } else if !query.is_empty() {
+        format!(" filtered: {query} · {find} edits · Esc clears ")
+    } else if max_scroll > 0 {
         format!(
-            " {}/{} or wheel scroll · {}–{} of {} · any other key closes ",
+            " {}/{} or wheel scroll · {}–{} of {} · {find} search · any other key closes ",
             display_key(&state.keymap.down),
             display_key(&state.keymap.up),
             scroll + 1,
@@ -3175,7 +3263,12 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
             content_h,
         )
     } else {
-        " any key closes ".to_string()
+        format!(" {find} search · any other key closes ")
+    };
+    let footer_style = if state.help_typing {
+        Style::default().fg(theme.accent)
+    } else {
+        Style::default().fg(theme.text_faint)
     };
 
     // The same dress as the services card: a chip cut into an accent frame,
@@ -3192,7 +3285,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
         ]))
         .title_alignment(ratatui::layout::Alignment::Center)
         .title_bottom(
-            Line::from(Span::styled(footer, Style::default().fg(theme.text_faint))).centered(),
+            Line::from(Span::styled(footer, footer_style)).centered(),
         )
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -3497,6 +3590,76 @@ fn op_row_marker(op: &GitOp, tick: u64, theme: &Theme) -> Span<'static> {
     }
 }
 
+/// The keys the hook-output pane answers to, in the order they are worth
+/// knowing. Scrolling and yanking always; the error walk only when there are
+/// errors to walk; and then the way out — which in the Changes view is also
+/// the way forward, because a failed hook leaves a commit to fix and make
+/// again. A batch keeps its own retry/skip rail across the queue above.
+fn op_key_rail(op: &GitOp, state: &AppState) -> Vec<(String, &'static str)> {
+    let km = &state.keymap;
+    let pair = |a: &str, b: &str| format!("{}/{}", display_key(a), display_key(b));
+    let mut rail = vec![(pair(&km.down, &km.up), "scroll")];
+    if op.error_count() > 0 {
+        rail.push((pair(&km.next_error, &km.prev_error), "error"));
+    }
+    rail.push((display_key(&km.yank).to_string(), "yank"));
+    if !op.finished {
+        // The command is still going: `back` steps out of the view and leaves
+        // it running rather than killing it, so say that and not "dismiss".
+        rail.push((display_key(&km.back).to_string(), "leave, keeps running"));
+        return rail;
+    }
+    // In a batch, retry/skip/stop belong to the queue and are already written
+    // across the top of it — repeating them here would say the same thing
+    // twice and crowd out the keys that are only on this pane.
+    if state.view != View::BatchCommit {
+        rail.push((display_key(&km.back).to_string(), "dismiss"));
+        // A hook that failed usually left something to fix — and a formatter
+        // that rewrote the files leaves them unstaged, which is the one step
+        // people forget before committing again.
+        if op.failed {
+            rail.push((display_key(&km.git_stage_all).to_string(), "stage all"));
+            rail.push((display_key(&km.git_commit).to_string(), "commit again"));
+        }
+    }
+    rail
+}
+
+/// A key rail as one line, cut to `width` by dropping whole entries off the
+/// end — a truncated rail is a rail whose last key reads as something it is
+/// not, and the app footer still carries the full set.
+fn rail_line(rail: &[(String, &'static str)], width: u16, theme: &Theme) -> Line<'static> {
+    // Two corners, and a space either side of the run so it never touches them.
+    let room = width.saturating_sub(4) as usize;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for (key, desc) in rail {
+        let sep = if spans.is_empty() { "" } else { " · " };
+        let cost = disp_width(sep) + disp_width(key) + 1 + disp_width(desc);
+        if used + cost > room {
+            break;
+        }
+        used += cost;
+        if !sep.is_empty() {
+            spans.push(Span::styled(sep, Style::default().fg(theme.border_dim)));
+        }
+        spans.push(Span::styled(
+            key.clone(),
+            Style::default().fg(theme.text_bright).bold(),
+        ));
+        spans.push(Span::styled(
+            format!(" {desc}"),
+            Style::default().fg(theme.text_faint),
+        ));
+    }
+    if spans.is_empty() {
+        return Line::default();
+    }
+    spans.insert(0, Span::raw(" "));
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
 /// The output of a running — or just-failed — commit or push.
 ///
 /// This pane exists for hooks. A `pre-commit` running pytest or pyright is the
@@ -3528,6 +3691,12 @@ fn render_op_output(f: &mut Frame, area: Rect, op: &GitOp, state: &AppState) {
         (format!("✓ {}", op.label()), theme.success)
     };
 
+    // What can be done *with this pane*, written on the pane. When a hook says
+    // no, the keys that get you back out — read the failure, copy it, fix the
+    // file, try again — are worth more on the box being stared at than on the
+    // app footer at the bottom of the screen, and a failed commit is exactly
+    // the moment nobody wants to go looking for `?`.
+    let rail = op_key_rail(op, state);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -3535,7 +3704,8 @@ fn render_op_output(f: &mut Frame, area: Rect, op: &GitOp, state: &AppState) {
         .title(Span::styled(
             format!(" {title} "),
             Style::default().fg(border).bold(),
-        ));
+        ))
+        .title_bottom(rail_line(&rail, area.width, theme).right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 {
@@ -4016,8 +4186,8 @@ fn lang_icon(path: &str) -> &'static str {
     }
 }
 
-/// The band naming one file in the combined view: a language mark, the
-/// filename and its own +/− counts on a solid run of the accent colour, the
+/// The band naming one file: a language mark, the filename and its own
+/// +/− counts on a solid run of the accent colour, the
 /// full width of the pane — a chapter head no row of diff text can be
 /// mistaken for, so where one file ends and the next begins is a glance, not
 /// a search.
@@ -4044,18 +4214,25 @@ fn file_banner(
     } else {
         format!(" {icon} ")
     };
-    let stats = format!("  +{add} −{del}");
+    // The counts carry their own meaning: what the file gained in green, what
+    // it lost in red. Both are taken down towards `surface` first — the raw
+    // success/failure colours are pitched for a dark background and would sit
+    // on the light band with nearly no contrast at all.
+    let added = band.fg(mix(theme.success, theme.surface, 0.55)).bold();
+    let removed = band.fg(mix(theme.failure, theme.surface, 0.55)).bold();
+    let plus = format!("  +{add}");
+    let minus = format!(" −{del}");
+    let stats_w = disp_width(&plus) + disp_width(&minus);
     let path = truncate(
         path,
-        width
-            .saturating_sub(disp_width(&lead) + 1 + disp_width(&stats))
-            .max(1),
+        width.saturating_sub(disp_width(&lead) + 1 + stats_w).max(1),
     );
-    let pad = width.saturating_sub(disp_width(&lead) + disp_width(&path) + disp_width(&stats));
+    let pad = width.saturating_sub(disp_width(&lead) + disp_width(&path) + stats_w);
     if wipe >= 1.0 {
         return Line::from(vec![
             Span::styled(format!("{lead}{path}"), band.bold()),
-            Span::styled(stats, band),
+            Span::styled(plus, added),
+            Span::styled(minus, removed),
             Span::styled(" ".repeat(pad), band),
         ]);
     }
@@ -4063,8 +4240,9 @@ fn file_banner(
     // nearly done, and the whole point here is watching it travel.
     let keep = (width as f64 * wipe).round() as usize;
     let (head, head_w) = fit_columns(&format!("{lead}{path}"), keep);
-    let (mid, mid_w) = fit_columns(&stats, keep.saturating_sub(head_w));
-    let fill = keep.saturating_sub(head_w + mid_w);
+    let (plus, plus_w) = fit_columns(&plus, keep.saturating_sub(head_w));
+    let (minus, minus_w) = fit_columns(&minus, keep.saturating_sub(head_w + plus_w));
+    let fill = keep.saturating_sub(head_w + plus_w + minus_w);
     // The comet tail ahead of the solid ground, densest where it leaves it.
     let edge: String = ["▓", "▒", "░"]
         .iter()
@@ -4073,7 +4251,8 @@ fn file_banner(
         .collect();
     Line::from(vec![
         Span::styled(head, band.bold()),
-        Span::styled(mid, band),
+        Span::styled(plus, added),
+        Span::styled(minus, removed),
         Span::styled(" ".repeat(fill), band),
         Span::styled(edge, Style::default().fg(theme.accent)),
     ])
@@ -4244,11 +4423,16 @@ fn render_git_diff(f: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let (add, del) = dv.stats();
-    // One file keeps its name in the title; more get a count, and the names
-    // live on the banners the pane scrolls through.
-    let mut title = match dv.files.len() {
-        0 | 1 => format!("{}  ", dv.file),
-        n => format!("{n} files  "),
+    // The names live on the bands the pane scrolls through — every file has
+    // one now — so the title counts files rather than repeating the first
+    // one two rows above itself. Until the diff arrives there are no bands
+    // yet, and the title is the only thing that can say what is coming.
+    let mut title = if dv.loading || dv.files.is_empty() {
+        format!("{}  ", dv.file)
+    } else if dv.files.len() == 1 {
+        "1 file  ".to_string()
+    } else {
+        format!("{} files  ", dv.files.len())
     };
     if dv.loading {
         title.push_str("loading…");
@@ -6161,20 +6345,33 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_file_gets_the_same_band_as_any_other() {
+        let st = diff_state(HUNK);
+        let out = draw_diff(&st, 100, 12);
+        // The band names the file inside the pane…
+        let band = out.lines().nth(1).unwrap();
+        assert!(band.contains("src/api.rs  +2 −1"), "got {band:?}");
+        // …so the title counts files instead of repeating the name above it.
+        assert!(out.starts_with("╭─┤ 1 file  +2 −1 ├"), "got:\n{out}");
+        assert!(!out.lines().next().unwrap().contains("api.rs"), "got:\n{out}");
+    }
+
+    #[test]
     fn the_scroll_counts_what_the_layout_actually_drew() {
         let st = diff_state(HUNK);
         let dv = st.git_diff.as_ref().unwrap();
-        // Six unified lines fold into five rows — the ± pair is one row.
-        assert_eq!(dv.lines.len(), 6);
-        assert_eq!(dv.rows.len(), 5);
+        // The file's band, the blank under it, and six unified lines — of
+        // which the ± pair folds into one row.
+        assert_eq!(dv.lines.len(), 8);
+        assert_eq!(dv.rows.len(), 7);
 
         draw_diff(&st, 100, 12);
-        assert_eq!(dv.units.get(), 5, "split: the offset counts rows");
-        assert_eq!(dv.max_scroll(3), 2);
+        assert_eq!(dv.units.get(), 7, "split: the offset counts rows");
+        assert_eq!(dv.max_scroll(3), 4);
 
         draw_diff(&st, 44, 12);
-        assert_eq!(dv.units.get(), 6, "unified: it counts lines again");
-        assert_eq!(dv.max_scroll(3), 3);
+        assert_eq!(dv.units.get(), 8, "unified: it counts lines again");
+        assert_eq!(dv.max_scroll(3), 5);
     }
 
     #[test]
@@ -6564,6 +6761,65 @@ mod tests {
         // them puts a new branch on the remote for everyone else to see.
         let (text, _) = push_prompt_screen(false);
         assert!(text.contains("publish main to origin?"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_hook_writes_the_way_out_on_the_pane_itself() {
+        let mut op = GitOp::new("commit", Some("pre-commit".into()), 0);
+        op.push_line("pytest...Failed".into(), false);
+        op.finished = true;
+        op.failed = true;
+        let out = draw_changes(&state_with_op(op), 100, 14);
+        // Reading it, copying it, and putting it away — plus the two keys that
+        // get the commit made once the hook's complaint has been dealt with.
+        for want in ["j/k scroll", "e/E error", "y yank", "Esc dismiss", "a stage all", "c commit again"] {
+            assert!(out.contains(want), "no `{want}` on the pane:\n{out}");
+        }
+    }
+
+    #[test]
+    fn a_running_hook_offers_only_what_it_can_actually_do() {
+        let mut op = GitOp::new("commit", Some("pre-commit".into()), 0);
+        op.push_line("ruff.....".into(), false);
+        let out = draw_changes(&state_with_op(op), 100, 14);
+        // `back` leaves the command running rather than killing it, and there
+        // is nothing to fix or re-commit until it has had its say.
+        assert!(out.contains("Esc leave, keeps running"), "got:\n{out}");
+        assert!(!out.contains("commit again"), "got:\n{out}");
+        // No errors yet, so no error walk offered.
+        assert!(!out.contains("e/E error"), "got:\n{out}");
+    }
+
+    #[test]
+    fn the_batch_pane_leaves_retry_and_skip_to_the_queue_above_it() {
+        let out = draw_batch(&batch_state(BatchPhase::Paused), 110, 18);
+        // Said once, on the queue that owns those keys.
+        assert_eq!(out.matches("retry").count(), 1, "got:\n{out}");
+        assert_eq!(out.matches("skip").count(), 1, "got:\n{out}");
+        // The pane still says what the pane can do.
+        assert!(out.contains("y yank"), "got:\n{out}");
+    }
+
+    #[test]
+    fn a_narrow_pane_drops_whole_keys_rather_than_half_of_one() {
+        let theme = Theme::midnight();
+        let rail = vec![
+            ("j/k".to_string(), "scroll"),
+            ("y".to_string(), "yank"),
+            ("Esc".to_string(), "dismiss"),
+        ];
+        let text = |w| -> String {
+            rail_line(&rail, w, &theme)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        assert_eq!(text(60).trim(), "j/k scroll · y yank · Esc dismiss");
+        // Room for two: the third goes whole, taking its separator with it.
+        assert_eq!(text(24).trim(), "j/k scroll · y yank");
+        // Room for none: nothing at all, rather than a stray fragment.
+        assert_eq!(text(8).trim(), "");
     }
 
     #[test]
@@ -8252,7 +8508,8 @@ mod tests {
         let text = draw_help(&st, 120, 54);
         // Everything is on screen: nothing left to scroll to, and both the
         // first and the last section are visible at once.
-        assert!(text.contains("any key closes"), "no scroll footer:\n{text}");
+        assert!(!text.contains("wheel scroll"), "nothing to scroll:\n{text}");
+        assert!(text.contains("/ search"), "the filter is offered:\n{text}");
         assert!(text.contains("Global"));
         assert!(text.contains("Trigger prompt"));
         // The current view's section floats to the top and wears the mark.
@@ -8285,6 +8542,82 @@ mod tests {
             text.lines().all(|l| l.chars().count() <= 60),
             "no line escapes the terminal:\n{text}"
         );
+    }
+
+    #[test]
+    fn typing_in_the_help_card_narrows_it_to_the_matching_bindings() {
+        let mut st = AppState::new(
+            "o/r".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        st.view = View::GitStatus;
+        st.show_help = true;
+        st.help_search = "stage".into();
+        let text = draw_help(&st, 120, 54);
+        assert!(text.contains("stage all"), "the matching rows survive:\n{text}");
+        // Rows that say nothing about staging are gone, and so are the
+        // sections left with nothing in them.
+        assert!(!text.contains("quit"), "unmatched rows are filtered out:\n{text}");
+        assert!(!text.contains("Trigger prompt"), "empty sections drop out:\n{text}");
+        assert!(text.contains("Esc clears"), "the filter says how to drop it:\n{text}");
+
+        // With Global filtered away there is nothing to float under, so the
+        // open view's section takes the top-left corner itself.
+        st.help_search = "push".into();
+        let text = draw_help(&st, 120, 54);
+        let first = text
+            .lines()
+            .find(|l| !l.contains("─┤") && !l.trim_matches(['│', ' ']).is_empty())
+            .unwrap();
+        assert!(
+            first.contains("Changes — working tree") && first.contains("you are here"),
+            "the open view leads:\n{text}"
+        );
+    }
+
+    #[test]
+    fn every_term_of_a_help_search_has_to_land_somewhere_on_the_row() {
+        assert!(help_row_matches("p", "push — sets upstream on first push", "push"));
+        // Both words, in either order, anywhere in key or description.
+        assert!(help_row_matches("p", "push — sets upstream on first push", "push upstream"));
+        assert!(help_row_matches("p", "push — sets upstream on first push", "upstream push"));
+        assert!(!help_row_matches("p", "push — sets upstream on first push", "push tag"));
+        // The binding itself is searchable, and case never matters.
+        assert!(help_row_matches("ctrl+p", "fuzzy find in the current list", "CTRL"));
+    }
+
+    #[test]
+    fn a_help_search_that_matches_nothing_says_so() {
+        let mut st = AppState::new(
+            "o/r".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        st.show_help = true;
+        st.help_search = "xyzzy".into();
+        let text = draw_help(&st, 120, 54);
+        assert!(text.contains("no binding matches"), "an empty result explains itself:\n{text}");
+    }
+
+    #[test]
+    fn the_search_terms_are_marked_in_the_rows_that_kept_them() {
+        let base = Style::default();
+        let hit = Style::default().bold();
+        let spans = highlight_terms("stage / unstage the selected file", "stage", base, hit);
+        let marked: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.style == hit)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(marked, vec!["stage", "stage"], "both occurrences light up");
+        // Nothing is lost or duplicated in the cutting.
+        let rebuilt: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rebuilt, "stage / unstage the selected file");
     }
 
     #[test]

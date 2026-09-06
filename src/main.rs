@@ -164,7 +164,19 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Command::Open { workflow }) => {
+        Some(Command::Open { workflow: None }) => {
+            if !has_remote {
+                return Err(anyhow!("no GitHub remote to open — pass --repo owner/name"));
+            }
+            let spec = provider.repo();
+            let url = format!("https://github.com/{}/{}/actions", spec.owner, spec.repo);
+            open::that(&url).context("open browser")?;
+            println!("opened {url}");
+            Ok(())
+        }
+        Some(Command::Open {
+            workflow: Some(workflow),
+        }) => {
             let resolved = resolve_workflow(&workflows, &workflow)?;
             let latest = provider
                 .get_latest_run(&resolved)

@@ -1129,9 +1129,9 @@ async fn handle_key(
         handle_log_search_input(state, key);
         return None;
     }
-    // Esc clears an active log query before falling through to view-back.
+    // Esc/Backspace clears an active log query before falling through to view-back.
     if state.view == View::Logs
-        && key.code == KeyCode::Esc
+        && is_back_fallback(&key)
         && state.log_search_query.is_some()
     {
         state.log_search_query = None;
@@ -1144,25 +1144,7 @@ async fn handle_key(
     // above — while it's open it swallows keys rather than acting on the view
     // behind it.
     if state.show_help {
-        // Clamped to what the card last drew, not merely saturated: notches
-        // counted past the bottom would all have to be scrolled back through
-        // before anything moved, which reads as a stuck wheel.
-        let max = state.last_help_max_scroll.get();
-        let down = |s: u16, by: u16| s.saturating_add(by).min(max);
-        match key.code {
-            KeyCode::Down => state.help_scroll = down(state.help_scroll, 1),
-            KeyCode::Up => state.help_scroll = state.help_scroll.saturating_sub(1),
-            KeyCode::PageDown => state.help_scroll = down(state.help_scroll, 10),
-            KeyCode::PageUp => state.help_scroll = state.help_scroll.saturating_sub(10),
-            _ if key_is(&key, km.down) => state.help_scroll = down(state.help_scroll, 1),
-            _ if key_is(&key, km.up) => state.help_scroll = state.help_scroll.saturating_sub(1),
-            // Anything else — `?`, Esc, q, Enter — dismisses it.
-            _ => {
-                state.show_help = false;
-                state.help_opened_tick = None;
-                state.needs_clear = true;
-            }
-        }
+        handle_help_key(state, key, km);
         return None;
     }
 
@@ -1184,6 +1166,8 @@ async fn handle_key(
     if key_is(&key, km.help) {
         state.show_help = true;
         state.help_scroll = 0;
+        state.help_search.clear();
+        state.help_typing = false;
         // The entrance is timed from the keypress, like the services card's —
         // and once help has been found, the footer's beacon retires.
         state.help_opened_tick = Some(state.tick_count);
@@ -1267,7 +1251,7 @@ async fn handle_key(
     // the output should not also throw you out of the repo. A command still
     // running keeps its pane instead — `back` steps out of the view and leaves
     // it to finish, and the output is waiting on the way back in.
-    if (key_is(&key, km.back) || key.code == KeyCode::Esc)
+    if (key_is(&key, km.back) || is_back_fallback(&key))
         && state.view == View::GitStatus
         && state.current_op().is_some_and(|o| o.finished)
         && !batch_owns_current_op(state)
@@ -1279,8 +1263,9 @@ async fn handle_key(
         return None;
     }
 
-    // Global: back — Esc is always accepted as a fallback regardless of config
-    if key_is(&key, km.back) || key.code == KeyCode::Esc {
+    // Global: back — Esc and Backspace are always accepted as fallbacks
+    // regardless of config.
+    if key_is(&key, km.back) || is_back_fallback(&key) {
         match state.view {
             View::Repos => return Some(AppEvent::Quit),
             View::GitStatus => {
@@ -1878,6 +1863,83 @@ async fn handle_key(
         View::Diff => {}
     }
     None
+}
+
+/// Keys while the help card is up. Extracted so the card's own little modes —
+/// scrolling, and typing into its filter — can be exercised without standing a
+/// provider and an event loop up around them.
+fn handle_help_key(state: &mut AppState, key: KeyEvent, km: &Keymap) {
+    // Clamped to what the card last drew, not merely saturated: notches
+    // counted past the bottom would all have to be scrolled back through
+    // before anything moved, which reads as a stuck wheel.
+    let max = state.last_help_max_scroll.get();
+    let down = |s: u16, by: u16| s.saturating_add(by).min(max);
+    // Typing into the filter. Every printable key belongs to the query —
+    // `q` and `?` included — so only the editing keys are read as keys.
+    // The card re-filters on each keystroke rather than on `↵`: the whole
+    // point is watching the reference narrow to the row you are after.
+    if state.help_typing {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                state.help_search.clear();
+                state.help_typing = false;
+                state.help_scroll = 0;
+            }
+            // Hands the keyboard back to the card with the filter still
+            // on: what you searched for stays, and now scrolls.
+            KeyCode::Enter => state.help_typing = false,
+            KeyCode::Backspace => {
+                // Backspacing past the start leaves the field rather than
+                // sitting in an empty one that swallows the next `?`.
+                if state.help_search.pop().is_none() {
+                    state.help_typing = false;
+                }
+                state.help_scroll = 0;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                state.help_search.push(c);
+                state.help_scroll = 0;
+            }
+            KeyCode::Down => state.help_scroll = down(state.help_scroll, 1),
+            KeyCode::Up => state.help_scroll = state.help_scroll.saturating_sub(1),
+            KeyCode::PageDown => state.help_scroll = down(state.help_scroll, 10),
+            KeyCode::PageUp => state.help_scroll = state.help_scroll.saturating_sub(10),
+            _ => {}
+        }
+        return;
+    }
+    match key.code {
+        KeyCode::Down => state.help_scroll = down(state.help_scroll, 1),
+        KeyCode::Up => state.help_scroll = state.help_scroll.saturating_sub(1),
+        KeyCode::PageDown => state.help_scroll = down(state.help_scroll, 10),
+        KeyCode::PageUp => state.help_scroll = state.help_scroll.saturating_sub(10),
+        _ if key_is(&key, km.down) => state.help_scroll = down(state.help_scroll, 1),
+        _ if key_is(&key, km.up) => state.help_scroll = state.help_scroll.saturating_sub(1),
+        // The same key that searches a log searches the reference.
+        _ if key_is(&key, km.search) => {
+            state.help_typing = true;
+            state.help_scroll = 0;
+        }
+        // Esc drops a filter before it closes the card: one key, undoing
+        // the last thing it did.
+        KeyCode::Esc if !state.help_search.is_empty() => {
+            state.help_search.clear();
+            state.help_scroll = 0;
+        }
+        // Anything else — `?`, Esc, q, Enter — dismisses it.
+        _ => close_help(state),
+    }
+}
+
+/// Put the help card away, filter and all: a card reopened still holding the
+/// last question you asked it is a card that answers the wrong one.
+fn close_help(state: &mut AppState) {
+    state.show_help = false;
+    state.help_opened_tick = None;
+    state.help_search.clear();
+    state.help_typing = false;
+    state.needs_clear = true;
 }
 
 fn handle_log_search_input(state: &mut AppState, key: KeyEvent) {
@@ -3129,9 +3191,7 @@ async fn handle_click(
     km: &Keymap,
 ) {
     if state.show_help {
-        state.show_help = false;
-        state.help_opened_tick = None;
-        state.needs_clear = true;
+        close_help(state);
         return;
     }
     if state.show_services {
@@ -3279,6 +3339,15 @@ fn parse_key(s: &str) -> Result<(KeyCode, KeyModifiers)> {
         _ => return Err(anyhow!("unknown key `{key_str}` in config")),
     };
     Ok((code, mods))
+}
+
+/// Esc and Backspace both mean "back" everywhere a text field is not being
+/// edited, whatever `[keys] back` is configured to. Text editors (search
+/// prompts, commit message, trigger inputs) are dispatched before the global
+/// back handler, so a Backspace while typing still deletes a character.
+fn is_back_fallback(event: &KeyEvent) -> bool {
+    matches!(event.code, KeyCode::Esc | KeyCode::Backspace)
+        && event.modifiers.difference(KeyModifiers::SHIFT).is_empty()
 }
 
 fn key_is(event: &KeyEvent, (code, mods): (KeyCode, KeyModifiers)) -> bool {
@@ -5337,6 +5406,56 @@ mod tests {
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn the_help_card_routes_every_printable_key_into_its_filter() {
+        let km = resolve_keymap(&KeymapConfig::default()).unwrap();
+        let mut st = dashboard();
+        st.show_help = true;
+        // `/` opens the field; after that `q` and `?` are text, not commands.
+        handle_help_key(&mut st, press(KeyCode::Char('/')), &km);
+        assert!(st.help_typing);
+        for c in "q?st".chars() {
+            handle_help_key(&mut st, press(KeyCode::Char(c)), &km);
+        }
+        assert_eq!(st.help_search, "q?st");
+        assert!(st.show_help, "typing never closes the card");
+
+        // Enter hands the keyboard back without dropping the filter.
+        handle_help_key(&mut st, press(KeyCode::Enter), &km);
+        assert!(!st.help_typing);
+        assert_eq!(st.help_search, "q?st");
+
+        // Esc drops the filter first, and only then closes the card.
+        handle_help_key(&mut st, press(KeyCode::Esc), &km);
+        assert!(st.show_help && st.help_search.is_empty());
+        handle_help_key(&mut st, press(KeyCode::Esc), &km);
+        assert!(!st.show_help);
+    }
+
+    #[test]
+    fn backspacing_out_of_the_help_filter_leaves_the_field() {
+        let km = resolve_keymap(&KeymapConfig::default()).unwrap();
+        let mut st = dashboard();
+        st.show_help = true;
+        st.help_typing = true;
+        handle_help_key(&mut st, press(KeyCode::Char('x')), &km);
+        handle_help_key(&mut st, press(KeyCode::Backspace), &km);
+        assert!(st.help_typing, "still editing an empty field");
+        handle_help_key(&mut st, press(KeyCode::Backspace), &km);
+        assert!(!st.help_typing, "backspacing past the start gives the keys back");
+        assert!(st.show_help, "and does not take the card with it");
+    }
+
+    #[test]
+    fn reopening_the_help_card_starts_from_the_whole_reference() {
+        let mut st = dashboard();
+        st.show_help = true;
+        st.help_search = "push".into();
+        st.help_typing = true;
+        close_help(&mut st);
+        assert!(st.help_search.is_empty() && !st.help_typing);
     }
 
     // tokio: saying yes spawns the first push op off-thread.
