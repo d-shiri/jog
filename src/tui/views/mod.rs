@@ -255,8 +255,24 @@ fn render_services_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
 
     let rows: Vec<Line> = if state.services.is_empty() {
+        // An empty card has four quite different reasons behind it, and the
+        // config hint is only one of them. Saying "add [uptime_kuma]" to
+        // someone who added it an hour ago — and is waiting out the first
+        // read, or staring past a page that refused — sends them to edit a
+        // file that was never the problem.
+        let msg = match (&state.kuma, state.kuma_fetched_at, &state.kuma_error) {
+            (None, _, _) => {
+                "nothing to show — add [uptime_kuma] with your status page's URL to config.toml"
+                    .to_string()
+            }
+            (Some(_), _, Some(e)) => {
+                format!("can't read the status page — {}", truncate(e, 90))
+            }
+            (Some(_), None, None) => "reading the status page…".to_string(),
+            (Some(_), Some(_), None) => "the status page lists no monitors".to_string(),
+        };
         vec![Line::from(Span::styled(
-            "nothing to show — add [uptime_kuma] with your status page's URL to config.toml",
+            msg,
             Style::default().fg(theme.text_muted).italic(),
         ))]
     } else {
@@ -412,8 +428,14 @@ fn render_services_overlay(f: &mut Frame, area: Rect, state: &AppState) {
             .right_aligned(),
         );
     // When these readings were fetched — the one fact that separates "all up"
-    // from "all up, as of some time before the wifi dropped".
+    // from "all up, as of some time before the wifi dropped". A read in
+    // flight says so instead: opening the card sends one, and the answer
+    // landing on a card that claimed nothing was happening reads as a glitch.
     let block = match state.kuma_fetched_at {
+        _ if state.kuma_pending => block.title_bottom(Line::from(Span::styled(
+            " updating… ",
+            Style::default().fg(theme.text_faint),
+        ))),
         Some(at) => {
             let secs = (Utc::now() - at).num_seconds().max(0);
             let ago = if secs < 60 {
@@ -438,6 +460,26 @@ fn render_services_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     );
 }
 
+/// Where the working-tree views were entered from, as the first crumb.
+///
+/// It used to always be the dashboard, because that was the only door. Reached
+/// from a workflow list — the way a single checkout reaches it — "Repos" names
+/// a screen `back` will not return to, and a breadcrumb that lies about the way
+/// out is worse than no breadcrumb.
+fn git_crumb_root<'a>(state: &AppState, theme: &Theme, sep: Span<'a>) -> Vec<Span<'a>> {
+    let from = state.git_view.as_ref().map(|g| g.return_to);
+    let label = match from {
+        Some(View::Workflows) => "Workflows",
+        Some(View::Runs) | Some(View::RunDetail) => "Runs",
+        Some(View::Watch) => "Watch",
+        _ => "Repos",
+    };
+    vec![
+        Span::styled(label, Style::default().fg(theme.text_muted)),
+        sep,
+    ]
+}
+
 fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     let sep = || Span::styled("  ›  ", Style::default().fg(theme.border_dim));
@@ -445,45 +487,47 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         // The panel below is titled "Repos" and counts them. Saying it twice
         // one line apart spends the width that the tallies now use.
         View::Repos => Vec::new(),
-        View::GitStatus => vec![
-            Span::styled("Repos", Style::default().fg(theme.text_muted)),
-            sep(),
-            Span::styled(
+        View::GitStatus => {
+            let mut c = git_crumb_root(state, theme, sep());
+            c.push(Span::styled(
                 state
                     .git_view
                     .as_ref()
                     .map(|g| g.spec.clone())
                     .unwrap_or_else(|| "?".into()),
                 Style::default().fg(theme.text_muted),
-            ),
-            sep(),
-            Span::styled("Changes", Style::default().fg(theme.primary).bold()),
-        ],
-        View::GitDiff => vec![
-            Span::styled("Repos", Style::default().fg(theme.text_muted)),
-            sep(),
-            Span::styled(
-                state
-                    .git_diff
-                    .as_ref()
-                    .map(|d| d.spec.clone())
-                    .unwrap_or_else(|| "?".into()),
-                Style::default().fg(theme.text_muted),
-            ),
-            sep(),
-            Span::styled("Changes", Style::default().fg(theme.text_muted)),
-            sep(),
-            Span::styled(
-                // The file the viewport is scrolled into — the crumb follows
-                // the reading position through the combined diff.
-                state
-                    .git_diff
-                    .as_ref()
-                    .map(|d| d.current_file().unwrap_or_else(|| d.file.clone()))
-                    .unwrap_or_else(|| "?".into()),
-                Style::default().fg(theme.primary).bold(),
-            ),
-        ],
+            ));
+            c.push(sep());
+            c.push(Span::styled("Changes", Style::default().fg(theme.primary).bold()));
+            c
+        }
+        View::GitDiff => {
+            let mut c = git_crumb_root(state, theme, sep());
+            c.extend([
+                Span::styled(
+                    state
+                        .git_diff
+                        .as_ref()
+                        .map(|d| d.spec.clone())
+                        .unwrap_or_else(|| "?".into()),
+                    Style::default().fg(theme.text_muted),
+                ),
+                sep(),
+                Span::styled("Changes", Style::default().fg(theme.text_muted)),
+                sep(),
+                Span::styled(
+                    // The file the viewport is scrolled into — the crumb follows
+                    // the reading position through the combined diff.
+                    state
+                        .git_diff
+                        .as_ref()
+                        .map(|d| d.current_file().unwrap_or_else(|| d.file.clone()))
+                        .unwrap_or_else(|| "?".into()),
+                    Style::default().fg(theme.primary).bold(),
+                ),
+            ]);
+            c
+        }
         View::Workflows => vec![
             Span::styled("Workflows", Style::default().fg(theme.primary).bold()),
         ],
@@ -900,12 +944,18 @@ fn workspace_tallies(state: &AppState) -> Vec<Span<'static>> {
     out
 }
 
-/// How much work is sitting uncommitted across the workspace.
+/// How much work is sitting uncommitted — and committed but unpushed — across
+/// the workspace.
 ///
 /// Files, not repos: "3 repos have changes" is the number you already know from
 /// the column, and it does not tell you which way the afternoon went. Kept apart
 /// from the tallies because it is the widest thing in the corner and so the
 /// first that a narrow terminal should lose.
+///
+/// The unpushed half is the same sentence one step later: a commit nobody
+/// pushed is invisible to CI and to everyone else, and outside the dashboard
+/// there is no row carrying its `↑`. Both halves are the standing reason to
+/// press the working-tree key.
 fn uncommitted_span(state: &AppState) -> Vec<Span<'static>> {
     let dirty: usize = state
         .repos
@@ -913,11 +963,25 @@ fn uncommitted_span(state: &AppState) -> Vec<Span<'static>> {
         .filter_map(|c| c.git.as_ref())
         .map(|g| g.staged_count() + g.unstaged_count())
         .sum();
-    if dirty == 0 {
+    let unpushed: u32 = state
+        .repos
+        .iter()
+        .filter_map(|c| c.git.as_ref())
+        .filter(|g| g.has_upstream)
+        .map(|g| g.ahead)
+        .sum();
+    let mut parts: Vec<String> = Vec::new();
+    if dirty > 0 {
+        parts.push(format!("◆{dirty} uncommitted"));
+    }
+    if unpushed > 0 {
+        parts.push(format!("↑{unpushed} unpushed"));
+    }
+    if parts.is_empty() {
         return Vec::new();
     }
     vec![Span::styled(
-        format!("◆{dirty} uncommitted   "),
+        format!("{}   ", parts.join("  ")),
         Style::default().fg(state.theme.accent),
     )]
 }
@@ -1051,6 +1115,22 @@ pub(super) fn display_key(s: &str) -> &str {
         "Space" => "␣",
         other => other,
     }
+}
+
+/// What the working-tree key is worth pressing for right now.
+///
+/// "changes" is the offer; "3 changes" is the reason. The count is already on
+/// the row, and repeating it in the footer is what turns a key you know about
+/// into a key you press.
+fn changes_label(state: &AppState) -> &'static str {
+    let dirty = state
+        .repos
+        .iter()
+        .find(|c| c.spec == state.repo_label)
+        .and_then(|c| c.git.as_ref())
+        .map(|g| g.staged_count() + g.unstaged_count())
+        .unwrap_or(0);
+    if dirty == 0 { "changes" } else { "changes ●" }
 }
 
 fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
@@ -1238,34 +1318,59 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             (display_key(&km.git_stage).into(), "stage/unstage"),
             (display_key(&km.back).into(), "back"),
         ],
-        View::Workflows => vec![
-            ("↵".into(), "runs"),
-            (display_key(&km.trigger).into(), "trigger"),
-            (display_key(&km.watch).into(), "watch"),
-            (display_key(&km.finder).into(), "find"),
-            (display_key(&km.repos_view).into(), "repos"),
-            (display_key(&km.open_browser).into(), "open"),
-            (display_key(&km.quit).into(), "quit"),
-        ],
-        View::Runs => vec![
-            ("↵".into(), "detail"),
-            (display_key(&km.trigger).into(), "trigger"),
-            (display_key(&km.rerun).into(), "rerun"),
-            (display_key(&km.rerun_failed).into(), "rerun-failed"),
-            (display_key(&km.cancel_run).into(), "cancel"),
-            (display_key(&km.watch).into(), "watch"),
-            (display_key(&km.finder).into(), "find"),
-            (display_key(&km.open_browser).into(), "open"),
-            (display_key(&km.back).into(), "back"),
-        ],
-        View::RunDetail => vec![
-            (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "step"),
-            (format!("↵/{}", display_key(&km.open_logs)), "logs"),
-            (display_key(&km.open_browser).into(), "open"),
-            (display_key(&km.diff).into(), "diff"),
-            (display_key(&km.back).into(), "back"),
-            (display_key(&km.quit).into(), "quit"),
-        ],
+        View::Workflows => {
+            let mut hints = vec![
+                ("↵".into(), "runs"),
+                (display_key(&km.trigger).into(), "trigger"),
+                (display_key(&km.watch).into(), "watch"),
+            ];
+            // The working tree, when there is one to open. Offered here rather
+            // than only on the dashboard: in a single checkout the dashboard is
+            // one row and refuses to open, and staging a file should not depend
+            // on how many repos happen to be configured.
+            if state.active_has_checkout() {
+                hints.push((display_key(&km.git_view).into(), changes_label(state)));
+            }
+            hints.push((display_key(&km.finder).into(), "find"));
+            // A one-row dashboard is nothing to advertise a key for.
+            if state.repos.len() > 1 {
+                hints.push((display_key(&km.repos_view).into(), "repos"));
+            }
+            hints.push((display_key(&km.open_browser).into(), "open"));
+            hints.push((display_key(&km.quit).into(), "quit"));
+            hints
+        }
+        View::Runs => {
+            let mut hints = vec![
+                ("↵".into(), "detail"),
+                (display_key(&km.trigger).into(), "trigger"),
+                (display_key(&km.rerun).into(), "rerun"),
+                (display_key(&km.rerun_failed).into(), "rerun-failed"),
+                (display_key(&km.cancel_run).into(), "cancel"),
+                (display_key(&km.watch).into(), "watch"),
+            ];
+            if state.active_has_checkout() {
+                hints.push((display_key(&km.git_view).into(), changes_label(state)));
+            }
+            hints.push((display_key(&km.finder).into(), "find"));
+            hints.push((display_key(&km.open_browser).into(), "open"));
+            hints.push((display_key(&km.back).into(), "back"));
+            hints
+        }
+        View::RunDetail => {
+            let mut hints = vec![
+                (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "step"),
+                (format!("↵/{}", display_key(&km.open_logs)), "logs"),
+                (display_key(&km.open_browser).into(), "open"),
+                (display_key(&km.diff).into(), "diff"),
+            ];
+            if state.active_has_checkout() {
+                hints.push((display_key(&km.git_view).into(), changes_label(state)));
+            }
+            hints.push((display_key(&km.back).into(), "back"));
+            hints.push((display_key(&km.quit).into(), "quit"));
+            hints
+        }
         View::Logs => {
             let np_label = if state.log_search_query.is_some() { "match" } else { "step" };
             let mut hints = vec![
@@ -1293,11 +1398,15 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             hints.push((display_key(&km.quit).into(), "quit"));
             hints
         },
-        View::Watch => vec![
-            (display_key(&km.open_browser).into(), "open"),
-            (display_key(&km.back).into(), "back"),
-            (display_key(&km.quit).into(), "quit"),
-        ],
+        View::Watch => {
+            let mut hints = vec![(display_key(&km.open_browser).into(), "open")];
+            if state.active_has_checkout() {
+                hints.push((display_key(&km.git_view).into(), changes_label(state)));
+            }
+            hints.push((display_key(&km.back).into(), "back"));
+            hints.push((display_key(&km.quit).into(), "quit"));
+            hints
+        }
         View::Diff => vec![
             (display_key(&km.open_browser).into(), "open"),
             (display_key(&km.back).into(), "back"),
@@ -2877,6 +2986,7 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
                 (k(&km.finder), "fuzzy find in the current list"),
                 (k(&km.refresh), "re-fetch whatever this screen shows"),
                 (k(&km.repos_view), "multi-repo dashboard"),
+                (k(&km.git_view), "the working tree of the repo in hand"),
                 (k(&km.services), "service health, by monitor name"),
                 (k(&km.snooze), "snooze notifications — 30m, 60m, off"),
                 (k(&km.open_browser), "open in browser"),
@@ -2899,10 +3009,7 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
         (
             "Batch commit",
             vec![
-                (
-                    "↵".into(),
-                    "start — stages everything and commits each repo in turn",
-                ),
+                ("↵".into(), "stage everything, commit each in turn"),
                 (k(&km.batch_retry), "retry the repo that failed",),
                 (k(&km.batch_skip), "skip it and carry on"),
                 (k(&km.git_view), "open the failed repo's working tree to fix it"),
@@ -6962,6 +7069,63 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_services_card_says_which_kind_of_empty_it_is() {
+        let st = |kuma: bool, fetched: bool, err: Option<&str>| {
+            let mut st = AppState::new(
+                "o/r".into(),
+                "main".into(),
+                Vec::new(),
+                crate::config::KeymapConfig::default(),
+                crate::history::History::default(),
+            );
+            st.show_services = true;
+            if kuma {
+                st.kuma = Some(crate::config::UptimeKumaConfig {
+                    url: "https://up.example.com".into(),
+                    status_page: "default".into(),
+                    map: Default::default(),
+                    poll_interval_s: 30,
+                });
+            }
+            if fetched {
+                st.kuma_fetched_at = Some(Utc::now());
+            }
+            st.kuma_error = err.map(str::to_string);
+            st
+        };
+        let draw = |st: &AppState| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
+            term.draw(|f| render_services_overlay(f, f.area(), st)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // No page configured: the config hint, which is the only case it fits.
+        let out = draw(&st(false, false, None));
+        assert!(out.contains("add [uptime_kuma]"), "{out}");
+        // Configured and waiting on the first answer — not a config problem,
+        // so not a config hint.
+        let out = draw(&st(true, false, None));
+        assert!(out.contains("reading the status page"), "{out}");
+        assert!(!out.contains("add [uptime_kuma]"), "{out}");
+        // Configured and refused: say why, where the question gets asked.
+        let out = draw(&st(true, false, Some("connection refused")));
+        assert!(out.contains("connection refused"), "{out}");
+        assert!(!out.contains("add [uptime_kuma]"), "{out}");
+        // Configured, answered, and the page really does list nothing.
+        let out = draw(&st(true, true, None));
+        assert!(out.contains("no monitors"), "{out}");
+    }
+
+    #[test]
     fn the_services_card_names_every_monitor_mapped_or_not() {
         let mut st = AppState::new(
             "o/r".into(),
@@ -7567,6 +7731,36 @@ mod tests {
     }
 
     #[test]
+    fn a_single_checkout_is_offered_its_working_tree_from_the_workflow_list() {
+        let mut st = AppState::new(
+            "acme/api".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        st.view = View::Workflows;
+        let mut card = crate::app::state::RepoCard::new("acme/api".into());
+        card.path = Some(std::path::PathBuf::from("/tmp/acme-api"));
+        st.repos.push(card);
+
+        let bar = draw_footer(&st, 150);
+        assert!(bar.contains("changes"), "the way in is advertised:\n{bar}");
+        // One row is not a dashboard, and a key that refuses is worse than
+        // no key at all.
+        assert!(!bar.contains("repos"), "nothing to jump to:\n{bar}");
+
+        // A dirty tree marks the key, so the footer says why to press it.
+        assert!(!bar.contains("changes ●"), "clean says nothing extra:\n{bar}");
+        st.repos[0].git = Some(crate::git::parse_status("## main\0 M a.txt\0"));
+        assert!(draw_footer(&st, 150).contains("changes ●"));
+
+        // No checkout on disk, nothing to stage — so no offer.
+        st.repos[0].path = None;
+        assert!(!draw_footer(&st, 150).contains("changes"));
+    }
+
+    #[test]
     fn the_dashboard_shows_what_a_batch_would_take() {
         let mut st = dashboard_with_live_ci();
         assert!(
@@ -8031,6 +8225,14 @@ mod tests {
         assert!(out.contains("✓1"), "{out}");
         assert!(out.contains("⏵2"), "{out}");
         assert!(out.contains("◆3 uncommitted"), "{out}");
+        // A commit that never got pushed is invisible to CI and to everyone
+        // else, and outside the dashboard no row carries its `↑`.
+        let mut st = workspace_dashboard();
+        st.repos[1].git = Some(crate::git::parse_status(
+            "## main...origin/main [ahead 2]\0M  a.rs\0",
+        ));
+        let out = draw_header(&st, 150);
+        assert!(out.contains("↑2 unpushed"), "{out}");
         // The total comes up with them: a repo that has never run CI is in none
         // of the four tallies, so they cannot be added up into it.
         assert!(out.contains("3 repos"), "{out}");

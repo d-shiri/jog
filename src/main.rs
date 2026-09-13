@@ -22,7 +22,6 @@ use crate::tui::TuiOpts;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::load().context("load config")?;
 
     let cwd = std::env::current_dir().context("cwd")?;
 
@@ -30,6 +29,11 @@ async fn main() -> Result<()> {
     // whose *children* are repos — fall back to scanning for them so the tool
     // still has something to show.
     let repo_root = find_repo_root(&cwd).ok();
+
+    // The checkout gets a say in its own settings: whatever `.jog.toml` at its
+    // root declares wins over the global file, which is how a status page stops
+    // being the last project's. Loaded after the root is known, for that reason.
+    let config = Config::load_for(repo_root.as_deref()).context("load config")?;
     let workspace = match &repo_root {
         Some(_) => Vec::new(),
         None => git::discover_workspace(&cwd),
@@ -99,6 +103,7 @@ async fn main() -> Result<()> {
                     focus_workflow: None,
                     workspace,
                     workspace_root,
+                    repo_root,
                 },
             )
             .await
@@ -146,6 +151,7 @@ async fn main() -> Result<()> {
                     focus_workflow: Some(resolved),
                     workspace: Vec::new(),
                     workspace_root: None,
+                    repo_root,
                 },
             )
             .await
@@ -160,6 +166,7 @@ async fn main() -> Result<()> {
                     focus_workflow: None,
                     workspace,
                     workspace_root,
+                    repo_root,
                 },
             )
             .await

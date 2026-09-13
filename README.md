@@ -127,8 +127,9 @@ any of them notifies you, not just the one you're sitting in.
 
 ## Commit, then run CI
 
-Press `c` on a dashboard row with a local checkout to review its working tree
-(`?` shows this table in-app):
+Press `c` to review the working tree of the repo in hand — from the workflow
+list, a run list, a run's detail or the watch view when you are inside a single
+checkout, or on a dashboard row that has one (`?` shows this table in-app):
 
 | Key | Action |
 |-----|--------|
@@ -138,6 +139,11 @@ Press `c` on a dashboard row with a local checkout to review its working tree
 | `P` | push — sets upstream on first push |
 | `t` | open this repo's workflows, where `t` triggers CI |
 | `r` | refresh |
+
+`Esc` goes back to wherever you pressed `c`, so the round trip out of the
+workflow list and back is two keys. The header carries `◆n uncommitted` and
+`↑n unpushed` from every view, and the footer's `changes` hint wears a dot while
+the tree is dirty — the dashboard is not the only place that notices.
 
 The order matters: `workflow_dispatch` runs against the **remote**, so a commit
 that hasn't been pushed won't be the code CI builds. Commit → push → trigger.
@@ -356,6 +362,21 @@ and the card reads that way. With only one group it falls back to **tags**
 section heading instead of a chip repeated down the card, extra tags stay as
 chips, and untagged monitors close the card in a section of their own.
 
+### A page per project
+
+One status page in the global config is right until the second project. A repo
+can name its own in a `.jog.toml` at its root, and `jog` uses that one while you
+are in it — see [Per-repo config](#per-repo-config):
+
+```toml
+# ~/work/acme-api/.jog.toml
+[uptime_kuma]
+status_page = "acme"       # same Kuma, this project's page
+```
+
+Switching repos on the dashboard switches the page with them: readings from the
+one you just left are dropped rather than left on screen looking current.
+
 Health is fetched on its own clock — `poll_interval_s`, default 30, since the
 monitors behind the page only check on the order of minutes — and the card's
 corner always says how old the readings are. `r` inside the card refreshes on
@@ -370,15 +391,15 @@ view you're in floats to the top.
 
 | View      | Keys |
 |-----------|------|
-| Global    | `?` help · `q` quit · `Esc` back · `j`/`k` move · `Enter` open · `r` refresh this screen · `Ctrl-P` find · `H` repos · `y` yank |
+| Global    | `?` help · `q` quit · `Esc` back · `j`/`k` move · `Enter` open · `r` refresh this screen · `Ctrl-P` find · `H` repos · `c` changes · `y` yank |
 | Repos     | `Enter` open repo · `c` review changes · `Space` mark · `C` commit marked · `o` open in browser |
 | Batch commit | `t` retry · `s` skip · `c` open the failed repo · `P` push all · `Esc` stop |
 | Changes   | `d`/`Enter` diff the file · `Space` stage/unstage · `a` stage all · `c` commit · `P` push · `t` run CI |
 | Hook output | `j`/`k` scroll · `e`/`E` next/prev error · `g`/`G` top/tail · `y` yank · `Esc` dismiss |
 | Diff      | side by side (unified on a narrow terminal) · `j`/`k` scroll · `d`/`u` page · `g`/`G` top/bottom · `n`/`p` next/prev file · `Space` stage/unstage |
-| Workflows | `t` trigger · `w` watch · `o` open in browser |
-| Runs      | `t` trigger · `Ctrl-R` rerun · `R` rerun-failed · `x` cancel · `w` watch |
-| Run detail| `Enter`/`l` open logs · `D` diff vs last success |
+| Workflows | `t` trigger · `w` watch · `c` changes · `o` open in browser |
+| Runs      | `t` trigger · `Ctrl-R` rerun · `R` rerun-failed · `x` cancel · `w` watch · `c` changes |
+| Run detail| `Enter`/`l` open logs · `D` diff vs last success · `c` changes |
 | Logs      | `j`/`k` scroll · `d`/`u` page · `g`/`G` top/bottom · `n`/`p` next/prev step · `a` all steps · `/` search · `e`/`E` next/prev error · `F` focus · `Enter` expand a fold |
 | Trigger   | `i`/`Enter` edit field · `Space` cycle choice · `t` submit |
 
@@ -390,7 +411,9 @@ waiting out the poll. All keys are remappable in `config.toml` (see
 
 ## Config
 
-`jog` reads `$XDG_CONFIG_HOME/jog/config.toml` (typically `~/.config/jog/config.toml`). All fields are optional.
+`jog` reads `$XDG_CONFIG_HOME/jog/config.toml` (typically
+`~/.config/jog/config.toml`), then lays the checkout's own `.jog.toml` over it
+(see [Per-repo config](#per-repo-config)). All fields are optional.
 
 ```toml
 [ui]
@@ -441,6 +464,29 @@ next_error = "e"
 prev_error = "E"
 # ... see src/config.rs for the full list
 ```
+
+### Per-repo config
+
+A checkout can carry its own settings in a **`.jog.toml`** at its root. It is
+laid over the global file key by key, so a project overrides only what is
+actually its own and keeps the theme, keymap and sounds you configured once:
+
+```toml
+# ~/work/acme-api/.jog.toml
+[uptime_kuma]
+status_page = "acme"                   # this project's page on the same Kuma
+# url = "https://status.acme.dev"      # …or a different Kuma entirely
+# url = ""                             # …or no service health here at all
+
+[provider]
+repos = ["acme/api", "acme/web"]       # the dashboard this project wants
+```
+
+Sub-tables merge (a local `[ui] theme` does not erase your global
+`[ui.colors]`); scalars and arrays replace whole. `url = ""` is how a repo turns
+service health off while the global config has it on. The file is read when
+`jog` starts inside the checkout, and again when you switch to that repo from
+the dashboard. Add it to `.gitignore` if it is yours rather than the team's.
 
 ## License
 

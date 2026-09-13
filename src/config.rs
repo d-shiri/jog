@@ -2,6 +2,16 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// A checkout's own settings, read from the root of the repo `jog` is launched
+/// in and laid over the global config.
+///
+/// The global file is where a machine says how it likes `jog` to behave; this
+/// is where a *project* says what `jog` should be pointed at while you are in
+/// it — which is almost always its own status page, and never the last
+/// project's. Every key of the global file is overridable, section by section:
+/// what the local file leaves out, the global one still answers.
+pub const LOCAL_CONFIG_NAME: &str = ".jog.toml";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -336,16 +346,44 @@ impl Default for KeymapConfig {
 }
 
 impl Config {
-    pub fn load() -> Result<Self> {
-        let path = Self::path();
-        if !path.exists() {
-            return Ok(Self::default());
+    /// The global config with `repo_root`'s own [`LOCAL_CONFIG_NAME`] laid over
+    /// it, key by key.
+    ///
+    /// Merging rather than replacing is what makes the local file worth having:
+    /// a project that only wants its own status page writes two lines and keeps
+    /// the theme, the keymap and the sounds its owner configured once.
+    pub fn load_for(repo_root: Option<&Path>) -> Result<Self> {
+        let global = read_table(&Self::path())?;
+        let local = match repo_root.map(|r| Self::local_path(r)) {
+            Some(path) => read_table(&path)?,
+            None => toml::Table::new(),
+        };
+        Self::layer(global, local)
+    }
+
+    /// The merge itself, given both files already parsed — the whole of
+    /// [`load_for`](Self::load_for) that doesn't touch the disk.
+    fn layer(mut global: toml::Table, local: toml::Table) -> Result<Self> {
+        merge_tables(&mut global, local);
+        let mut cfg: Self = toml::Value::Table(global)
+            .try_into()
+            .context("parse config")?;
+        // `url = ""` is how a project says *no* status page while the global
+        // config has one. Without it the local file could only ever point the
+        // feature somewhere else, never turn it off.
+        if cfg
+            .uptime_kuma
+            .as_ref()
+            .is_some_and(|k| k.url.trim().is_empty())
+        {
+            cfg.uptime_kuma = None;
         }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read config {}", path.display()))?;
-        let cfg: Self = toml::from_str(&raw)
-            .with_context(|| format!("parse config {}", path.display()))?;
         Ok(cfg)
+    }
+
+    /// Where a checkout keeps its own settings.
+    pub fn local_path(repo_root: &Path) -> PathBuf {
+        repo_root.join(LOCAL_CONFIG_NAME)
     }
 
     pub fn path() -> PathBuf {
@@ -353,5 +391,129 @@ impl Config {
             return dir.join("jog").join("config.toml");
         }
         Path::new(".").join("jog.toml")
+    }
+}
+
+/// A config file as a raw table, or an empty one when it isn't there.
+///
+/// Absent is not an error — neither file is required — but unreadable and
+/// malformed are: a config that silently does nothing is indistinguishable
+/// from a broken one.
+fn read_table(path: &Path) -> Result<toml::Table> {
+    if !path.exists() {
+        return Ok(toml::Table::new());
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read config {}", path.display()))?;
+    raw.parse::<toml::Table>()
+        .with_context(|| format!("parse config {}", path.display()))
+}
+
+/// Lay `over` on top of `base`, recursing into tables.
+///
+/// Sub-tables merge so a local `[ui] theme = …` doesn't erase the global
+/// `[ui.colors]`; everything else — scalars and arrays alike — is replaced
+/// whole, because a half-overridden list of favourites is nobody's intent.
+fn merge_tables(base: &mut toml::Table, over: toml::Table) {
+    for (k, v) in over {
+        match (base.get_mut(&k), v) {
+            (Some(toml::Value::Table(b)), toml::Value::Table(o)) => merge_tables(b, o),
+            (_, v) => {
+                base.insert(k, v);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table(raw: &str) -> toml::Table {
+        raw.parse().expect("test fixture parses")
+    }
+
+    const GLOBAL: &str = r##"
+        [ui]
+        theme = "midnight"
+        [ui.colors]
+        accent = "#ff0000"
+        [uptime_kuma]
+        url = "https://up.example.com"
+        status_page = "all"
+        [uptime_kuma.map]
+        "API" = "acme/backend"
+    "##;
+
+    #[test]
+    fn a_repo_points_service_health_at_its_own_page() {
+        let cfg = Config::layer(
+            table(GLOBAL),
+            table(r#"[uptime_kuma]
+                     url = "https://status.other.dev"
+                     status_page = "public""#),
+        )
+        .unwrap();
+        let k = cfg.uptime_kuma.expect("still configured");
+        assert_eq!(k.url, "https://status.other.dev");
+        assert_eq!(k.status_page, "public");
+        // Untouched by the local file, so the global answer stands.
+        assert_eq!(cfg.ui.theme, "midnight");
+    }
+
+    #[test]
+    fn what_the_local_file_leaves_out_the_global_still_answers() {
+        // Only the slug moves: the instance URL and the monitor map are the
+        // machine's settings and have no business being retyped per project.
+        let cfg = Config::layer(
+            table(GLOBAL),
+            table(r#"[uptime_kuma]
+                     status_page = "checkout""#),
+        )
+        .unwrap();
+        let k = cfg.uptime_kuma.unwrap();
+        assert_eq!(k.url, "https://up.example.com");
+        assert_eq!(k.status_page, "checkout");
+        assert_eq!(k.map.get("API").map(String::as_str), Some("acme/backend"));
+    }
+
+    #[test]
+    fn an_empty_url_turns_service_health_off_for_this_repo() {
+        let cfg = Config::layer(table(GLOBAL), table(r#"[uptime_kuma]
+                                                        url = """#))
+            .unwrap();
+        assert!(cfg.uptime_kuma.is_none(), "no column, no tally, no requests");
+    }
+
+    #[test]
+    fn sub_tables_merge_rather_than_replace_each_other() {
+        let cfg = Config::layer(
+            table(GLOBAL),
+            table(r#"[ui]
+                     theme = "paper""#),
+        )
+        .unwrap();
+        assert_eq!(cfg.ui.theme, "paper");
+        // Setting the theme locally must not erase the global colour overrides.
+        assert_eq!(cfg.ui.colors.get("accent").map(String::as_str), Some("#ff0000"));
+    }
+
+    #[test]
+    fn a_repo_can_name_the_others_it_wants_beside_it() {
+        let cfg = Config::layer(
+            table(r#"[provider]
+                     repos = ["acme/one"]"#),
+            table(r#"[provider]
+                     repos = ["acme/two", "acme/three"]"#),
+        )
+        .unwrap();
+        // Arrays replace whole: a half-overridden list is nobody's intent.
+        assert_eq!(cfg.provider.repos, vec!["acme/two", "acme/three"]);
+    }
+
+    #[test]
+    fn no_local_file_is_the_global_config_unchanged() {
+        let cfg = Config::layer(table(GLOBAL), toml::Table::new()).unwrap();
+        assert_eq!(cfg.uptime_kuma.unwrap().url, "https://up.example.com");
     }
 }

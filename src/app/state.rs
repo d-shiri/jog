@@ -184,6 +184,12 @@ pub struct GitView {
     /// push, which clears this) asks again while ordinary status refreshes
     /// don't.
     pub pr: Option<(String, Option<PrInfo>)>,
+    /// Where `back` goes from here — the view this one was opened from.
+    ///
+    /// The working tree used to be reachable only from the dashboard, so back
+    /// could hard-code it. Reached from a workflow list in a single checkout,
+    /// that would throw you onto a one-row dashboard you never asked for.
+    pub return_to: View,
 }
 
 impl GitView {
@@ -197,7 +203,14 @@ impl GitView {
             busy: false,
             has_ci,
             pr: None,
+            return_to: View::Repos,
         }
+    }
+
+    /// Where `back` should land, when it isn't the dashboard.
+    pub fn returning_to(mut self, view: View) -> Self {
+        self.return_to = view;
+        self
     }
 
     /// The PR shown to the user, if the branch has one.
@@ -2073,6 +2086,11 @@ pub struct AppState {
     /// A misconfigured Kuma has already said so once. A URL typo should be
     /// one status line, not one per poll forever.
     pub kuma_error_shown: bool,
+    /// Why the last read failed, kept for as long as it keeps failing. The
+    /// status line says it once and then scrolls away; the card is where
+    /// someone goes to ask why it is empty, and it has to answer there.
+    /// Cleared by the first answer that lands.
+    pub kuma_error: Option<String>,
     /// The service-health overlay: every monitor by name, with its ping and
     /// day's uptime — including the ones no dashboard row claims.
     pub show_services: bool,
@@ -2086,6 +2104,13 @@ pub struct AppState {
     /// The tick the last Kuma read went out on. Kuma runs on its own, slower
     /// clock than the CI poll; this is what holds it to that clock.
     pub kuma_last_poll_tick: u64,
+    /// Which status page the readings on screen belong to.
+    ///
+    /// Bumped whenever `kuma` is re-pointed at a different page, and carried by
+    /// every probe: a reply from the page we just walked away from arrives
+    /// stamped with the old number and is dropped, rather than filling the card
+    /// with the previous project's monitors.
+    pub kuma_epoch: u64,
     /// The `[uptime_kuma]` config, copied in at startup so the card's manual
     /// refresh can fire a fetch without threading `Config` through every key.
     pub kuma: Option<crate::config::UptimeKumaConfig>,
@@ -2235,10 +2260,12 @@ impl AppState {
             service_repos: HashMap::new(),
             kuma_pending: false,
             kuma_error_shown: false,
+            kuma_error: None,
             show_services: false,
             services_opened_tick: None,
             kuma_fetched_at: None,
             kuma_last_poll_tick: 0,
+            kuma_epoch: 0,
             kuma: None,
             hits: RefCell::new(Vec::new()),
             snooze_until: None,
@@ -2266,6 +2293,14 @@ impl AppState {
                 .find(|j| j.status == Status::Running)
                 .map(|j| (card.spec.as_str(), d, j))
         })
+    }
+
+    /// Whether the repo the app is pointed at has a checkout on disk — i.e.
+    /// whether there is a working tree to stage, commit and push.
+    pub fn active_has_checkout(&self) -> bool {
+        self.repos
+            .iter()
+            .any(|c| c.spec == self.repo_label && c.path.is_some())
     }
 
     /// The monitors watching one dashboard repo, in status-page order.

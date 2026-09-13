@@ -13,6 +13,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::collections::HashMap;
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -77,8 +78,8 @@ pub enum AppEvent {
     /// the job but has no log text to serve yet.
     WatchTailLoaded(u64, String, Option<Vec<String>>),
     /// Service health from the Uptime Kuma status page, or why it couldn't be
-    /// read.
-    KumaLoaded(Result<Vec<crate::kuma::Service>, String>),
+    /// read, stamped with the epoch of the page it was asked of.
+    KumaLoaded(u64, Result<Vec<crate::kuma::Service>, String>),
     /// The extracted "why it failed" window for a failed run open in the
     /// detail view — see [`FailureDigest`]. Empty `lines` means the log had
     /// nothing to say (or could not be fetched); the pane just stays absent.
@@ -109,6 +110,11 @@ pub struct TuiOpts {
     pub workspace: Vec<std::path::PathBuf>,
     /// The directory that scan was rooted at, for display.
     pub workspace_root: Option<std::path::PathBuf>,
+    /// Root of the checkout jog was launched inside, when it was launched
+    /// inside one. This is what makes the working tree reachable in single-repo
+    /// mode: the active repo's row carries it, so stage/commit/push work on the
+    /// repo you are standing in and not only on rows a workspace scan found.
+    pub repo_root: Option<std::path::PathBuf>,
 }
 
 pub async fn run(
@@ -144,7 +150,7 @@ pub async fn run(
     resolve_theme(&mut state, &config);
     state.workspace_root = opts.workspace_root.clone();
     state.repos = if opts.workspace.is_empty() {
-        dashboard_repos(&config, &state.repo_label)
+        dashboard_repos(&config, &state.repo_label, opts.repo_root.clone())
     } else {
         // Workspace mode: `repo_label` is whichever scanned repo happened to
         // have a usable remote, not somewhere the user asked to be.
@@ -180,7 +186,11 @@ pub async fn run(
 /// Rows for the multi-repo dashboard: everything in `[provider] repos`, with the
 /// currently active repo prepended if it isn't already listed. Duplicates are
 /// dropped so listing the active repo explicitly is harmless.
-fn dashboard_repos(cfg: &Config, active: &str) -> Vec<RepoCard> {
+///
+/// `active_path` is the checkout we are standing in, when there is one. It goes
+/// on the active repo's row, which is what gives the single-repo case the whole
+/// working-tree half of the app — a row without a path can only be looked at.
+fn dashboard_repos(cfg: &Config, active: &str, active_path: Option<PathBuf>) -> Vec<RepoCard> {
     let mut specs: Vec<String> = Vec::new();
     if !active.is_empty() {
         specs.push(active.to_string());
@@ -191,7 +201,13 @@ fn dashboard_repos(cfg: &Config, active: &str) -> Vec<RepoCard> {
             specs.push(r.to_string());
         }
     }
-    group_by_owner(specs.into_iter().map(RepoCard::new).collect())
+    let mut cards: Vec<RepoCard> = specs.into_iter().map(RepoCard::new).collect();
+    if let Some(path) = active_path
+        && let Some(card) = cards.iter_mut().find(|c| c.spec == active)
+    {
+        card.path = Some(path);
+    }
+    group_by_owner(cards)
 }
 
 /// Gather each owner's repos together, owners in the order they first appear.
@@ -353,6 +369,23 @@ async fn event_loop(
     let km = resolve_keymap(&config.keys)?;
     state.kuma = config.uptime_kuma.clone();
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+    // In a single checkout the config that arrived here was already layered
+    // with that repo's own file. A workspace has no single root to layer at
+    // startup, so the repo it happens to open on gets its say here — the same
+    // way every later switch does.
+    if let Some(path) = state
+        .repos
+        .iter()
+        .find(|c| c.spec == state.repo_label)
+        .and_then(|c| c.path.clone())
+    {
+        point_kuma_at(state, Some(&path), &tx);
+    }
+    // Kuma's first read rides the poll loop below, which does not come round
+    // until a whole poll interval has passed — so the health tally and the
+    // services card spent that first interval looking unconfigured. Ask now;
+    // the probe's own cadence takes over from here.
+    spawn_kuma_probe(state, &tx, true);
     if state.view == View::Repos {
         spawn_fetch_repo_cards(&provider, state, &tx);
     } else {
@@ -927,7 +960,13 @@ async fn event_loop(
                             spawn_fetch_workflow_preview(provider.clone(), w.file_name, tx.clone(), state);
                         }
                     }
-                    AppEvent::KumaLoaded(result) => {
+                    AppEvent::KumaLoaded(epoch, result) => {
+                        // An answer from a page we have since walked away from.
+                        // Dropped whole: it would otherwise show one project's
+                        // monitors under another project's name.
+                        if epoch != state.kuma_epoch {
+                            continue;
+                        }
                         state.kuma_pending = false;
                         match result {
                             Ok(services) => {
@@ -937,8 +976,10 @@ async fn event_loop(
                                 // monitors get added, repos get switched.
                                 let specs: Vec<String> =
                                     state.repos.iter().map(|c| c.spec.clone()).collect();
-                                let explicit = config
-                                    .uptime_kuma
+                                // `state.kuma`, not the startup config: the
+                                // page — and its map — follows the repo.
+                                let explicit = state
+                                    .kuma
                                     .as_ref()
                                     .map(|k| k.map.clone())
                                     .unwrap_or_default();
@@ -951,6 +992,8 @@ async fn event_loop(
                                     .collect();
                                 state.services = services;
                                 state.kuma_fetched_at = Some(chrono::Utc::now());
+                                state.kuma_error = None;
+                                state.kuma_error_shown = false;
                                 // Fresh readings landing on an open card get
                                 // the same entrance the card itself had: the
                                 // verdicts on screen are new, and a silent
@@ -967,6 +1010,9 @@ async fn event_loop(
                                     state.set_status_err(format!("uptime kuma: {e}"));
                                     state.kuma_error_shown = true;
                                 }
+                                // The status line is a moment; the card is
+                                // where the question gets asked later.
+                                state.kuma_error = Some(e);
                             }
                         }
                     }
@@ -1074,6 +1120,12 @@ async fn event_loop(
                         if !held {
                             poll_push_watches(state, &provider, &tx);
                         }
+                        // Likewise the working tree we are standing in. The
+                        // header's uncommitted count is a standing offer to
+                        // press `c`; on every view but the dashboard nothing
+                        // was refreshing it, so it only ever told the truth
+                        // about the moment jog started.
+                        poll_active_worktree(state, &tx);
                     }
                 }
             }
@@ -1187,6 +1239,11 @@ async fn handle_key(
     // Global: service health by name, wherever you are.
     if key_is(&key, km.services) {
         state.show_services = true;
+        // Opening the card is a question about right now. Kuma's own cadence
+        // still applies — a reading that landed seconds ago is not re-fetched
+        // — but a card opened onto nothing goes and asks rather than waiting
+        // out the rest of the interval with a blank in front of the user.
+        spawn_kuma_probe(state, tx, state.services.is_empty());
         // The reveal is timed from the keypress, so the card plays its
         // entrance every time it is asked for rather than once a session.
         state.services_opened_tick = Some(state.tick_count);
@@ -1246,6 +1303,23 @@ async fn handle_key(
         return None;
     }
 
+    // Global: the working tree of the repo in hand.
+    //
+    // On the dashboard this key means "the row under the cursor" and in the
+    // working tree itself it means commit, so those two keep their own
+    // handling; everywhere else in the CI half it is the way in. Without this
+    // a single checkout could reach none of it — the dashboard it used to be
+    // the only door to has one row and refuses to open.
+    if key_is(&key, km.git_view)
+        && matches!(
+            state.view,
+            View::Workflows | View::Runs | View::RunDetail | View::Watch
+        )
+    {
+        open_git_view_for_active(state, tx);
+        return None;
+    }
+
     // A *finished* hook-output pane takes `back` before the view does: what you
     // do after reading the failure is fix the file it pointed at, so dismissing
     // the output should not also throw you out of the repo. A command still
@@ -1269,6 +1343,11 @@ async fn handle_key(
         match state.view {
             View::Repos => return Some(AppEvent::Quit),
             View::GitStatus => {
+                let return_to = state
+                    .git_view
+                    .as_ref()
+                    .map(|g| g.return_to)
+                    .unwrap_or(View::Repos);
                 state.git_view = None;
                 // Leaving the repo entirely also drops any diff of its files,
                 // so re-entering never opens on the previous repo's contents.
@@ -1278,7 +1357,7 @@ async fn handle_key(
                 state.switch_view(if batch_is_live(state) {
                     View::BatchCommit
                 } else {
-                    View::Repos
+                    return_to
                 });
             }
             View::GitDiff => {
@@ -1527,9 +1606,27 @@ async fn handle_key(
             } else if key_is(&key, km.git_push) {
                 push_current(state, tx);
             } else if key_is(&key, km.trigger) {
-                // Hand off to CI: switch the app to this repo and show its
-                // workflows, where `t` triggers as usual.
-                switch_to_selected_repo(state, provider, tx);
+                // Hand off to CI: show this repo's workflows, where `t`
+                // triggers as usual.
+                let spec = state.git_view.as_ref().map(|g| g.spec.clone());
+                let active = spec.as_deref() == Some(state.repo_label.as_str());
+                if active && !state.workflows.is_empty() {
+                    // Already pointed here with the list in hand — the
+                    // single-repo case. Switching would re-fetch what we have.
+                    state.git_view = None;
+                    state.git_diff = None;
+                    state.switch_view(View::Workflows);
+                } else {
+                    // `switch_to_selected_repo` reads the dashboard cursor, and
+                    // `c` may have been pressed nowhere near it; aim it at the
+                    // repo actually on screen first.
+                    if let Some(i) =
+                        spec.and_then(|s| state.repos.iter().position(|c| c.spec == s))
+                    {
+                        state.repo_cursor = i;
+                    }
+                    switch_to_selected_repo(state, provider, tx);
+                }
             }
         }
         View::GitDiff => {
@@ -3908,6 +4005,31 @@ fn spawn_fetch_repo_cards(
     }
 }
 
+/// Re-read the working tree of the repo the app is pointed at.
+///
+/// Costs no API budget and, thanks to the fingerprint gate, usually no
+/// subprocess either — a few stats say nothing moved and it returns. The
+/// dashboard does this for every row itself; this is the one row that matters
+/// everywhere else.
+fn poll_active_worktree(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
+    if state.view == View::Repos {
+        return;
+    }
+    let active = state
+        .repos
+        .iter()
+        .find(|c| c.spec == state.repo_label)
+        .and_then(|c| Some((c.spec.clone(), c.path.clone()?)));
+    let Some((spec, path)) = active else { return };
+    // A status reply clears the view's `busy` flag, which is what stops two
+    // stages racing each other over the index. Landing one *unasked* in the
+    // middle of a git command would unlock exactly what the flag is holding.
+    if state.git_view.as_ref().is_some_and(|g| g.busy) || state.op_running(&spec) {
+        return;
+    }
+    spawn_git_status_gated(spec, path, tx.clone(), state);
+}
+
 /// Notice the workspace going quiet with every row green, once per lull.
 ///
 /// A transition, not a state: "busy a moment ago, and now nothing in flight
@@ -3979,10 +4101,47 @@ fn spawn_kuma_probe(
     state.kuma_last_poll_tick = state.tick_count.max(1);
     state.kuma_pending = true;
     let (url, slug, tx) = (k.url.clone(), k.status_page.clone(), tx.clone());
+    let epoch = state.kuma_epoch;
     tokio::task::spawn_blocking(move || {
         let res = crate::kuma::fetch(&url, &slug).map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::KumaLoaded(res));
+        let _ = tx.send(AppEvent::KumaLoaded(epoch, res));
     });
+}
+
+/// Point service health at whatever the repo now in hand declares.
+///
+/// A status page belongs to the project, not to the machine: `[uptime_kuma]`
+/// in the checkout's own `.jog.toml` beats the global one, so walking from one
+/// repo to the next walks the Live column with it. A repo that says nothing
+/// gets the global page back, which is the behaviour there has always been.
+fn point_kuma_at(
+    state: &mut AppState,
+    repo_root: Option<&std::path::Path>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    // A local file with a typo in it is not a reason to lose the page already
+    // on screen; the startup load is where a broken config gets reported.
+    let Ok(cfg) = crate::config::Config::load_for(repo_root) else {
+        return;
+    };
+    let same_page = match (&state.kuma, &cfg.uptime_kuma) {
+        (Some(a), Some(b)) => a.url == b.url && a.status_page == b.status_page,
+        (a, b) => a.is_none() && b.is_none(),
+    };
+    state.kuma = cfg.uptime_kuma;
+    if same_page {
+        return;
+    }
+    // Different page: what is on screen is the last project's. Drop it rather
+    // than leave it there looking current until the next answer lands.
+    state.kuma_epoch += 1;
+    state.services.clear();
+    state.service_repos.clear();
+    state.kuma_fetched_at = None;
+    state.kuma_error_shown = false;
+    state.kuma_error = None;
+    state.kuma_pending = false;
+    spawn_kuma_probe(state, tx, true);
 }
 
 /// Re-read the API budget: what the header meter shows, and what tells a
@@ -4389,6 +4548,32 @@ fn open_git_view(
     spawn_git_status(spec, path, tx.clone(), state);
 }
 
+/// Open the working tree of the repo the app is currently pointed at, from a
+/// view that is about that repo rather than about a list of them.
+///
+/// The dashboard's `c` asks about the row under the cursor; this asks about
+/// `repo_label`, which is the only repo a single checkout has. `back` returns
+/// to the view it was pressed on, so the round trip is two keys and lands
+/// where it started.
+fn open_git_view_for_active(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
+    let from = state.view;
+    let card = state.repos.iter().find(|c| c.spec == state.repo_label);
+    let Some((spec, path, has_ci)) = card
+        .and_then(|c| Some((c.spec.clone(), c.path.clone()?, c.has_ci())))
+    else {
+        state.set_status(format!(
+            "{} has no local checkout — run jog inside one to stage and commit",
+            state.repo_label
+        ));
+        return;
+    };
+    state.git_view = Some(
+        crate::app::state::GitView::new(spec.clone(), path.clone(), has_ci).returning_to(from),
+    );
+    state.switch_view(View::GitStatus);
+    spawn_git_status(spec, path, tx.clone(), state);
+}
+
 /// Point the whole app at the repo under the dashboard cursor.
 ///
 /// Workflows come from the API rather than the filesystem — we have no checkout
@@ -4411,6 +4596,9 @@ fn switch_to_selected_repo(
     };
     let label = card.spec.clone();
     let local_path = card.path.clone();
+    // Whatever this checkout says about itself — its status page above all —
+    // takes effect with the switch, not at the next launch.
+    point_kuma_at(state, local_path.as_deref(), tx);
     let spec = match RepoSpec::parse(&remote) {
         Ok(s) => s,
         Err(e) => {
@@ -5907,23 +6095,100 @@ mod tests {
         c
     }
 
+    /// A single checkout, the way `jog` starts inside one: one row, and it
+    /// carries the path.
+    fn single_repo(view: View) -> AppState {
+        let mut st = AppState::new(
+            "acme/api".into(),
+            "main".into(),
+            vec![Workflow {
+                name: "CI".into(),
+                file_name: "ci.yml".into(),
+                triggerable: true,
+                last_status: None,
+                last_run_at: None,
+                inputs: Vec::new(),
+            }],
+            KeymapConfig::default(),
+            History::default(),
+        );
+        st.repos = dashboard_repos(
+            &Config::default(),
+            "acme/api",
+            Some(std::path::PathBuf::from("/tmp/acme-api")),
+        );
+        st.view = view;
+        st
+    }
+
+    #[test]
+    fn the_checkout_we_are_standing_in_gets_a_row_that_can_be_committed() {
+        let cards = dashboard_repos(
+            &cfg_with_repos(&["o/b"]),
+            "o/a",
+            Some(std::path::PathBuf::from("/tmp/a")),
+        );
+        // The active repo carries the working tree; a repo we have no checkout
+        // of still carries none.
+        assert_eq!(cards[0].spec, "o/a");
+        assert_eq!(cards[0].path.as_deref(), Some(std::path::Path::new("/tmp/a")));
+        assert_eq!(cards[1].spec, "o/b");
+        assert!(cards[1].path.is_none());
+    }
+
+    // Opening the view kicks a `git status` read off-thread.
+    #[tokio::test]
+    async fn the_working_tree_is_one_key_away_from_the_workflow_list() {
+        let mut st = single_repo(View::Workflows);
+        assert!(st.active_has_checkout(), "the footer offers the key");
+
+        open_git_view_for_active(&mut st, &mpsc::unbounded_channel().0);
+        assert_eq!(st.view, View::GitStatus);
+        let gv = st.git_view.as_ref().expect("opened on the active repo");
+        assert_eq!(gv.spec, "acme/api");
+        assert_eq!(gv.path, std::path::PathBuf::from("/tmp/acme-api"));
+        // Reached from the workflow list, so that is where `back` returns —
+        // not a one-row dashboard nobody asked for.
+        assert_eq!(gv.return_to, View::Workflows);
+    }
+
+    #[test]
+    fn a_repo_with_no_checkout_says_so_rather_than_opening_an_empty_view() {
+        let mut st = single_repo(View::Workflows);
+        st.repos[0].path = None;
+        open_git_view_for_active(&mut st, &mpsc::unbounded_channel().0);
+        assert_eq!(st.view, View::Workflows, "nothing to show, so nowhere to go");
+        assert!(st.git_view.is_none());
+        let msg = st.status_msg.clone().unwrap_or_default();
+        assert!(msg.contains("no local checkout"), "got {msg:?}");
+    }
+
+    // Opening the view kicks a `git status` read off-thread.
+    #[tokio::test]
+    async fn opening_from_the_dashboard_still_goes_back_to_the_dashboard() {
+        let mut st = dashboard();
+        open_git_view(&mut st, &mpsc::unbounded_channel().0);
+        assert_eq!(st.view, View::GitStatus);
+        assert_eq!(st.git_view.as_ref().unwrap().return_to, View::Repos);
+    }
+
     #[test]
     fn dashboard_puts_active_repo_first_without_duplicating() {
-        let cards = dashboard_repos(&cfg_with_repos(&["o/b", "o/a"]), "o/a");
+        let cards = dashboard_repos(&cfg_with_repos(&["o/b", "o/a"]), "o/a", None);
         let specs: Vec<&str> = cards.iter().map(|c| c.spec.as_str()).collect();
         assert_eq!(specs, vec!["o/a", "o/b"]);
     }
 
     #[test]
     fn dashboard_includes_active_repo_when_unlisted() {
-        let cards = dashboard_repos(&cfg_with_repos(&["o/b"]), "o/a");
+        let cards = dashboard_repos(&cfg_with_repos(&["o/b"]), "o/a", None);
         let specs: Vec<&str> = cards.iter().map(|c| c.spec.as_str()).collect();
         assert_eq!(specs, vec!["o/a", "o/b"]);
     }
 
     #[test]
     fn dashboard_skips_blank_entries() {
-        let cards = dashboard_repos(&cfg_with_repos(&["", "  ", "o/b"]), "o/a");
+        let cards = dashboard_repos(&cfg_with_repos(&["", "  ", "o/b"]), "o/a", None);
         assert_eq!(cards.len(), 2);
     }
 
