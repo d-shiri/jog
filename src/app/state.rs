@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
@@ -13,11 +14,15 @@ use crate::config::KeymapConfig;
 use crate::git::RepoStatus;
 use crate::history::History;
 use crate::provider::github::{ApiError, Quota};
+use crate::provider::graph::{RunNode, WorkflowGraph, shape};
 use crate::provider::{Job, PrInfo, Run, RunDetail, Status, Workflow};
 
 
 #[derive(Debug, Clone, Copy)]
 pub enum DetailItem {
+    /// A matrix box's own row — the index is into [`AppState::run_shape`].
+    /// Folding it hides the legs behind it.
+    Group(usize),
     Job(usize),
     Step { job: usize, step: usize },
 }
@@ -55,18 +60,84 @@ pub struct FailureDigest {
     pub error_rows: Vec<usize>,
 }
 
+/// A list row's recent history, for the two bits of motion the dashboard has
+/// always had and the single-repo lists never did: a flash when the row's CI
+/// moves at all, and a longer coloured breath when a run actually lands.
+///
+/// Kept beside the list rather than on the row, because the rows themselves are
+/// replaced wholesale by every poll — the memory of what they used to say has
+/// to outlive them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Pulse {
+    /// Tick the row last changed in any way.
+    pub changed: Option<u64>,
+    /// Tick a run on this row reached its verdict, and what the verdict was.
+    pub settled: Option<(u64, Status)>,
+}
+
+impl Pulse {
+    /// Every tick this pulse is still counting from, whatever it is counting.
+    pub fn ticks(&self) -> [Option<u64>; 2] {
+        [self.changed, self.settled.map(|(t, _)| t)]
+    }
+
+    /// Note a status that has moved. `was` is `None` on a row's first sighting,
+    /// which is not a change — every row lighting up on arrival would teach the
+    /// eye to ignore the one thing the flash is for.
+    pub fn note(&mut self, was: Option<Status>, now: Status, tick: u64) {
+        let Some(was) = was else { return };
+        if was == now {
+            return;
+        }
+        self.changed = Some(tick);
+        if now.is_terminal() && !was.is_terminal() {
+            self.settled = Some((tick, now));
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LogGroup {
     pub header_line: usize,
     pub end_line: usize,
 }
 
-pub fn build_detail_items(detail: &RunDetail) -> Vec<DetailItem> {
+/// The detail view's rows, flattened in the order they are drawn: every job
+/// with its steps under it, and a matrix box standing in front of its legs.
+///
+/// `shape` is [`AppState::run_shape`] and `open` decides which boxes are
+/// unfolded — see [`AppState::group_is_open`]. A run whose shape hasn't been
+/// worked out yet (or that has none worth drawing) falls back to plain job
+/// order, so this is safe to call before the shape exists.
+pub fn build_detail_items(
+    detail: &RunDetail,
+    shape: &[RunNode],
+    open: &dyn Fn(&str, &[usize]) -> bool,
+) -> Vec<DetailItem> {
     let mut items = Vec::new();
-    for (ji, job) in detail.jobs.iter().enumerate() {
+    let push_job = |items: &mut Vec<DetailItem>, ji: usize| {
         items.push(DetailItem::Job(ji));
-        for (si, _) in job.steps.iter().enumerate() {
+        for si in 0..detail.jobs[ji].steps.len() {
             items.push(DetailItem::Step { job: ji, step: si });
+        }
+    };
+    if shape.is_empty() {
+        for ji in 0..detail.jobs.len() {
+            push_job(&mut items, ji);
+        }
+        return items;
+    }
+    for (ni, node) in shape.iter().enumerate() {
+        match node {
+            RunNode::Job(ji) => push_job(&mut items, *ji),
+            RunNode::Matrix { key, legs } => {
+                items.push(DetailItem::Group(ni));
+                if open(key, legs) {
+                    for ji in legs {
+                        push_job(&mut items, *ji);
+                    }
+                }
+            }
         }
     }
     items
@@ -1825,7 +1896,45 @@ pub struct AppState {
     pub workflow_cursor: usize,
     pub runs: Vec<Run>,
     pub run_cursor: usize,
+    /// Recent runs across the whole repo, newest first — the answer to the
+    /// one `list_repo_runs` the single-repo views already spend. Feeds the
+    /// Workflows list's history strips and tells it what is in flight.
+    pub repo_runs: Vec<Run>,
+    /// Flash/settle memory for the Workflows list, by workflow file name.
+    pub workflow_pulse: HashMap<String, Pulse>,
+    /// The same for the Runs list, by run id.
+    pub run_pulse: HashMap<u64, Pulse>,
+    /// How far the Watch view's job list is scrolled, and how far it may be —
+    /// the second is set while drawing, because only the draw knows how tall
+    /// the jobs came out. Same arrangement the help card uses.
+    pub watch_scroll: u16,
+    pub last_watch_max_scroll: Cell<u16>,
+    /// The same pair for the diff-against-last-success view.
+    pub diff_scroll: u16,
+    pub last_diff_max_scroll: Cell<u16>,
+    /// …and for the services card.
+    pub services_scroll: u16,
+    pub last_services_max_scroll: Cell<u16>,
+    /// Tick the current list view was entered on, for its entrance sweep.
+    pub list_opened_tick: Option<u64>,
+    /// Tick the Workflows view last asked the API what the repo is doing.
+    pub workflows_polled_tick: u64,
     pub run_detail: Option<RunDetail>,
+    /// How `run_detail`'s jobs hang together: matrix legs boxed with their
+    /// siblings, the rest in `needs:` order. Rebuilt whenever the detail is,
+    /// by [`AppState::rebuild_run_shape`].
+    pub run_shape: Vec<RunNode>,
+    /// Matrix boxes the user has folded or unfolded by hand, by job key.
+    /// Anything not in here follows [`AppState::group_is_open`]'s default.
+    pub detail_group_open: HashMap<String, bool>,
+    /// Parsed workflow files, by file name, each stamped with the file's
+    /// modification time so an edit in the checkout re-reads it. A `None`
+    /// parse is cached too: a repo without a checkout must not be re-read on
+    /// every poll for an answer that will not change.
+    pub workflow_graphs: HashMap<String, (Option<std::time::SystemTime>, Option<Arc<WorkflowGraph>>)>,
+    /// The checkout jog was launched in, when there is one — where the
+    /// workflow YAML behind `run_shape` is read from.
+    pub repo_root: Option<PathBuf>,
     pub detail_cursor: usize,
     pub log_lines: Vec<String>,
     pub log_raw: Vec<String>,
@@ -2166,7 +2275,22 @@ impl AppState {
             workflow_cursor: 0,
             runs: Vec::new(),
             run_cursor: 0,
+            repo_runs: Vec::new(),
+            workflow_pulse: HashMap::new(),
+            run_pulse: HashMap::new(),
+            watch_scroll: 0,
+            last_watch_max_scroll: Cell::new(0),
+            diff_scroll: 0,
+            last_diff_max_scroll: Cell::new(0),
+            services_scroll: 0,
+            last_services_max_scroll: Cell::new(0),
+            list_opened_tick: None,
+            workflows_polled_tick: 0,
             run_detail: None,
+            run_shape: Vec::new(),
+            detail_group_open: HashMap::new(),
+            workflow_graphs: HashMap::new(),
+            repo_root: None,
             detail_cursor: 0,
             log_lines: Vec::new(),
             log_raw: Vec::new(),
@@ -2372,6 +2496,134 @@ impl AppState {
         self.api_backoff_secs = 0;
     }
 
+    /// The recent runs of one workflow, newest first.
+    ///
+    /// GitHub's repo-wide run list doesn't name the file a run came out of, so
+    /// the run's title — which is the workflow's own `name:` — is what ties the
+    /// two together. That is the same match the status sweep uses.
+    pub fn runs_of(&self, wf: &Workflow) -> Vec<&Run> {
+        self.repo_runs
+            .iter()
+            .filter(|r| match &r.workflow_file {
+                Some(f) => f == &wf.file_name,
+                None => r.display_title == wf.name,
+            })
+            .collect()
+    }
+
+    /// Runs in flight on the repo the app is pointed at, with the card they
+    /// belong to — the activity strip's input outside the dashboard.
+    pub fn active_repo_progress(&self) -> Vec<(&RepoCard, &RunDetail)> {
+        let label = self.repo_label.as_str();
+        self.active_progress()
+            .into_iter()
+            .filter(|(c, _)| c.spec == label)
+            // Each tracked run carries a copy of itself from the moment its
+            // job fetch left, so a run that has landed since still calls
+            // itself running and would keep a spinner on the strip. The lists
+            // the view polls are the fresher word on it.
+            .filter(|(_, d)| !self.has_landed(d.run.id))
+            .collect()
+    }
+
+    /// Has this run reached its verdict, according to anything fresher than
+    /// the progress cache?
+    fn has_landed(&self, id: u64) -> bool {
+        self.runs
+            .iter()
+            .chain(self.repo_runs.iter())
+            .any(|r| r.id == id && r.status.is_terminal())
+    }
+
+    /// Work out the shape of whatever `run_detail` now holds: which jobs are
+    /// legs of one matrix, and what order `needs:` puts the rest in.
+    ///
+    /// Called every time the detail is replaced, which is every poll while a
+    /// run is live. The workflow file behind it is parsed once and kept, so the
+    /// repeat is a few string matches over a handful of jobs.
+    pub fn rebuild_run_shape(&mut self) {
+        let Some(detail) = &self.run_detail else {
+            self.run_shape.clear();
+            return;
+        };
+        // Which file this run came out of. The runs endpoint doesn't say, so
+        // fall back to the workflow we are listing runs for, and then to the
+        // one whose name the run carries as its title.
+        let file = detail
+            .run
+            .workflow_file
+            .clone()
+            .or_else(|| self.workflow_for_runs.clone())
+            .or_else(|| {
+                let title = detail.run.display_title.as_str();
+                self.workflows
+                    .iter()
+                    .find(|w| w.name == title)
+                    .map(|w| w.file_name.clone())
+            });
+        let graph = file.and_then(|f| self.workflow_graph(&f));
+        let detail = self.run_detail.as_ref().expect("checked above");
+        self.run_shape = shape(&detail.jobs, graph.as_deref());
+    }
+
+    /// The parsed workflow file, read from the checkout the first time it is
+    /// asked for. `None` without a checkout, or for a file that won't parse —
+    /// the shape then falls back to reading GitHub's own leg naming.
+    fn workflow_graph(&mut self, file: &str) -> Option<Arc<WorkflowGraph>> {
+        let path = self
+            .repo_root
+            .as_ref()
+            .map(|root| root.join(".github").join("workflows").join(file));
+        // One stat per poll, against a file the editor next to jog may well be
+        // rewriting: a workflow whose jobs were renamed an hour ago should not
+        // keep being read through the shape it used to have.
+        let stamp = path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok()?.modified().ok());
+        if let Some((seen, hit)) = self.workflow_graphs.get(file)
+            && *seen == stamp
+        {
+            return hit.clone();
+        }
+        let parsed = path
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|raw| WorkflowGraph::parse(&raw))
+            .map(Arc::new);
+        self.workflow_graphs
+            .insert(file.to_string(), (stamp, parsed.clone()));
+        parsed
+    }
+
+    /// Is a matrix box unfolded in the detail view? Unless the user has said
+    /// otherwise, a box opens itself when one of its legs is worth looking at —
+    /// still running, or red — and stays shut when they all passed.
+    pub fn group_is_open(&self, key: &str, legs: &[usize]) -> bool {
+        if let Some(explicit) = self.detail_group_open.get(key) {
+            return *explicit;
+        }
+        let jobs = self.run_detail.as_ref().map(|d| &d.jobs);
+        legs.iter()
+            .filter_map(|&i| jobs?.get(i))
+            .any(|j| j.status != Status::Success && j.status != Status::Skipped)
+    }
+
+    /// Fold an open matrix box, unfold a shut one.
+    pub fn toggle_group(&mut self, node: usize) {
+        let Some(RunNode::Matrix { key, legs }) = self.run_shape.get(node).cloned() else {
+            return;
+        };
+        let now = self.group_is_open(&key, &legs);
+        self.detail_group_open.insert(key, !now);
+    }
+
+    /// The detail view's rows for the run on screen.
+    pub fn detail_items(&self) -> Vec<DetailItem> {
+        match &self.run_detail {
+            Some(d) => build_detail_items(d, &self.run_shape, &|k, legs| self.group_is_open(k, legs)),
+            None => Vec::new(),
+        }
+    }
+
     pub fn switch_view(&mut self, v: View) {
         if self.view != v {
             self.view = v;
@@ -2381,6 +2633,19 @@ impl AppState {
             // the program — the same rule the help and services cards follow.
             if v == View::Repos {
                 self.dash_opened_tick = Some(self.tick_count);
+            }
+            // The same entrance on the views a single-repo session actually
+            // lands on. Set on arrival, not on startup, so it replays every
+            // time you come back rather than once per session.
+            if matches!(v, View::Workflows | View::Runs) {
+                self.list_opened_tick = Some(self.tick_count);
+            }
+            // A view is entered at the top of itself, never part-way down
+            // whatever the last visit left behind.
+            match v {
+                View::Watch => self.watch_scroll = 0,
+                View::Diff => self.diff_scroll = 0,
+                _ => {}
             }
         }
     }
@@ -3331,6 +3596,62 @@ fn strip_time_prefix(s: &str) -> &str {
 mod tests {
     use super::*;
     use crate::provider::WorkflowInput;
+
+    #[test]
+    fn the_shape_comes_off_the_workflow_file_in_the_checkout() {
+        let root = std::env::temp_dir().join(format!("jog-shape-{}", std::process::id()));
+        let dir = root.join(".github").join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("deploy.yml"),
+            "jobs:\n  build:\n    name: build ${{ matrix.service }}\n    strategy:\n      matrix:\n        service: [a, b]\n",
+        )
+        .unwrap();
+
+        let mut st = AppState::new(
+            "o/r".into(),
+            "main".into(),
+            Vec::new(),
+            KeymapConfig::default(),
+            History::default(),
+        );
+        st.repo_root = Some(root.clone());
+        // The run doesn't name its own file; the workflow being listed does.
+        st.workflow_for_runs = Some("deploy.yml".into());
+        let job = |name: &str| Job {
+            id: 1,
+            name: name.into(),
+            status: Status::Success,
+            started_at: None,
+            completed_at: None,
+            steps: Vec::new(),
+        };
+        st.run_detail = Some(RunDetail {
+            run: Run {
+                id: 1,
+                display_title: "Deploy".into(),
+                head_branch: "main".into(),
+                commit_msg: String::new(),
+                status: Status::Success,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                url: String::new(),
+                workflow_file: None,
+            },
+            jobs: vec![job("build a"), job("build b")],
+        });
+        st.rebuild_run_shape();
+        // Names the API gives no hint about — only the file says these two
+        // are legs of one job.
+        assert_eq!(
+            st.run_shape,
+            vec![RunNode::Matrix {
+                key: "build".into(),
+                legs: vec![0, 1]
+            }]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn the_trigger_prompt_prefills_what_was_dispatched_last_time() {

@@ -224,6 +224,72 @@ The output belongs to the repo, not to the screen: `Esc` out of a repo mid-hook
 and its dashboard row says so (`main ●3  ⠹ commit`, or `✗ commit` once a hook
 has rejected it), and walking back in picks the output up where it was.
 
+## The single-repo views move too
+
+What the multi-repo dashboard does — rows that light up when their CI moves, a
+verdict that breathes in its own colour when a run lands, a history strip per
+row, and a live panel naming the step something is on — the Workflows and Runs
+lists now do as well:
+
+```
+ ╭─┤ Workflows  3 ├──────────────────────────────────────── ✓1  ✗1  ⏵1 ─╮
+ │     Workflow            File                Last run  Recent runs     │
+ │                                                                       │
+ │ ▶ ⠹  Deploy to stage    deploy_to_stage.yml   4m ago   ▃▅▂▃▁▅▃  ✓7    │
+ │   ✗  Run tests          ci.yml                1h ago   ▃▃▃▂▃▃▃  ✓5 ✗2 │
+ │   ✓  CodeQL             codeql.yml            2d ago   ▂▃▃▃▃▅▃  ✓9    │
+ ╰───────────────────────────────────────────────────────────────────────╯
+ ╭ ⠹ Live  1 in flight ──────────────────────────────────────────────────╮
+ │ ⠹  Deploy to stage  CRM-IMP  build gojobi  › Run docker/build-push…   │
+ │    ━━━━━━━╺──────  6/11  4:16  ~1:20 left                             │
+ ╰───────────────────────────────────────────────────────────────────────╯
+```
+
+The history strips are drawn from the repo-wide run list those views already
+fetch, so they cost nothing extra; the live panel costs one request per run in
+flight, and none at all while the repo is quiet. The Workflows list refreshes
+itself now, on its own clock — every poll while something is running, a sixth of
+that when nothing is. It is a conditional request, so a quiet repo answers "not
+modified" and spends none of the hour's budget.
+
+The selected row is tinted rather than repainted, so the status glyph, the branch
+and the timestamps keep their own colours under the cursor. The run preview beside
+the list draws from both the per-workflow fetch and the repo-wide poll, newest
+wins: it fills in from runs already in hand instead of sitting at `loading…` every
+time the cursor moves, and a run it caught mid-flight stops spinning when that run
+lands rather than when you leave the view.
+
+## A matrix reads as one job
+
+A workflow that fans `build` out over five services arrives from the API as five
+ordinary jobs with expanded names, and used to fill the Watch view with five
+copies of the same step list. `jog` reads the run's shape back out of the
+workflow file in the checkout — which jobs are legs of one matrix, and what
+order `needs:` puts them in — and draws it the way the run page does:
+
+```
+ ✓ which commit  5/5  8s ───────────────────────────────────────────────────────
+   ✓ 1. Set up job
+ ╭─┤ Matrix: build ├──────────────────────────────────────────────── 4m 46s ─╮
+ │ ✓ build db-backup                                          9/9       15s  │
+ │ ⠹ build gojobi                                            6/11    1m 12s  │
+ │     ⠹ 6. Run docker/build-push-action@v6                                  │
+ │ ✓ build ingestor                                           9/9    4m 46s  │
+ │ ✓ build ollama                                             9/9       19s  │
+ │ ✓ build wecker                                           11/11       40s  │
+ ╰───────────────────────────────────────────────────────────────────────────╯
+ ✓ deploy-stage / v0.0.21 → stage  10/10  55s ──────────────────────────────────
+```
+
+A leg that passed is one line with its clock on it. A leg still working, or one
+that broke, opens far enough to say which step it is on. In the run detail view
+the box is a row of its own: `Enter` folds its legs away or brings them back,
+and a box with something red in it starts open.
+
+Without a checkout — the multi-repo dashboard looking at a repo you have no copy
+of — there is no file to read, so legs are recognised the other way GitHub names
+them: `test (ubuntu-latest, 3.11)` and its siblings still box together.
+
 ## Fuzzy finder
 
 `Ctrl-P` opens a finder over whatever the current view lists — repos, workflows,

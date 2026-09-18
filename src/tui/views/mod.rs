@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, LineGauge, Padding, Paragraph, Row, Table, TableState,
-    Wrap,
+    Widget, Wrap,
 };
 
 use std::collections::HashMap;
@@ -15,12 +15,13 @@ use super::animated_glyph;
 use super::motion::{Motion, mix};
 use crate::app::state::{
     AppState, BatchPhase, ByteSpan, DetailItem, DiffLine, DiffRow, DiffSide, GitDiffView, GitOp,
-    Hit, ItemState,
-    StatusKind, Theme, View, ansi_line_to_spans, build_detail_items,
+    Hit, ItemState, Pulse,
+    StatusKind, Theme, View, ansi_line_to_spans,
 };
 use crate::history::HistoryEntry;
 use crate::provider::github::{ApiFault, CRITICAL_PERCENT};
-use crate::provider::{Job, Run, Status};
+use crate::provider::graph::RunNode;
+use crate::provider::{Job, Run, RunDetail, Status};
 
 pub fn render(f: &mut Frame, state: &AppState) {
     let area = f.area();
@@ -166,6 +167,37 @@ const HEADER_LINES: u16 = 2;
 /// long list keeps the loop at full rate exactly as long as its own sweep runs.
 pub fn dash_revealing(state: &AppState) -> bool {
     state.view == View::Repos && dash_reveal_at(state, state.repos.len() + 4) < 1.0
+}
+
+/// The same entrance, for the lists a single-repo session lives in.
+fn list_reveal_at(state: &AppState, i: usize) -> f64 {
+    staggered_reveal(
+        state.list_opened_tick,
+        state.tick_count,
+        i,
+        DASH_REVEAL_STEP,
+        DASH_REVEAL_TICKS,
+    )
+}
+
+/// Whether the Workflows or Runs list still has rows arriving.
+pub fn list_revealing(state: &AppState) -> bool {
+    matches!(state.view, View::Workflows | View::Runs)
+        && list_reveal_at(state, state.workflows.len().max(state.runs.len()) + 4) < 1.0
+}
+
+/// Whether any list row is still lit — a flash fading, or a verdict breathing.
+pub fn list_pulsing(state: &AppState) -> bool {
+    let tick = state.tick_count;
+    state
+        .workflow_pulse
+        .values()
+        .chain(state.run_pulse.values())
+        .any(|p| {
+            let [changed, settled] = p.ticks();
+            changed.is_some_and(|a| tick.saturating_sub(a) < FLASH_TICKS)
+                || settled.is_some_and(|a| tick.saturating_sub(a) < SETTLE_TICKS)
+        })
 }
 
 /// How long the footer's `? help` beacon breathes after startup: ten seconds
@@ -450,11 +482,43 @@ fn render_services_overlay(f: &mut Frame, area: Rect, state: &AppState) {
         }
         None => block,
     };
+    // A status page with thirty monitors on it is taller than the screen; the
+    // card stops at the screen's edge and the rest is scrolled to.
+    let viewport = slot.height.saturating_sub(4);
+    // On a terminal too short for even one row there is nothing to scroll
+    // through — and a cap taken at face value would swallow every key on a
+    // card showing nothing.
+    let max_scroll = if viewport == 0 {
+        0
+    } else {
+        (rows.len() as u16).saturating_sub(viewport)
+    };
+    state.last_services_max_scroll.set(max_scroll);
+    let scroll = state.services_scroll.min(max_scroll);
+    let block = if max_scroll > 0 {
+        block.title_bottom(
+            Line::from(Span::styled(
+                format!(
+                    " {}/{} scroll · {}–{} of {} ",
+                    display_key(&state.keymap.down),
+                    display_key(&state.keymap.up),
+                    scroll + 1,
+                    (scroll + viewport).min(rows.len() as u16),
+                    rows.len(),
+                ),
+                Style::default().fg(theme.text_faint),
+            ))
+            .centered(),
+        )
+    } else {
+        block
+    };
     // Solid ground like the help card's: Clear alone leaves default cells,
     // which a translucent terminal renders as wallpaper behind the text.
     f.render_widget(
         Paragraph::new(rows)
             .block(block)
+            .scroll((scroll, 0))
             .style(Style::default().bg(theme.surface_alt)),
         slot,
     );
@@ -1358,9 +1422,18 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             hints
         }
         View::RunDetail => {
+            // A matrix box has no log of its own: there, Enter folds it.
+            let on_box = matches!(
+                state.detail_items().get(state.detail_cursor),
+                Some(DetailItem::Group(_))
+            );
             let mut hints = vec![
                 (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "step"),
-                (format!("↵/{}", display_key(&km.open_logs)), "logs"),
+                if on_box {
+                    ("↵".to_string(), "fold")
+                } else {
+                    (format!("↵/{}", display_key(&km.open_logs)), "logs")
+                },
                 (display_key(&km.open_browser).into(), "open"),
                 (display_key(&km.diff).into(), "diff"),
             ];
@@ -1399,7 +1472,16 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             hints
         },
         View::Watch => {
-            let mut hints = vec![(display_key(&km.open_browser).into(), "open")];
+            let mut hints = Vec::new();
+            // Offered only when there is something below the fold — a key that
+            // does nothing is worse than no key at all.
+            if state.last_watch_max_scroll.get() > 0 {
+                hints.push((
+                    format!("{}/{}", display_key(&km.down), display_key(&km.up)),
+                    "scroll",
+                ));
+            }
+            hints.push((display_key(&km.open_browser).into(), "open"));
             if state.active_has_checkout() {
                 hints.push((display_key(&km.git_view).into(), changes_label(state)));
             }
@@ -1407,11 +1489,19 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             hints.push((display_key(&km.quit).into(), "quit"));
             hints
         }
-        View::Diff => vec![
-            (display_key(&km.open_browser).into(), "open"),
-            (display_key(&km.back).into(), "back"),
-            (display_key(&km.quit).into(), "quit"),
-        ],
+        View::Diff => {
+            let mut hints = Vec::new();
+            if state.last_diff_max_scroll.get() > 0 {
+                hints.push((
+                    format!("{}/{}", display_key(&km.down), display_key(&km.up)),
+                    "scroll",
+                ));
+            }
+            hints.push((display_key(&km.open_browser).into(), "open"));
+            hints.push((display_key(&km.back).into(), "back"));
+            hints.push((display_key(&km.quit).into(), "quit"));
+            hints
+        }
         View::TriggerPrompt if editing => vec![
             ("type".into(), "edit"),
             ("Bksp".into(), "delete"),
@@ -1732,7 +1822,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
     };
 
     if let Some(sa) = strip_area {
-        render_activity_strip(f, sa, state, &live);
+        render_activity_strip(f, sa, state, &live, true);
     }
 
     // No frame. The header one line up already names the directory and counts
@@ -2085,7 +2175,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
             let branch = latest.map(|r| r.head_branch.clone()).unwrap_or_default();
 
             let (c_ok, c_fail, c_busy) = card.counts();
-            let mut recent = run_sparkline(&card.runs, spark_w, theme);
+            let mut recent = run_sparkline(&card.runs.iter().collect::<Vec<_>>(), spark_w, theme);
             // Numbers line up down the column or they are not worth aligning at
             // all: the bar strip is padded to its full width so a repo with four
             // runs does not shift its counts left of a repo with twenty, and the
@@ -2103,31 +2193,16 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
             let sparkline = Line::from(recent);
             let _ = c_busy;
 
-            // A row whose CI moved since you last looked lights up and fades
-            // back down, so the change is findable without diffing the screen
-            // against your memory of it. A *landing* outranks a mere change:
-            // it breathes in the verdict's colour for two full breaths —
-            // longer and warmer than the flash — because "it finished, and
-            // this is how" is the fact the dashboard exists to deliver.
-            let m = Motion::new(state.tick_count);
-            let base = row_bg_for_status(status, theme);
-            let settle = card
-                .settled_tick
-                .map(|(at, verdict)| (m.decay(at, SETTLE_TICKS), verdict))
-                .filter(|(envelope, _)| *envelope > 0.0);
-            let bg = if let Some((envelope, verdict)) = settle {
-                let tint = style_for_status(verdict, theme).fg.unwrap_or(theme.text);
-                // The pulse carries the breath; the decay fades it out.
-                mix(base, tint, envelope * (0.2 + 0.35 * m.pulse(12)))
-            } else if let Some(at) = card.changed_tick {
-                mix(
-                    base,
-                    style_for_status(status, theme).fg.unwrap_or(theme.text),
-                    0.4 * m.decay(at, FLASH_TICKS),
-                )
-            } else {
-                base
-            };
+            let bg = pulsed_bg(
+                row_bg_for_status(status, theme),
+                Pulse {
+                    changed: card.changed_tick,
+                    settled: card.settled_tick,
+                },
+                status,
+                state.tick_count,
+                theme,
+            );
             let dress = row_dress(bg, rows.len(), i == state.repo_cursor, theme);
 
             let mut cells = vec![
@@ -2199,41 +2274,14 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
     ts.select(row_of.get(state.repo_cursor).copied());
     f.render_stateful_widget(table, inner, &mut ts);
 
-    // The entrance: the table rises out of the dashboard's own ground one line
-    // at a time, top to bottom — the sweep the help and services cards play,
-    // on the view you actually land on rather than only on the ones you open.
-    //
-    // Done over the drawn buffer rather than over the rows: a built `Row` will
-    // not hand its cells back to be recoloured, and what sweeps here is where a
-    // line sits on screen, not which repo holds it. Only the lines the table
-    // really drew are touched — blending the empty space below the last row
-    // would paint a slab of ground there and then take it away again.
+    // The sweep the help and services cards play, on the view you actually
+    // land on rather than only on the ones you open.
     if state.dash_opened_tick.is_some() {
         let body = inner.height.saturating_sub(HEADER_LINES) as usize;
         let drawn = HEADER_LINES as usize + rows_len.saturating_sub(ts.offset()).min(body);
-        let ground = theme.row_idle;
-        let buf = f.buffer_mut();
-        for line in 0..drawn.min(inner.height as usize) {
-            let p = dash_reveal_at(state, line);
-            if p >= 1.0 {
-                continue;
-            }
-            let y = inner.y + line as u16;
-            for x in inner.x..inner.right() {
-                if let Some(cell) = buf.cell_mut((x, y)) {
-                    // `Reset` is the terminal's own colour, which cannot be
-                    // blended and would snap to the card's ground — a slab of
-                    // paint appearing under the column heads and then leaving.
-                    // Those cells simply sit the sweep out.
-                    if cell.fg != Color::Reset {
-                        cell.fg = mix(ground, cell.fg, p);
-                    }
-                    if cell.bg != Color::Reset {
-                        cell.bg = mix(ground, cell.bg, p);
-                    }
-                }
-            }
-        }
+        sweep_in(f, inner, drawn, theme.row_idle, |line| {
+            dash_reveal_at(state, line)
+        });
     }
 
     // Click targets, through the same heading-aware map. Headings themselves
@@ -2377,6 +2425,73 @@ fn render_dash_live(f: &mut Frame, area: Rect, state: &AppState) {
 ///
 /// All three compose into a single colour rather than one painting over the
 /// next, which is the whole reason the selection can stop erasing the row.
+/// A row's ground, with whatever it is currently saying about itself mixed in.
+///
+/// A row whose CI moved since you last looked lights up and fades back down, so
+/// the change is findable without diffing the screen against your memory of it.
+/// A *landing* outranks a mere change: it breathes in the verdict's colour for
+/// two full breaths — longer and warmer than the flash — because "it finished,
+/// and this is how" is the fact these views exist to deliver.
+fn pulsed_bg(base: Color, pulse: Pulse, status: Status, tick: u64, theme: &Theme) -> Color {
+    let m = Motion::new(tick);
+    let settle = pulse
+        .settled
+        .map(|(at, verdict)| (m.decay(at, SETTLE_TICKS), verdict))
+        .filter(|(envelope, _)| *envelope > 0.0);
+    if let Some((envelope, verdict)) = settle {
+        let tint = style_for_status(verdict, theme).fg.unwrap_or(theme.text);
+        // The pulse carries the breath; the decay fades it out.
+        return mix(base, tint, envelope * (0.2 + 0.35 * m.pulse(12)));
+    }
+    match pulse.changed {
+        Some(at) => mix(
+            base,
+            style_for_status(status, theme).fg.unwrap_or(theme.text),
+            0.4 * m.decay(at, FLASH_TICKS),
+        ),
+        None => base,
+    }
+}
+
+/// The entrance: a table rises out of its own ground one line at a time, top to
+/// bottom.
+///
+/// Done over the drawn buffer rather than over the rows: a built `Row` will not
+/// hand its cells back to be recoloured, and what sweeps here is where a line
+/// sits on screen, not which item holds it. Only the lines the table really
+/// drew are touched — blending the empty space below the last row would paint a
+/// slab of ground there and then take it away again.
+fn sweep_in(
+    f: &mut Frame,
+    inner: Rect,
+    drawn: usize,
+    ground: Color,
+    reveal: impl Fn(usize) -> f64,
+) {
+    let buf = f.buffer_mut();
+    for line in 0..drawn.min(inner.height as usize) {
+        let p = reveal(line);
+        if p >= 1.0 {
+            continue;
+        }
+        let y = inner.y + line as u16;
+        for x in inner.x..inner.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                // `Reset` is the terminal's own colour, which cannot be blended
+                // and would snap to the card's ground — a slab of paint
+                // appearing under the column heads and then leaving. Those
+                // cells simply sit the sweep out.
+                if cell.fg != Color::Reset {
+                    cell.fg = mix(ground, cell.fg, p);
+                }
+                if cell.bg != Color::Reset {
+                    cell.bg = mix(ground, cell.bg, p);
+                }
+            }
+        }
+    }
+}
+
 fn row_dress(base: Color, idx: usize, selected: bool, theme: &Theme) -> Style {
     let bg = banded(base, idx, theme);
     let bg = if selected {
@@ -2495,7 +2610,7 @@ impl Columns {
 /// how it ended. A pair of counts can say "18 passed, 2 failed" but never *"it
 /// started failing three runs ago"* or *"the last green one took twice as long
 /// as usual"*, which are the two questions a repo's history gets asked.
-fn run_sparkline(runs: &[Run], width: usize, theme: &Theme) -> Vec<Span<'static>> {
+fn run_sparkline(runs: &[&Run], width: usize, theme: &Theme) -> Vec<Span<'static>> {
     const BARS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
     if runs.is_empty() {
         // Padded like any other strip, so "no history" does not shove its count
@@ -2506,7 +2621,7 @@ fn run_sparkline(runs: &[Run], width: usize, theme: &Theme) -> Vec<Span<'static>
         ];
     }
     // `runs` is newest-first; a history reads left to right.
-    let window: Vec<&Run> = runs.iter().take(width).rev().collect();
+    let window: Vec<&Run> = runs.iter().take(width).rev().copied().collect();
     let secs = |r: &Run| (r.updated_at - r.created_at).num_seconds().max(0) as f64;
     let longest = window.iter().copied().map(secs).fold(0.0_f64, f64::max);
     let shortest = window.iter().copied().map(secs).fold(f64::MAX, f64::min);
@@ -2657,6 +2772,9 @@ fn render_activity_strip(
     area: Rect,
     state: &AppState,
     entries: &[(&crate::app::state::RepoCard, &crate::provider::RunDetail)],
+    // Off in the single-repo views: the header already names the repo, and
+    // repeating it down every row costs the step name the width it needs.
+    show_repo: bool,
 ) {
     let theme = &state.theme;
     let tick = state.tick_count;
@@ -2757,7 +2875,7 @@ fn render_activity_strip(
             StripRow {
                 glyph,
                 repeat,
-                repo: card.spec.clone(),
+                repo: if show_repo { card.spec.clone() } else { String::new() },
                 workflow: run.display_title.clone(),
                 branch: run.head_branch.clone(),
                 job,
@@ -2787,7 +2905,7 @@ fn render_activity_strip(
     const CAP: [usize; 5] = [28, 30, 18, 22, 48];
     const FLOOR: [usize; 5] = [10, 8, 6, 6, 12];
     let mut cols = [
-        longest(&|c| disp_width(&c.repo)),
+        if show_repo { longest(&|c| disp_width(&c.repo)) } else { 0 },
         longest(&|c| disp_width(&c.workflow)),
         longest(&|c| disp_width(&c.branch)),
         longest(&|c| disp_width(&c.job)),
@@ -2810,7 +2928,8 @@ fn render_activity_strip(
     let w_eta = longest(&|c| disp_width(&c.eta)).min(14);
     let show_eta = w_eta > 0 && inner >= 80;
     let (w_eta, eta_spacing) = if show_eta { (w_eta, SPACING) } else { (0, 0) };
-    let fixed = 1 + bar_w + w_count + w_elapsed + w_eta + eta_spacing + SPACING * 8;
+    let fixed =
+        1 + bar_w + w_count + w_elapsed + w_eta + eta_spacing + SPACING * if show_repo { 8 } else { 7 };
     let avail = inner.saturating_sub(fixed);
     shrink_to_fit(&mut cols, &FLOOR, avail);
     // Slack goes to the step, so the elapsed clock keeps the right edge and the
@@ -2833,19 +2952,21 @@ fn render_activity_strip(
                     Style::default().fg(theme.text_muted).italic(),
                 )),
             };
-            let mut cells_out = vec![
-                Cell::from(Span::styled(
-                    c.glyph.clone(),
-                    Style::default().fg(theme.warning).bold(),
-                )),
-                Cell::from(Span::styled(
+            let mut cells_out = vec![Cell::from(Span::styled(
+                c.glyph.clone(),
+                Style::default().fg(theme.warning).bold(),
+            ))];
+            if show_repo {
+                cells_out.push(Cell::from(Span::styled(
                     truncate(&c.repo, cols[0]),
                     if c.repeat {
                         Style::default().fg(theme.text_ghost)
                     } else {
                         Style::default().fg(theme.text_bright).bold()
                     },
-                )),
+                )));
+            }
+            cells_out.extend([
                 Cell::from(Span::styled(
                     truncate(&c.workflow, cols[1]),
                     Style::default().fg(theme.text),
@@ -2864,7 +2985,7 @@ fn render_activity_strip(
                     c.count.clone(),
                     Style::default().fg(theme.text_muted),
                 )),
-            ];
+            ]);
             if show_eta {
                 cells_out.push(Cell::from(
                     Line::from(Span::styled(
@@ -2885,16 +3006,18 @@ fn render_activity_strip(
         })
         .collect();
 
-    let mut widths = vec![
-        Constraint::Length(1), // spinner
-        Constraint::Length(cols[0] as u16),
+    let mut widths = vec![Constraint::Length(1)]; // spinner
+    if show_repo {
+        widths.push(Constraint::Length(cols[0] as u16));
+    }
+    widths.extend([
         Constraint::Length(cols[1] as u16),
         Constraint::Length(cols[2] as u16),
         Constraint::Length(cols[3] as u16),
         Constraint::Length(cols[4] as u16),
         Constraint::Length(bar_w as u16),
         Constraint::Length(w_count as u16),
-    ];
+    ]);
     if show_eta {
         widths.push(Constraint::Length(w_eta as u16));
     }
@@ -3072,7 +3195,10 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
         (
             "Run detail",
             vec![
-                (format!("↵/{}", display_key(&km.open_logs)), "open logs"),
+                (
+                    format!("↵/{}", display_key(&km.open_logs)),
+                    "open logs, or fold a matrix box",
+                ),
                 (k(&km.diff), "diff against the last successful run"),
             ],
         ),
@@ -4890,12 +5016,40 @@ fn render_finder_overlay(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_workflows(f: &mut Frame, area: Rect, state: &AppState) {
+    let area = live_strip_below(f, area, state, &state.active_repo_progress());
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(area);
     render_workflows_list(f, chunks[0], state);
     render_workflows_preview(f, chunks[1], state);
+}
+
+/// The dashboard's activity strip, along the bottom of a single-repo view.
+///
+/// Returns what is left of `area` for the view itself. Given room on the same
+/// terms the dashboard uses: only while the list above it can still show a
+/// useful number of rows, because the list is the view. Full width rather than
+/// under one pane — the strip is read down its columns, and half a terminal is
+/// not enough to keep them.
+fn live_strip_below(
+    f: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    live: &[(&crate::app::state::RepoCard, &RunDetail)],
+) -> Rect {
+    let rows = live.len().min(3) as u16;
+    if rows == 0 || area.height < rows + 9 {
+        return area;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(rows + 2)])
+        .split(area);
+    // The repo name is off: the header names it already, and repeating it down
+    // every row costs the step name the width it needs.
+    render_activity_strip(f, chunks[1], state, live, false);
+    chunks[0]
 }
 
 fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
@@ -4927,65 +5081,138 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let sel_bg = theme.select_bg;
-    let sel_fg = theme.text_bright;
-    let hdr = Style::default().fg(theme.text_muted);
+    let hdr = Style::default().fg(theme.text_faint);
 
-    let header = Row::new(vec![
+    // The history strip only when the runs behind it have been fetched and the
+    // list is wide enough to carry it — all or nothing, like the dashboard's
+    // optional columns: half a sparkline is worse than none.
+    let spark_w = 8usize;
+    let show_recent = !state.repo_runs.is_empty() && inner.width >= 56;
+
+    let mut header_cells = vec![
         Cell::from(""),
         Cell::from(Span::styled("Workflow", hdr)),
         Cell::from(Span::styled("File", hdr)),
-        Cell::from(Span::styled("Last run", hdr)),
+        Cell::from(Line::from(Span::styled("Last run", hdr)).right_aligned()),
         Cell::from(""),
-    ])
-    .height(1)
-    .bottom_margin(1);
+    ];
+    if show_recent {
+        header_cells.insert(4, Cell::from(Span::styled("Recent runs", hdr)));
+    }
+    let header = Row::new(header_cells).height(1).bottom_margin(1);
 
     let rows: Vec<Row> = state
         .workflows
         .iter()
-        .map(|w| {
+        .enumerate()
+        .map(|(i, w)| {
             let status = w.last_status.unwrap_or(Status::Unknown);
             let (when_text, when_style) = w
                 .last_run_at
                 .map(|t| relative_styled(t.with_timezone(&Utc), theme))
                 .unwrap_or_else(|| ("—".into(), Style::default().fg(theme.unknown)));
             let trig = if w.triggerable { "t" } else { " " };
+            let pulse = state.workflow_pulse.get(&w.file_name).copied().unwrap_or_default();
+            let bg = pulsed_bg(
+                row_bg_for_status(status, theme),
+                pulse,
+                status,
+                state.tick_count,
+                theme,
+            );
 
-            let row_bg = row_bg_for_status(status, theme);
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(Span::styled(animated_glyph(status, state.tick_count), style_for_status(status, &state.theme))),
-                Cell::from(Span::styled(w.name.clone(), Style::default())),
+                Cell::from(Span::styled(
+                    w.name.clone(),
+                    if i == state.workflow_cursor {
+                        Style::default().fg(theme.text_bright).bold()
+                    } else {
+                        Style::default().fg(theme.text)
+                    },
+                )),
                 Cell::from(Span::styled(
                     w.file_name.clone(),
                     Style::default().fg(theme.text_muted),
                 )),
-                Cell::from(Span::styled(when_text, when_style)),
-                Cell::from(Span::styled(
-                    trig,
-                    Style::default().fg(theme.accent),
-                )),
-            ])
-            .style(Style::default().bg(row_bg))
+                Cell::from(Line::from(Span::styled(when_text, when_style)).right_aligned()),
+            ];
+            if show_recent {
+                let runs = state.runs_of(w);
+                let (ok, fail) = runs.iter().fold((0u32, 0u32), |(o, f), r| match r.status {
+                    Status::Success => (o + 1, f),
+                    Status::Failure | Status::Cancelled => (o, f + 1),
+                    _ => (o, f),
+                });
+                let mut strip = run_sparkline(&runs, spark_w, theme);
+                if !runs.is_empty() {
+                    strip.push(Span::styled(
+                        format!(" ✓{ok:<3}"),
+                        Style::default().fg(theme.success_dim),
+                    ));
+                    if fail > 0 {
+                        strip.push(Span::styled(
+                            format!("✗{fail:<3}"),
+                            Style::default().fg(theme.failure),
+                        ));
+                    }
+                }
+                cells.push(Cell::from(Line::from(strip)));
+            }
+            cells.push(Cell::from(Span::styled(trig, Style::default().fg(theme.accent))));
+            Row::new(cells).style(row_dress(bg, i, i == state.workflow_cursor, theme))
         })
         .collect();
 
-    let widths = [
+    let mut widths = vec![
         Constraint::Length(1),       // status glyph
-        Constraint::Fill(55),        // workflow name
-        Constraint::Fill(45),        // file
+        Constraint::Fill(1),         // workflow name — takes the slack
+        // Given a floor rather than a share where there is room for one:
+        // `deploy_to_stage.yml` cut to `deploy_to_stage.y` is the truncation
+        // that reads as a bug. Where there isn't, the name outranks it — a
+        // list of workflows is read by name.
+        if inner.width >= 72 {
+            Constraint::Min(20)
+        } else {
+            Constraint::Fill(1)
+        },
         Constraint::Length(10),      // last run
         Constraint::Length(1),       // trig
     ];
+    if show_recent {
+        widths.insert(4, Constraint::Length(spark_w as u16 + 9));
+    }
 
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(2)
-        .row_highlight_style(Style::default().bg(sel_bg).fg(sel_fg).add_modifier(Modifier::BOLD))
-        .highlight_symbol("▶ ");
+        // Empty on purpose — see the note in `render_repos`. A flat highlight
+        // style would repaint the one row you are pointing at in a single
+        // colour, taking the status glyph and the timestamp with it.
+        .row_highlight_style(Style::default())
+        .highlight_symbol(Span::styled(
+            "▶ ",
+            Style::default().fg(theme.primary).bold(),
+        ));
 
     let mut ts = TableState::default();
     if state.workflows.is_empty() {
+        // Between switching repos and the new list landing there is nothing to
+        // say yet — and "this repo has no workflows" would be a lie told every
+        // time. A moving placeholder at least says jog is still asking.
+        if state.pending > 0 {
+            let body: Vec<Line> = (0..(inner.height.saturating_sub(1)).min(5))
+                .map(|i| {
+                    Line::from(skeleton(
+                        (inner.width as usize).saturating_sub(4),
+                        state.tick_count + i as u64 * 3,
+                        theme,
+                    ))
+                })
+                .collect();
+            f.render_widget(Paragraph::new(body), inner);
+            return;
+        }
         render_empty(
             f,
             inner,
@@ -4998,6 +5225,14 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
     }
     ts.select(Some(state.workflow_cursor));
     f.render_stateful_widget(table, inner, &mut ts);
+    if state.list_opened_tick.is_some() {
+        let body = inner.height.saturating_sub(HEADER_LINES) as usize;
+        let drawn =
+            HEADER_LINES as usize + state.workflows.len().saturating_sub(ts.offset()).min(body);
+        sweep_in(f, inner, drawn, theme.surface, |line| {
+            list_reveal_at(state, line)
+        });
+    }
     register_table_hits(
         state,
         inner,
@@ -5030,7 +5265,26 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
         .unwrap_or(false)
         && !state.workflow_preview_runs.is_empty();
 
-    if !preview_ready {
+    // Two sources, and the fresher one wins.
+    //
+    // The per-workflow fetch goes out when the cursor arrives at a row and
+    // never again, so the run it caught mid-flight stays mid-flight on this
+    // pane for as long as you look at it — spinning next to a row the list on
+    // the left has already marked failed. The repo-wide list is re-read every
+    // poll, so anything recent enough to appear in it is taken from there; the
+    // per-workflow list contributes the older runs it reaches and this one
+    // doesn't, which is the depth it was fetched for.
+    let mut runs: Vec<&Run> = selected.map(|w| state.runs_of(w)).unwrap_or_default();
+    if preview_ready {
+        for r in &state.workflow_preview_runs {
+            if !runs.iter().any(|x| x.id == r.id) {
+                runs.push(r);
+            }
+        }
+        runs.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+    }
+
+    if runs.is_empty() {
         f.render_widget(
             Paragraph::new(Span::styled("loading…", Style::default().fg(theme.text_faint))),
             inner,
@@ -5051,7 +5305,13 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
     let gap: u16 = 1;
     let step = bar_w + gap;
     let max_bars = ((bar_area.width + gap) / step) as usize;
-    for (i, run) in state.workflow_preview_runs.iter().rev().take(max_bars).enumerate() {
+    // Newest first in, oldest first out: take the most recent runs, then turn
+    // them round so the strip reads left to right like the sparklines do. The
+    // old `.rev().take(…)` took from the far end, which was every run there was
+    // back when this list was ten long — and is the *oldest* fourteen now that
+    // the repo-wide poll feeds it too.
+    let window: Vec<&&Run> = runs.iter().take(max_bars).rev().collect();
+    for (i, run) in window.into_iter().enumerate() {
         let bar_color = match run.status {
             Status::Success                     => theme.success,
             Status::Failure                     => theme.failure,
@@ -5079,8 +5339,7 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
     .height(1)
     .bottom_margin(1);
 
-    let rows: Vec<Row> = state
-        .workflow_preview_runs
+    let rows: Vec<Row> = runs
         .iter()
         .map(|r| {
             let (when_text, when_style) = relative_styled(r.updated_at, theme);
@@ -5106,13 +5365,18 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
         .highlight_symbol("▶ ");
 
     let mut ts = TableState::default();
-    if !state.workflow_preview_runs.is_empty() {
-        ts.select(Some(0)); // highlight most recent
-    }
+    ts.select(Some(0)); // highlight most recent
     f.render_stateful_widget(table, inner_chunks[1], &mut ts);
 }
 
 fn render_runs(f: &mut Frame, area: Rect, state: &AppState) {
+    // Narrowed to what this list is about: the runs of the workflow on screen.
+    let live: Vec<_> = state
+        .active_repo_progress()
+        .into_iter()
+        .filter(|(_, d)| state.runs.iter().any(|r| r.id == d.run.id))
+        .collect();
+    let area = live_strip_below(f, area, state, &live);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
@@ -5156,15 +5420,13 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let sel_bg = theme.select_bg_dim;
-    let sel_fg = theme.text_bright;
-    let hdr = Style::default().fg(theme.text_muted);
+    let hdr = Style::default().fg(theme.text_faint);
 
     let header = Row::new(vec![
         Cell::from(""),
         Cell::from(Span::styled("Branch", hdr)),
-        Cell::from(Span::styled("Updated", hdr)),
-        Cell::from(Span::styled("Dur", hdr)),
+        Cell::from(Line::from(Span::styled("Updated", hdr)).right_aligned()),
+        Cell::from(Line::from(Span::styled("Dur", hdr)).right_aligned()),
     ])
     .height(1)
     .bottom_margin(1);
@@ -5172,7 +5434,8 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
     let rows: Vec<Row> = state
         .runs
         .iter()
-        .map(|r| {
+        .enumerate()
+        .map(|(i, r)| {
             let (when_text, when_style) = relative_styled(r.updated_at, theme);
             let dur_secs = elapsed_seconds(r);
             let dur_text = format_elapsed(dur_secs);
@@ -5200,13 +5463,24 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
                 Line::from(Span::styled(r.head_branch.clone(), Style::default().fg(theme.accent))),
                 commit_line,
             ]);
+            let pulse = state.run_pulse.get(&r.id).copied().unwrap_or_default();
+            let bg = pulsed_bg(
+                row_bg_for_status(r.status, theme),
+                pulse,
+                r.status,
+                state.tick_count,
+                theme,
+            );
             Row::new(vec![
                 Cell::from(Span::styled(animated_glyph(r.status, state.tick_count), style_for_status(r.status, &state.theme))),
                 Cell::from(branch_cell),
-                Cell::from(Span::styled(when_text, when_style)),
-                Cell::from(Span::styled(dur_text, dur_style)),
+                Cell::from(Line::from(Span::styled(when_text, when_style)).right_aligned()),
+                Cell::from(Line::from(Span::styled(dur_text, dur_style)).right_aligned()),
             ])
             .height(2)
+            // Two-line rows, so the banding takes the row's index rather than
+            // its line — a stripe per run, not per line of one.
+            .style(row_dress(bg, i, i == state.run_cursor, theme))
         })
         .collect();
 
@@ -5220,11 +5494,29 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(2)
-        .row_highlight_style(Style::default().bg(sel_bg).fg(sel_fg).add_modifier(Modifier::BOLD))
-        .highlight_symbol("▶ ");
+        // Empty on purpose — see the note in `render_repos`.
+        .row_highlight_style(Style::default())
+        .highlight_symbol(Span::styled(
+            "▶ ",
+            Style::default().fg(theme.primary).bold(),
+        ));
 
     let mut ts = TableState::default();
     if state.runs.is_empty() {
+        // A list still being fetched is not a workflow that never ran.
+        if state.pending > 0 {
+            let body: Vec<Line> = (0..(inner.height.saturating_sub(1)).min(5))
+                .map(|i| {
+                    Line::from(skeleton(
+                        (inner.width as usize).saturating_sub(4),
+                        state.tick_count + i as u64 * 3,
+                        theme,
+                    ))
+                })
+                .collect();
+            f.render_widget(Paragraph::new(body), inner);
+            return;
+        }
         render_empty(
             f,
             inner,
@@ -5237,6 +5529,16 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
     }
     ts.select(Some(state.run_cursor));
     f.render_stateful_widget(table, inner, &mut ts);
+    if state.list_opened_tick.is_some() {
+        let body = inner.height.saturating_sub(HEADER_LINES) as usize;
+        // Two lines per run, so the sweep still crosses one screen line at a
+        // time but the list only reaches half as far down it.
+        let drawn = HEADER_LINES as usize
+            + (state.runs.len().saturating_sub(ts.offset()) * 2).min(body);
+        sweep_in(f, inner, drawn, theme.overlay, |line| {
+            list_reveal_at(state, line)
+        });
+    }
     // Runs rows are two lines tall (branch over commit message).
     register_table_hits(state, inner, 2, 2, state.runs.len(), state.run_cursor, |r| {
         Some(Hit::Run(r))
@@ -5284,6 +5586,12 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
                 lines.push(Line::default());
             }
 
+        // Where the eye should land when there are more steps than room: the
+        // step in flight, or failing that the one that broke. A pane that
+        // always starts at "1. Set up job" of the first job spends its whole
+        // height on the part nobody opened the run to read.
+        let mut running: Option<usize> = None;
+        let mut broken: Option<usize> = None;
         for job in &detail.jobs {
             lines.push(Line::from(vec![
                 Span::styled(animated_glyph(job.status, state.tick_count), style_for_status(job.status, &state.theme)),
@@ -5291,6 +5599,12 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
                 Span::styled(job.name.clone(), Style::default().bold()),
             ]));
             for (si, step) in job.steps.iter().enumerate() {
+                if step.status == Status::Running && running.is_none() {
+                    running = Some(lines.len());
+                }
+                if step.status.is_failure() && broken.is_none() {
+                    broken = Some(lines.len());
+                }
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(animated_glyph(step.status, state.tick_count), style_for_status(step.status, &state.theme)),
@@ -5298,10 +5612,19 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
                 ]));
             }
         }
+        let max_scroll = (lines.len() as u16).saturating_sub(inner.height);
+        // A third of the way down, so what came before it is still readable.
+        let anchor = running.or(broken).unwrap_or(0) as u16;
+        let scroll = anchor.saturating_sub(inner.height / 3).min(max_scroll);
         f.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
             inner,
         );
+        if max_scroll > 0 {
+            scroll_note(f, area, scroll, inner.height, max_scroll, theme);
+        }
     }
 }
 
@@ -5330,17 +5653,86 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
         }).fold(0.0_f64, f64::max)
     }).collect();
 
-    let items = build_detail_items(detail);
+    let items = state.detail_items();
     let cursor = state.detail_cursor;
     let sel_bg = theme.surface_alt;
+    // Legs of a matrix sit one level in from the jobs that stand alone, so the
+    // box they belong to is readable even after scrolling past its header.
+    let indent: Vec<&str> = {
+        let mut v = vec![""; detail.jobs.len()];
+        for node in &state.run_shape {
+            if let RunNode::Matrix { legs, .. } = node {
+                for &ji in legs {
+                    v[ji] = "  ";
+                }
+            }
+        }
+        v
+    };
 
     let rows: Vec<Row> = items.iter().enumerate().map(|(flat_idx, item)| {
         let selected = flat_idx == cursor;
         let row_style = if selected { Style::default().bg(sel_bg) } else { Style::default() };
         match item {
+            DetailItem::Group(ni) => {
+                let RunNode::Matrix { key, legs } = &state.run_shape[*ni] else {
+                    return Row::new(vec![Cell::from("")]);
+                };
+                let open = state.group_is_open(key, legs);
+                let jobs: Vec<&Job> = legs.iter().map(|&i| &detail.jobs[i]).collect();
+                let status = worst_status(jobs.iter().map(|j| j.status));
+                let failed = jobs.iter().filter(|j| j.status.is_failure()).count();
+                let prefix = if selected { "▶ " } else { "  " };
+                let name_style = if selected {
+                    Style::default().bold().fg(theme.primary)
+                } else {
+                    Style::default().bold().fg(theme.text_bright)
+                };
+                let name_cell = Cell::from(Line::from(vec![
+                    Span::raw(prefix),
+                    Span::styled(
+                        animated_glyph(status, state.tick_count),
+                        style_for_status(status, &state.theme),
+                    ),
+                    Span::styled(
+                        if open { " ▾ " } else { " ▸ " },
+                        Style::default().fg(theme.text_muted),
+                    ),
+                    Span::styled(format!("Matrix: {key}"), name_style),
+                ]));
+                // The box's own clock is the wall time it took, not the sum of
+                // its legs — they ran side by side.
+                let dur_cell = match group_secs(&jobs) {
+                    Some(secs) => Cell::from(format!("{:>6}", format_step_dur(secs as f64)))
+                        .style(Style::default().fg(theme.text_ghost)),
+                    None => Cell::from(""),
+                };
+                let badge = if failed > 0 {
+                    Span::styled(
+                        format!("  {failed}/{} legs failed", legs.len()),
+                        Style::default().fg(theme.failure).bold(),
+                    )
+                } else {
+                    Span::styled(
+                        format!("  {} legs", legs.len()),
+                        Style::default().fg(theme.text_muted),
+                    )
+                };
+                Row::new(vec![
+                    name_cell,
+                    dur_cell,
+                    Cell::from(""),
+                    Cell::from(Line::from(badge)),
+                ])
+                .style(row_style)
+            }
             DetailItem::Job(ji) => {
                 let job = &detail.jobs[*ji];
-                let prefix = if selected { "▶ " } else { "  " };
+                let prefix = if selected {
+                    format!("{}▶ ", indent[*ji])
+                } else {
+                    format!("{}  ", indent[*ji])
+                };
                 let name_style = if selected {
                     Style::default().bold().fg(theme.primary)
                 } else {
@@ -5352,12 +5744,21 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
                     Span::raw(" "),
                     Span::styled(job.name.clone(), name_style),
                 ]));
-                Row::new(vec![name_cell, Cell::from(""), Cell::from(""), Cell::from("")])
+                let dur_cell = match job.duration_secs() {
+                    Some(secs) => Cell::from(format!("{:>6}", format_step_dur(secs as f64)))
+                        .style(Style::default().fg(theme.text_ghost)),
+                    None => Cell::from(""),
+                };
+                Row::new(vec![name_cell, dur_cell, Cell::from(""), Cell::from("")])
                     .style(row_style)
             }
             DetailItem::Step { job: ji, step: si } => {
                 let step = &detail.jobs[*ji].steps[*si];
-                let prefix = if selected { "  ▶ " } else { "    " };
+                let prefix = if selected {
+                    format!("{}  ▶ ", indent[*ji])
+                } else {
+                    format!("{}    ", indent[*ji])
+                };
                 let name_style = if selected {
                     Style::default().fg(theme.text_bright).bold()
                 } else {
@@ -5474,17 +5875,43 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
     ]);
     f.render_widget(Paragraph::new(summary), inner_chunks[0]);
 
+    // Where in the list the cursor is, when the list is longer than the room
+    // for it. A view that scrolls should say so, and say how far it goes.
+    let rows_h = inner_chunks[2].height as usize;
+    if items.len() > rows_h && rows_h > 0 {
+        let first = (cursor + 1).saturating_sub(rows_h);
+        f.render_widget(
+            Paragraph::new(
+                Line::from(Span::styled(
+                    format!("{}–{} of {} ", first + 1, first + rows_h, items.len()),
+                    Style::default().fg(theme.text_faint),
+                ))
+                .right_aligned(),
+            ),
+            inner_chunks[0],
+        );
+    }
+
     let table = Table::new(rows, [
+        // The name column takes whatever the fixed ones leave — job names
+        // carry a matrix leg or a called workflow in them and were being cut
+        // in half by a badge column that is mostly empty.
         Constraint::Min(20),     // name
         Constraint::Length(6),   // duration (right-aligned inside cell)
         Constraint::Length(10),  // ■ bar
-        Constraint::Fill(1),     // historical badge
+        Constraint::Length(18),  // historical badge
     ])
-    .column_spacing(1);
-    f.render_widget(table, inner_chunks[2]);
-    // This table never scrolls (drawn stateless from row 0), so the click map
-    // is pinned to the top with `selected_row = 0`.
-    register_table_hits(state, inner_chunks[2], 0, 1, items.len(), 0, |r| {
+    .column_spacing(1)
+    // The row under the cursor is dressed by hand — see `render_repos` — so
+    // the table's own highlight must not paint over it.
+    .row_highlight_style(Style::default());
+    // Stateful, which is what scrolls it: the cursor used to be free to walk
+    // off the bottom of a long run and take the view's usefulness with it,
+    // because the table was drawn from row 0 every frame.
+    let mut ts = TableState::default();
+    ts.select(Some(cursor));
+    f.render_stateful_widget(table, inner_chunks[2], &mut ts);
+    register_table_hits(state, inner_chunks[2], 0, 1, items.len(), cursor, |r| {
         Some(Hit::DetailItem(r))
     });
 }
@@ -5686,6 +6113,10 @@ fn render_search_overlay(f: &mut Frame, area: Rect, state: &AppState) {
 
 fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
+    // Answered up front, because two paths below return before the jobs are
+    // laid out: a stale cap left in the cell has the footer offering a scroll
+    // key on a view with nothing to scroll, and the key moving a phantom.
+    state.last_watch_max_scroll.set(0);
     // The live tail earns a pane only while a job is actually producing one —
     // between runs, and once everything has settled, the steps get the room
     // back and the view is exactly what it was before the pane existed.
@@ -5813,90 +6244,334 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(summary, chunks[0]);
 
     if let Some(detail) = &state.run_detail {
-        let theme = &state.theme;
-
-        // Build alternating constraints: 1 row for the job gauge, N rows for its steps.
-        let constraints: Vec<Constraint> = detail.jobs.iter()
-            .flat_map(|job| [
-                Constraint::Length(1),
-                Constraint::Length(job.steps.len() as u16),
-            ])
-            .collect();
-
-        if constraints.is_empty() {
+        // Matrix legs come boxed together, the way the run page draws them. A
+        // run whose shape nothing could be worked out for is still a plain
+        // list of jobs, which is what this view always was.
+        let fallback: Vec<RunNode>;
+        let nodes: &[RunNode] = if state.run_shape.is_empty() {
+            fallback = (0..detail.jobs.len()).map(RunNode::Job).collect();
+            &fallback
+        } else {
+            &state.run_shape
+        };
+        if nodes.is_empty() {
             return;
         }
 
-        let areas = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(constraints)
-            .split(chunks[1]);
-
-        for (i, job) in detail.jobs.iter().enumerate() {
-            let total = job.steps.len().max(1) as f64;
-            let done = job.steps.iter().filter(|s| s.status.is_terminal()).count() as f64;
-            let ratio = (done / total).clamp(0.0, 1.0);
-            let g_style = style_for_status(job.status, theme);
-
-            // ── Gauge row ──────────────────────────────────────────────
-            let label = Line::from(vec![
-                Span::styled(animated_glyph(job.status, state.tick_count), g_style),
-                Span::raw(" "),
-                Span::styled(job.name.clone(), Style::default().fg(theme.text_bright).bold()),
-                Span::styled(
-                    format!("  {}/{}", done as u32, total as u32),
-                    Style::default().fg(theme.text_muted),
-                ),
-            ]);
-            f.render_widget(
-                LineGauge::default()
-                    .ratio(ratio)
-                    .label(label)
-                    .filled_style(g_style)
-                    .unfilled_style(Style::default().fg(theme.border)),
-                areas[i * 2],
-            );
-
-            // ── Steps list ─────────────────────────────────────────────
-            if job.steps.is_empty() {
-                continue;
+        // Every standalone job would like its steps under it, and a workflow
+        // with eight of them asks for more rows than any terminal has. Close
+        // the ones nobody opened this view to read — the ones that passed,
+        // from the top — and only start on the rest once they've all gone.
+        let avail = chunks[1].height as usize;
+        let mut open: Vec<bool> = nodes
+            .iter()
+            .map(|n| matches!(n, RunNode::Job(_)))
+            .collect();
+        let used = |open: &[bool]| -> usize {
+            nodes
+                .iter()
+                .zip(open)
+                .map(|(n, &o)| watch_block_height(n, &detail.jobs, o))
+                .sum()
+        };
+        while used(&open) > avail {
+            let quiet = |ji: usize| {
+                let st = detail.jobs[ji].status;
+                st.is_terminal() && !st.is_failure()
+            };
+            let next = nodes
+                .iter()
+                .enumerate()
+                .find(|(i, n)| open[*i] && matches!(n, RunNode::Job(ji) if quiet(*ji)))
+                .or_else(|| nodes.iter().enumerate().find(|(i, _)| open[*i]));
+            match next {
+                Some((i, _)) => open[i] = false,
+                None => break,
             }
-            let step_lines: Vec<Line> = job.steps.iter().enumerate().map(|(si, step)| {
-                let (glyph_style, name_style) = match step.status {
-                    Status::Success =>  (
-                        Style::default().fg(theme.success),
-                        Style::default().fg(theme.success_dim),
-                    ),
-                    Status::Failure =>  (
-                        Style::default().fg(theme.failure).bold(),
-                        Style::default().fg(theme.failure_dim).bold(),
-                    ),
-                    Status::Running =>  (
-                        style_for_status(step.status, theme).bold(),
-                        Style::default().fg(theme.text_bright).bold(),
-                    ),
-                    Status::Cancelled | Status::Skipped => (
-                        Style::default().fg(theme.unknown),
-                        Style::default().fg(theme.text_ghost),
-                    ),
-                    _ => (
-                        Style::default().fg(theme.text_ghost),
-                        Style::default().fg(theme.text_ghost),
-                    ),
-                };
-                Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(animated_glyph(step.status, state.tick_count), glyph_style),
-                    Span::styled(format!(" {}. ", si + 1), Style::default().fg(theme.text_ghost)),
-                    Span::styled(step.name.clone(), name_style),
-                ])
-            }).collect();
-
-            f.render_widget(
-                Paragraph::new(step_lines),
-                areas[i * 2 + 1],
-            );
         }
+
+        // Even fully collapsed a long enough run outgrows the room for it —
+        // and a `Layout` given more rows than it has squeezes the ones at the
+        // bottom to nothing, so jobs simply vanished. What doesn't fit is
+        // scrolled to instead.
+        let total = used(&open);
+        let max_scroll = total.saturating_sub(avail) as u16;
+        state.last_watch_max_scroll.set(max_scroll);
+        let scroll = state.watch_scroll.min(max_scroll);
+
+        if max_scroll == 0 {
+            draw_watch_blocks(f.buffer_mut(), chunks[1], nodes, &open, detail, state);
+            return;
+        }
+        // Drawn full height into a buffer of its own, then the window that
+        // fits is copied across. Laying the blocks out inside the visible area
+        // and clipping would be the same code with every height wrong.
+        let tall = Rect { height: total as u16, ..chunks[1] };
+        let mut scratch = ratatui::buffer::Buffer::empty(tall);
+        draw_watch_blocks(&mut scratch, tall, nodes, &open, detail, state);
+        let buf = f.buffer_mut();
+        for row in 0..chunks[1].height {
+            let from = tall.y + scroll + row;
+            for x in chunks[1].x..chunks[1].right() {
+                if let (Some(src), Some(dst)) =
+                    (scratch.cell((x, from)).cloned(), buf.cell_mut((x, chunks[1].y + row)))
+                {
+                    *dst = src;
+                }
+            }
+        }
+        // Where you are in it, written along the bottom edge of the summary
+        // block — the one rule on screen that is not carrying a job.
+        scroll_note(f, chunks[0], scroll, chunks[1].height, max_scroll, theme);
+    }
+}
+
+/// Lay the run's blocks out top to bottom and draw them. Takes a buffer rather
+/// than the frame because the scrolling path draws into one of its own.
+fn draw_watch_blocks(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    nodes: &[RunNode],
+    open: &[bool],
+    detail: &RunDetail,
+    state: &AppState,
+) {
+    let constraints: Vec<Constraint> = nodes
+        .iter()
+        .zip(open)
+        .map(|(n, &o)| Constraint::Length(watch_block_height(n, &detail.jobs, o) as u16))
+        .collect();
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    for ((node, &open), area) in nodes.iter().zip(open).zip(areas.iter()) {
+        match node {
+            RunNode::Job(ji) => draw_watch_job(buf, *area, &detail.jobs[*ji], open, state),
+            RunNode::Matrix { key, legs } => {
+                draw_watch_matrix(buf, *area, key, legs, detail, state)
+            }
+        }
+    }
+}
+
+/// Rows a Watch block takes up: the job's own line, plus whatever it shows
+/// underneath — its steps, or a box's legs.
+fn watch_block_height(node: &RunNode, jobs: &[Job], open: bool) -> usize {
+    match node {
+        RunNode::Job(ji) => 1 + if open { jobs[*ji].steps.len() } else { 0 },
+        RunNode::Matrix { legs, .. } => {
+            let rows: usize = legs
+                .iter()
+                .map(|&i| 1 + usize::from(leg_focus(&jobs[i]).is_some()))
+                .sum();
+            rows + 2 // the box's own border
+        }
+    }
+}
+
+/// The one step of a matrix leg worth a second line: what it is running now,
+/// or what broke. `None` for a leg that simply passed — the reason a box of
+/// green legs stays five rows tall however long its legs were.
+fn leg_focus(job: &Job) -> Option<(usize, &crate::provider::Step)> {
+    job.steps
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.status == Status::Running)
+        .or_else(|| {
+            job.steps
+                .iter()
+                .enumerate()
+                .find(|(_, s)| s.status.is_failure())
+        })
+}
+
+/// A job on its own: the gauge line it always had, now with the clock the run
+/// page prints, and its steps below when there is room for them.
+fn draw_watch_job(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    job: &Job,
+    open: bool,
+    state: &AppState,
+) {
+    let theme = &state.theme;
+    let total = job.steps.len().max(1) as f64;
+    let done = job.steps.iter().filter(|s| s.status.is_terminal()).count() as f64;
+    let g_style = style_for_status(job.status, theme);
+
+    let mut label = vec![
+        Span::styled(animated_glyph(job.status, state.tick_count), g_style),
+        Span::raw(" "),
+        Span::styled(job.name.clone(), Style::default().fg(theme.text_bright).bold()),
+        Span::styled(
+            format!("  {}/{}", done as u32, total as u32),
+            Style::default().fg(theme.text_muted),
+        ),
+    ];
+    if let Some(secs) = job.duration_secs() {
+        label.push(Span::styled(
+            format!("  {}", format_step_dur(secs as f64)),
+            Style::default().fg(theme.text_ghost),
+        ));
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    LineGauge::default()
+        .ratio((done / total).clamp(0.0, 1.0))
+        .label(Line::from(label))
+        .filled_style(g_style)
+        .unfilled_style(Style::default().fg(theme.border))
+        .render(rows[0], buf);
+
+    if !open || job.steps.is_empty() {
+        return;
+    }
+    let step_lines: Vec<Line> = job
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(si, step)| {
+            let (glyph_style, name_style) = step_styles(step.status, theme);
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(animated_glyph(step.status, state.tick_count), glyph_style),
+                Span::styled(format!(" {}. ", si + 1), Style::default().fg(theme.text_ghost)),
+                Span::styled(step.name.clone(), name_style),
+            ])
+        })
+        .collect();
+    Paragraph::new(step_lines).render(rows[1], buf);
+}
+
+/// One matrix job's legs, in the box the run page puts them in: a line each,
+/// and a second line for any leg still working or already broken.
+fn draw_watch_matrix(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    key: &str,
+    legs: &[usize],
+    detail: &RunDetail,
+    state: &AppState,
+) {
+    let theme = &state.theme;
+    let jobs: Vec<&Job> = legs.iter().map(|&i| &detail.jobs[i]).collect();
+    let status = worst_status(jobs.iter().map(|j| j.status));
+    // The panel chip every other pane wears, so the box reads as part of the
+    // view rather than as something bolted onto it. Only a broken leg colours
+    // the border — a green matrix has five green glyphs already.
+    let edge = if status.is_failure() {
+        theme.failure_dim
+    } else {
+        theme.border
+    };
+    let chip = Line::from(vec![
+        Span::styled("─┤ ", Style::default().fg(edge)),
+        Span::styled("Matrix: ", Style::default().fg(theme.text_muted)),
+        Span::styled(key.to_string(), Style::default().fg(theme.primary).bold()),
+        Span::styled(" ├", Style::default().fg(edge)),
+    ]);
+    let mut blk = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(edge))
+        .padding(Padding::horizontal(1))
+        .title(chip);
+    if let Some(secs) = group_secs(&jobs) {
+        blk = blk.title(
+            Line::from(vec![
+                Span::styled("─ ", Style::default().fg(edge)),
+                Span::styled(
+                    format_step_dur(secs as f64),
+                    Style::default().fg(theme.text_ghost),
+                ),
+                Span::styled(" ─", Style::default().fg(edge)),
+            ])
+            .right_aligned(),
+        );
+    }
+    let inner = blk.inner(area);
+    blk.render(area, buf);
+    if inner.height == 0 {
+        return;
+    }
+
+    let w = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for job in &jobs {
+        let done = job.steps.iter().filter(|s| s.status.is_terminal()).count();
+        let mut right = format!("{done}/{}", job.steps.len());
+        if let Some(secs) = job.duration_secs() {
+            right = format!("{right}   {:>7}", format_step_dur(secs as f64));
+        }
+        let head = format!(
+            "{} {}",
+            animated_glyph(job.status, state.tick_count),
+            job.name
+        );
+        let gap = w
+            .saturating_sub(UnicodeWidthStr::width(head.as_str()))
+            .saturating_sub(UnicodeWidthStr::width(right.as_str()))
+            .max(1);
+        lines.push(Line::from(vec![
+            Span::styled(
+                animated_glyph(job.status, state.tick_count),
+                style_for_status(job.status, theme),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate(&job.name, w.saturating_sub(right.len() + 4)),
+                if job.status == Status::Running {
+                    Style::default().fg(theme.text_bright).bold()
+                } else {
+                    Style::default().fg(theme.text)
+                },
+            ),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(right, Style::default().fg(theme.text_muted)),
+        ]));
+        // What this leg is busy with, or what it died on — the line that makes
+        // a collapsed box still worth watching.
+        if let Some((si, step)) = leg_focus(job) {
+            let (glyph_style, name_style) = step_styles(step.status, theme);
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(animated_glyph(step.status, state.tick_count), glyph_style),
+                Span::styled(format!(" {}. ", si + 1), Style::default().fg(theme.text_ghost)),
+                Span::styled(truncate(&step.name, w.saturating_sub(10)), name_style),
+            ]));
+        }
+    }
+    Paragraph::new(lines).render(inner, buf);
+}
+
+/// How a step's glyph and name are painted for its status — shared by the
+/// Watch view's two ways of listing steps.
+fn step_styles(status: Status, theme: &Theme) -> (Style, Style) {
+    match status {
+        Status::Success => (
+            Style::default().fg(theme.success),
+            Style::default().fg(theme.success_dim),
+        ),
+        Status::Failure => (
+            Style::default().fg(theme.failure).bold(),
+            Style::default().fg(theme.failure_dim).bold(),
+        ),
+        Status::Running => (
+            Style::default().fg(theme.primary).bold(),
+            Style::default().fg(theme.text_bright).bold(),
+        ),
+        Status::Cancelled | Status::Skipped => (
+            Style::default().fg(theme.unknown),
+            Style::default().fg(theme.text_ghost),
+        ),
+        _ => (
+            Style::default().fg(theme.text_ghost),
+            Style::default().fg(theme.text_ghost),
+        ),
     }
 }
 
@@ -6013,7 +6688,55 @@ fn render_diff(f: &mut Frame, area: Rect, state: &AppState) {
         }
     }
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    // Wrapped lines take more rows than they are, so the cap is counted in
+    // lines and comes out generous: overshooting shows blank rows, which is
+    // recoverable, where undershooting hides the last line for good.
+    let max_scroll = (lines.len() as u16).saturating_sub(inner.height);
+    state.last_diff_max_scroll.set(max_scroll);
+    let scroll = state.diff_scroll.min(max_scroll);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        inner,
+    );
+    if max_scroll > 0 {
+        scroll_note(f, area, scroll, inner.height, max_scroll, theme);
+    }
+}
+
+/// The "you are here" note a scrolling pane wears on its bottom edge.
+fn scroll_note(
+    f: &mut Frame,
+    area: Rect,
+    scroll: u16,
+    viewport: u16,
+    max_scroll: u16,
+    theme: &Theme,
+) {
+    let total = max_scroll + viewport;
+    let note = format!(
+        " ↕ {}–{} of {} ",
+        scroll + 1,
+        (scroll + viewport).min(total),
+        total
+    );
+    let w = note.chars().count() as u16;
+    if area.width < w + 4 || area.height < 2 {
+        return;
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            note,
+            Style::default().fg(theme.text_faint),
+        ))),
+        Rect {
+            x: area.right().saturating_sub(w + 2),
+            y: area.bottom().saturating_sub(1),
+            width: w,
+            height: 1,
+        },
+    );
 }
 
 fn style_for_status(s: Status, theme: &Theme) -> Style {
@@ -6150,9 +6873,34 @@ fn render_trigger_prompt(f: &mut Frame, area: Rect, state: &AppState) {
         hint_spans.push(Span::styled(" cycle", Style::default().fg(theme.text_faint)));
     }
     lines.push(Line::from(hint_spans));
+    // A workflow with more inputs than the modal is tall used to hide the rest
+    // of them, cursor and all. Follow the cursor instead: enough of the list
+    // scrolls away to keep the field being answered on screen, and the two
+    // hint lines at the end come with it.
+    //
+    // Counted in rendered rows, not in fields: the paragraph wraps, so a long
+    // default or a recalled value on a narrow modal takes two rows and one
+    // more field slides off the bottom for each of them — the very field being
+    // answered, in the case this exists to fix. Word wrap can still spill a
+    // row past what dividing by the width predicts, which costs a row of
+    // context and never the cursor.
+    let text_w = modal.width.saturating_sub(2).max(1) as usize;
+    let rows_of = |l: &Line| l.width().div_ceil(text_w).max(1);
+    let viewport = modal.height.saturating_sub(2);
+    // Field `i` is line `i`: nothing is pushed before the loop above.
+    let through_cursor: usize = lines
+        .iter()
+        .take(prompt.cursor + 1)
+        .map(&rows_of)
+        .sum();
+    let total_rows: usize = lines.iter().map(&rows_of).sum();
+    let scroll = (through_cursor as u16)
+        .saturating_sub(viewport)
+        .min((total_rows as u16).saturating_sub(viewport));
     let p = Paragraph::new(lines)
         .block(styled_block(&title, &state.theme))
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     f.render_widget(p, modal);
 }
 
@@ -6217,6 +6965,34 @@ fn format_step_dur(secs: f64) -> String {
         let s = (secs % 60.0) as u64;
         if s == 0 { format!("{m}m") } else { format!("{m}m {s}s") }
     }
+}
+
+/// The one status that speaks for a whole matrix box: the worst thing any leg
+/// is doing, in the order a reader cares about them.
+fn worst_status(legs: impl Iterator<Item = Status>) -> Status {
+    let rank = |s: Status| match s {
+        Status::Failure => 6,
+        Status::Running => 5,
+        Status::Queued => 4,
+        Status::Cancelled => 3,
+        Status::Unknown => 2,
+        Status::Skipped => 1,
+        Status::Success => 0,
+    };
+    legs.max_by_key(|s| rank(*s)).unwrap_or(Status::Unknown)
+}
+
+/// Wall time across a matrix box: first leg starting to last leg finishing.
+/// Legs run side by side, so adding their clocks up would say ten minutes
+/// about a box that took three.
+fn group_secs(legs: &[&Job]) -> Option<i64> {
+    let start = legs.iter().filter_map(|j| j.started_at).min()?;
+    let end = if legs.iter().any(|j| !j.status.is_terminal()) {
+        Utc::now()
+    } else {
+        legs.iter().filter_map(|j| j.completed_at).max()?
+    };
+    Some((end - start).num_seconds().max(0))
 }
 
 fn step_timing(
@@ -7403,6 +8179,8 @@ mod tests {
             id: 7,
             name: name.into(),
             status: Status::Running,
+            started_at: None,
+            completed_at: None,
             steps: steps
                 .iter()
                 .map(|(n, s)| crate::provider::Step {
@@ -7413,6 +8191,587 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn draw_watch(state: &AppState, w: u16, h: u16) -> String {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_watch(f, f.area(), state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The run behind the screenshot this view was rebuilt for: a commit
+    /// check, five build legs of one matrix job, then two deploys.
+    fn watching_a_matrix_run(build: &[(&str, Status)]) -> AppState {
+        const WF: &str = r#"
+jobs:
+  which-commit:
+    name: which commit
+  build:
+    needs: which-commit
+    name: build ${{ matrix.service }}
+    strategy:
+      matrix:
+        service: [db-backup, gojobi, ingestor, ollama, wecker]
+  deploy-stage:
+    needs: build
+    uses: ./.github/workflows/deploy.yml
+"#;
+        let mut st = AppState::new(
+            "vakanzo/vakanzo".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        st.view = View::Watch;
+        let done = |n: &str| a_job_at(n, Status::Success, 40, &[("Set up job", Status::Success)]);
+        let mut jobs = vec![a_job_at(
+            "which commit",
+            Status::Success,
+            8,
+            &[("Set up job", Status::Success)],
+        )];
+        for (name, status) in build {
+            jobs.push(a_job_at(
+                name,
+                *status,
+                95,
+                &[
+                    ("Set up job", Status::Success),
+                    ("Registry login", Status::Success),
+                    (
+                        "Run docker/build-push-action@v6",
+                        if *status == Status::Running {
+                            Status::Running
+                        } else {
+                            *status
+                        },
+                    ),
+                ],
+            ));
+        }
+        jobs.push(done("deploy-stage / v0.0.21 → stage"));
+        jobs.push(done("deploy-stage / v0.0.21 → stage (GPU box)"));
+        st.run_detail = Some(crate::provider::RunDetail {
+            run: a_run(1, "Deploy to stage", Status::Running, 256),
+            jobs,
+        });
+        let graph = crate::provider::graph::WorkflowGraph::parse(WF).unwrap();
+        let detail = st.run_detail.as_ref().unwrap();
+        st.run_shape = crate::provider::graph::shape(&detail.jobs, Some(&graph));
+        st
+    }
+
+    fn a_job_at(
+        name: &str,
+        status: Status,
+        secs: i64,
+        steps: &[(&str, Status)],
+    ) -> crate::provider::Job {
+        let now = Utc::now();
+        crate::provider::Job {
+            id: 7,
+            name: name.into(),
+            status,
+            started_at: Some(now - chrono::Duration::seconds(secs)),
+            completed_at: status.is_terminal().then_some(now),
+            steps: steps
+                .iter()
+                .map(|(n, s)| crate::provider::Step {
+                    name: (*n).into(),
+                    status: *s,
+                    started_at: None,
+                    completed_at: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn watch_boxes_matrix_legs_and_keeps_the_live_one_open() {
+        let st = watching_a_matrix_run(&[
+            ("build db-backup", Status::Success),
+            ("build gojobi", Status::Running),
+            ("build ingestor", Status::Success),
+            ("build ollama", Status::Success),
+            ("build wecker", Status::Success),
+        ]);
+        let out = draw_watch(&st, 70, 32);
+        // One box, titled the way the run page titles it, with a line per leg
+        // in alphabetical order.
+        assert!(out.contains("Matrix: build"), "{out}");
+        let legs: Vec<&str> = out
+            .lines()
+            // Inside the box: the live-log pane below names a leg too.
+            .filter(|l| {
+                l.starts_with('│')
+                    && ["db-backup", "gojobi", "ingestor", "ollama", "wecker"]
+                        .iter()
+                        .any(|leg| l.contains(&format!("build {leg}")))
+            })
+            .map(|l| l.trim())
+            .collect();
+        assert_eq!(legs.len(), 5, "one line per leg:\n{out}");
+        assert!(legs[0].contains("db-backup") && legs[4].contains("wecker"), "{out}");
+        // Each leg carries its own clock, the way the run page prints them.
+        assert!(legs.iter().all(|l| l.contains("1m 35s")), "{out}");
+        // The leg still working says what it is working on; the four that
+        // passed say nothing beyond their clock, so the box is six rows and
+        // not five jobs' worth of steps.
+        let box_rows: Vec<&str> = out
+            .lines()
+            .skip_while(|l| !l.contains("Matrix: build"))
+            .take_while(|l| !l.starts_with('╰'))
+            .collect();
+        assert_eq!(
+            box_rows
+                .iter()
+                .filter(|l| l.contains("Run docker/build-push-action@v6"))
+                .count(),
+            1,
+            "only the live leg opens:\n{out}"
+        );
+        assert_eq!(box_rows.len(), 7, "title, five legs, one live step:\n{out}");
+        // Steps of the jobs outside the box are still listed.
+        assert!(out.contains("1. Set up job"), "{out}");
+    }
+
+    #[test]
+    fn watch_scrolls_what_it_cannot_collapse_any_further() {
+        // Twelve jobs in a ten-row window: even one line each is too many, and
+        // the ones at the bottom used to be squeezed out of existence.
+        let mut st = watching_a_matrix_run(&[("build gojobi", Status::Success)]);
+        let detail = st.run_detail.as_mut().unwrap();
+        detail.jobs = (0..12)
+            .map(|i| {
+                a_job_at(
+                    &format!("job number {i}"),
+                    Status::Success,
+                    10,
+                    &[("Set up job", Status::Success)],
+                )
+            })
+            .collect();
+        st.run_shape.clear();
+        st.rebuild_run_shape();
+
+        let top = draw_watch(&st, 70, 18);
+        assert!(top.contains("job number 0"), "{top}");
+        assert!(!top.contains("job number 11"), "{top}");
+        // The header says there is more, and by how much.
+        assert!(top.contains("of 12"), "{top}");
+
+        st.watch_scroll = 99; // clamped to the end by the draw
+        let bottom = draw_watch(&st, 70, 18);
+        assert!(bottom.contains("job number 11"), "the last job should be reachable:\n{bottom}");
+        assert!(!bottom.contains("job number 0"), "{bottom}");
+    }
+
+    #[test]
+    fn watch_gives_up_green_jobs_steps_before_it_overflows() {
+        let st = watching_a_matrix_run(&[
+            ("build db-backup", Status::Success),
+            ("build gojobi", Status::Success),
+            ("build ingestor", Status::Success),
+            ("build ollama", Status::Success),
+            ("build wecker", Status::Success),
+        ]);
+        // Fewer rows than the run wants: the box keeps all five legs and the
+        // jobs around it give up their steps, so the last job still lands on
+        // screen instead of being pushed off the bottom.
+        let roomy = draw_watch(&st, 70, 22);
+        let tight = draw_watch(&st, 70, 18);
+        assert!(tight.contains("Matrix: build"), "{tight}");
+        assert!(
+            tight.contains("deploy-stage / v0.0.21 → stage (GPU box)"),
+            "last job pushed off the bottom:\n{tight}"
+        );
+        assert!(
+            tight.matches("1. Set up job").count() < roomy.matches("1. Set up job").count(),
+            "steps should be given up under pressure:\n{tight}"
+        );
+    }
+
+    fn draw_detail(state: &AppState, w: u16, h: u16) -> String {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_run_detail(f, f.area(), state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_detail_list_scrolls_the_cursor_into_view() {
+        let mut st = watching_a_matrix_run(&[
+            ("build db-backup", Status::Success),
+            ("build gojobi", Status::Success),
+            ("build ingestor", Status::Success),
+            ("build ollama", Status::Success),
+            ("build wecker", Status::Success),
+        ]);
+        st.view = View::RunDetail;
+        st.detail_group_open.insert("build".into(), true);
+        let rows = st.detail_items().len();
+        // A window far shorter than the run: the last row is well past it.
+        let top = draw_detail(&st, 80, 12);
+        assert!(top.contains("which commit"), "{top}");
+
+        st.detail_cursor = rows - 1;
+        let bottom = draw_detail(&st, 80, 12);
+        assert!(
+            bottom.contains("Complete job") || bottom.contains("Set up job"),
+            "the last row should be on screen:\n{bottom}"
+        );
+        assert!(!bottom.contains("which commit"), "the top should have scrolled away:\n{bottom}");
+        // And the header says where in the list you are.
+        assert!(bottom.contains(&format!("of {rows}")), "{bottom}");
+    }
+
+    #[test]
+    fn detail_folds_a_matrix_that_passed_and_opens_one_that_broke() {
+        let mut green = watching_a_matrix_run(&[
+            ("build db-backup", Status::Success),
+            ("build gojobi", Status::Success),
+            ("build ingestor", Status::Success),
+            ("build ollama", Status::Success),
+            ("build wecker", Status::Success),
+        ]);
+        green.view = View::RunDetail;
+        let out = draw_detail(&green, 80, 24);
+        // One row stands for all five legs, with the wall clock of the box.
+        assert!(out.contains("▸ Matrix: build"), "{out}");
+        assert!(out.contains("5 legs"), "{out}");
+        assert!(!out.contains("build gojobi"), "legs stay folded away:\n{out}");
+
+        let mut red = watching_a_matrix_run(&[
+            ("build db-backup", Status::Success),
+            ("build gojobi", Status::Failure),
+            ("build ingestor", Status::Success),
+            ("build ollama", Status::Success),
+            ("build wecker", Status::Success),
+        ]);
+        red.view = View::RunDetail;
+        let out = draw_detail(&red, 80, 30);
+        // A box with something wrong in it opens itself, and says how much.
+        assert!(out.contains("▾ Matrix: build"), "{out}");
+        assert!(out.contains("1/5 legs failed"), "{out}");
+        assert!(out.contains("build gojobi"), "{out}");
+    }
+
+    #[test]
+    fn folding_a_matrix_changes_which_rows_the_cursor_counts() {
+        let mut st = watching_a_matrix_run(&[
+            ("build db-backup", Status::Success),
+            ("build gojobi", Status::Failure),
+            ("build ingestor", Status::Success),
+            ("build ollama", Status::Success),
+            ("build wecker", Status::Success),
+        ]);
+        let open = st.detail_items().len();
+        // The box's own row is item 2 — after `which commit` and its step.
+        assert!(matches!(st.detail_items()[2], DetailItem::Group(_)));
+        st.toggle_group(1);
+        let shut = st.detail_items().len();
+        // Five legs with three steps each are gone; the box's row is not.
+        assert_eq!(open - shut, 5 * 4);
+    }
+
+    fn draw_view(state: &AppState, w: u16, h: u16, draw: fn(&mut Frame, Rect, &AppState)) -> String {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, f.area(), state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A single repo with four workflows, some history behind them, and one
+    /// deploy in flight.
+    fn single_repo_session() -> AppState {
+        let mut st = AppState::new(
+            "vakanzo/vakanzo".into(),
+            "CRM-IMP".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        st.view = View::Workflows;
+        let wf = |name: &str, file: &str, status: Status| crate::provider::Workflow {
+            name: name.into(),
+            file_name: file.into(),
+            triggerable: true,
+            last_status: Some(status),
+            last_run_at: Some(Utc::now() - chrono::Duration::seconds(240)),
+            inputs: Vec::new(),
+        };
+        st.workflows = vec![
+            wf("Deploy to stage", "deploy_to_stage.yml", Status::Running),
+            wf("Run tests", "ci.yml", Status::Failure),
+            wf("CodeQL", "codeql.yml", Status::Success),
+        ];
+        let mut card = crate::app::state::RepoCard::new("vakanzo/vakanzo".into());
+        card.loaded = true;
+        st.repos.push(card);
+        // Repo-wide history: the strips are drawn from these.
+        let mut runs = Vec::new();
+        for (i, (title, status)) in [
+            ("Deploy to stage", Status::Running),
+            ("Run tests", Status::Failure),
+            ("Deploy to stage", Status::Success),
+            ("Run tests", Status::Success),
+            ("Deploy to stage", Status::Success),
+            ("CodeQL", Status::Success),
+            ("Run tests", Status::Success),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut r = a_run(100 + i as u64, title, status, 300 * (i as i64 + 1));
+            r.workflow_file = None;
+            runs.push(r);
+        }
+        st.repo_runs = runs.clone();
+        st.run_progress.insert(
+            "vakanzo/vakanzo".into(),
+            vec![crate::provider::RunDetail {
+                run: runs[0].clone(),
+                jobs: vec![a_job(
+                    "build gojobi",
+                    &[
+                        ("Set up job", Status::Success),
+                        ("Registry login", Status::Success),
+                        ("Run docker/build-push-action@v6", Status::Running),
+                        ("Complete job", Status::Queued),
+                    ],
+                )],
+            }],
+        );
+        st
+    }
+
+    #[test]
+    fn the_workflows_list_carries_history_and_what_is_in_flight() {
+        let st = single_repo_session();
+        let out = draw_view(&st, 140, 20, render_workflows);
+        // A history strip per row, with the tallies the dashboard prints.
+        assert!(out.contains("Recent runs"), "{out}");
+        assert!(out.contains("✓2"), "counts per workflow:\n{out}");
+        // And the live strip along the bottom, naming the step.
+        assert!(out.contains("Live"), "{out}");
+        assert!(out.contains("Run docker/build-push-action@v6"), "{out}");
+        // The repo column is dropped there — the header already says the repo.
+        assert!(!out.contains("vakanzo/vakanzo"), "{out}");
+    }
+
+    #[test]
+    fn the_runs_list_keeps_a_live_run_in_view() {
+        let mut st = single_repo_session();
+        st.view = View::Runs;
+        st.workflow_for_runs = Some("deploy_to_stage.yml".into());
+        st.runs = st
+            .repo_runs
+            .iter()
+            .filter(|r| r.display_title == "Deploy to stage")
+            .cloned()
+            .collect();
+        let out = draw_view(&st, 120, 20, render_runs);
+        assert!(out.contains("Live"), "{out}");
+        assert!(out.contains("Run docker/build-push-action@v6"), "{out}");
+    }
+
+    fn buffer_of(
+        state: &AppState,
+        w: u16,
+        h: u16,
+        draw: fn(&mut Frame, Rect, &AppState),
+    ) -> ratatui::buffer::Buffer {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, f.area(), state)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    #[test]
+    fn a_landed_run_breathes_on_its_workflow_row_and_then_stops() {
+        let mut st = single_repo_session();
+        st.tick_count = 100;
+        let quiet = buffer_of(&st, 110, 12, render_workflows_list);
+
+        // Fresh verdict: the row is tinted.
+        st.workflow_pulse.insert(
+            "ci.yml".into(),
+            Pulse { changed: Some(100), settled: Some((100, Status::Success)) },
+        );
+        let lit = buffer_of(&st, 110, 12, render_workflows_list);
+        assert_ne!(quiet, lit, "a landing should colour its row");
+
+        // Same verdict, long spent: the row is back to its own ground, and the
+        // spinner is at the same frame, so nothing else can account for it.
+        st.workflow_pulse.insert(
+            "ci.yml".into(),
+            Pulse { changed: Some(0), settled: Some((0, Status::Success)) },
+        );
+        let faded = buffer_of(&st, 110, 12, render_workflows_list);
+        assert_eq!(quiet, faded, "the breath should not outlast its window");
+    }
+
+    #[test]
+    fn the_lists_play_their_entrance_and_settle_into_it() {
+        let mut st = single_repo_session();
+        st.tick_count = 100;
+        st.list_opened_tick = None;
+        let settled = buffer_of(&st, 110, 12, render_workflows_list);
+
+        st.list_opened_tick = Some(100);
+        let arriving = buffer_of(&st, 110, 12, render_workflows_list);
+        assert_ne!(settled, arriving, "the rows should rise out of the ground");
+
+        // Opened long enough ago that the sweep has finished: identical again.
+        st.list_opened_tick = Some(1);
+        assert_eq!(settled, buffer_of(&st, 110, 12, render_workflows_list));
+    }
+
+    #[test]
+    fn the_live_strip_lets_go_of_a_run_that_has_landed() {
+        let mut st = single_repo_session();
+        let out = draw_view(&st, 140, 20, render_workflows);
+        assert!(out.contains("Live"), "the strip is there to begin with:\n{out}");
+
+        // The run the strip is tracking finishes. Its own copy inside
+        // `run_progress` is as old as the fetch that started it and still says
+        // Running — the repo-wide list is what knows better.
+        let tracked = st.run_progress["vakanzo/vakanzo"][0].run.id;
+        for r in &mut st.repo_runs {
+            if r.id == tracked {
+                r.status = Status::Success;
+            }
+        }
+        let after = draw_view(&st, 140, 20, render_workflows);
+        assert!(!after.contains("in flight"), "the strip should let go:\n{after}");
+    }
+
+    #[test]
+    fn the_preview_stops_spinning_once_the_run_it_is_showing_has_landed() {
+        let mut st = single_repo_session();
+        st.workflow_cursor = 1; // Run tests
+        let wf = st.workflows[1].file_name.clone();
+        let name = st.workflows[1].name.clone();
+        // What the per-workflow fetch caught when the cursor arrived: the run
+        // was still going.
+        let mut mid_flight = a_run(900, &name, Status::Running, 60);
+        // The per-workflow fetch knows its file; the repo-wide one doesn't.
+        mid_flight.workflow_file = Some(wf.clone());
+        st.workflow_preview_file = Some(wf);
+        st.workflow_preview_runs = vec![mid_flight.clone()];
+        // What the repo-wide poll says a minute later: it failed.
+        let mut landed = mid_flight.clone();
+        landed.status = Status::Failure;
+        landed.workflow_file = None;
+        st.repo_runs.insert(0, landed);
+
+        let out = draw_view(&st, 140, 20, render_workflows);
+        // The preview's own rows: the branch column is the one thing only it
+        // prints, and every run in this fixture is on `main`.
+        // (The live strip names a branch too, but no row of it is a run's age.)
+        let rows: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains(" main ") && l.contains(" ago"))
+            .collect();
+        // Four runs of this workflow, and the one both sources hold is listed
+        // once rather than once per source.
+        assert_eq!(rows.len(), 4, "{out}");
+        assert!(
+            rows[0].contains('✗'),
+            "the verdict should reach the preview:\n{out}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains('⠋') || r.contains('⠙') || r.contains('⠹')),
+            "nothing should still be spinning:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_preview_chart_shows_the_newest_runs_not_the_oldest() {
+        let mut st = single_repo_session();
+        st.workflow_cursor = 1; // Run tests
+        let name = st.workflows[1].name.clone();
+        // More runs of this workflow than the chart has bars for, the newest
+        // of them red. The chart used to take from the far end of a
+        // newest-first list and draw the oldest few.
+        for i in 0..40u64 {
+            let mut r = a_run(1000 + i, &name, Status::Success, 10_000 - i as i64);
+            r.workflow_file = None;
+            st.repo_runs.push(r);
+        }
+        let mut newest = a_run(999, &name, Status::Failure, 5);
+        newest.workflow_file = None;
+        st.repo_runs.insert(0, newest);
+
+        // The chart is drawn as coloured blocks, so read the buffer's colours
+        // rather than its symbols: the failure must be among them.
+        let buf = buffer_of(&st, 140, 20, render_workflows);
+        let failure = st.theme.failure;
+        let charted = (0..buf.area.width)
+            .flat_map(|x| (0..6).map(move |y| (x, y)))
+            .any(|(x, y)| buf[(x, y)].bg == failure);
+        assert!(charted, "the newest run should be in the chart");
+    }
+
+    #[test]
+    fn the_history_strip_counts_the_run_that_just_landed() {
+        // The same staleness, one column to the left: the strip and its
+        // tallies are drawn from the repo-wide list, so they move with it.
+        let mut st = single_repo_session();
+        st.workflow_cursor = 1;
+        let name = st.workflows[1].name.clone();
+        let before = draw_view(&st, 140, 20, render_workflows_list);
+        assert!(before.contains("✓2  ✗1"), "{before}");
+        // The repo-wide endpoint doesn't name the file a run came from, which
+        // is why the match is by title — the fixture has to arrive the same way.
+        let mut landed = a_run(900, &name, Status::Failure, 60);
+        landed.workflow_file = None;
+        st.repo_runs.insert(0, landed);
+        let after = draw_view(&st, 140, 20, render_workflows_list);
+        assert!(after.contains("✓2  ✗2"), "{after}");
+    }
+
+    #[test]
+    fn a_narrow_workflows_list_drops_the_history_before_it_truncates_names() {
+        let st = single_repo_session();
+        let out = draw_view(&st, 50, 14, render_workflows_list);
+        assert!(!out.contains("Recent runs"), "{out}");
+        // The columns that were always there keep their room, and the name —
+        // which is what a workflow is read by — is not the one that gives.
+        assert!(out.contains("Run tests"), "{out}");
+        assert!(out.contains("ci.yml"), "{out}");
     }
 
     /// Three repos, two of them mid-deploy — one on a step, one still queued.
@@ -8003,7 +9362,7 @@ mod tests {
                 r
             })
             .collect();
-        let bars = run_sparkline(&runs, 6, &theme);
+        let bars = run_sparkline(&runs.iter().collect::<Vec<_>>(), 6, &theme);
 
         // Oldest on the left, so the recent failures are where the eye lands.
         let colors: Vec<Color> = bars.iter().map(|s| s.style.fg.unwrap()).collect();
@@ -8048,7 +9407,7 @@ mod tests {
                 r
             })
             .collect();
-        let bars = run_sparkline(&steady, 6, &theme);
+        let bars = run_sparkline(&steady.iter().collect::<Vec<_>>(), 6, &theme);
         let glyphs: std::collections::HashSet<&str> =
             bars.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(glyphs.len(), 1, "got {glyphs:?}");

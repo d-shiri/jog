@@ -724,6 +724,10 @@ fn map_job(j: gh_workflows::Job) -> Job {
         id: j.id.0,
         name: super::emoji_width_safe(&j.name),
         status,
+        // Queued jobs carry a zero-ish `started_at` from the API; only a job
+        // that has actually begun gets a clock.
+        started_at: (status != Status::Queued).then_some(j.started_at),
+        completed_at: j.completed_at,
         steps: j.steps.into_iter().map(map_step).collect(),
     }
 }

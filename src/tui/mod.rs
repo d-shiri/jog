@@ -22,7 +22,7 @@ use rayon::prelude::*;
 
 use crate::app::state::{
     AppState, BatchCommit, BatchPhase, DetailItem, FailureDigest, Finder, FinderKind, GitOp, Hit,
-    PushPrompt, PushWatch, RepoCard, Theme, TriggerPrompt, View, build_detail_items,
+    PushPrompt, PushWatch, RepoCard, Theme, TriggerPrompt, View,
     classify_log_severity,
 };
 use crate::config::KeymapConfig;
@@ -31,6 +31,7 @@ use crate::history::History;
 use crate::provider::github::{
     ApiError, ApiFault, GitHubProvider, Quota, RepoSpec, classify_error, current_branch,
 };
+use crate::provider::graph::RunNode;
 use crate::provider::{PrInfo, Provider, Run, RunDetail, Status, Step, Workflow};
 
 mod motion;
@@ -149,6 +150,8 @@ pub async fn run(
         && (config.ui.notify_sound || config.ui.notify_desktop);
     resolve_theme(&mut state, &config);
     state.workspace_root = opts.workspace_root.clone();
+    // Where the workflow YAML behind a run's shape is read from.
+    state.repo_root = opts.repo_root.clone();
     state.repos = if opts.workspace.is_empty() {
         dashboard_repos(&config, &state.repo_label, opts.repo_root.clone())
     } else {
@@ -167,6 +170,9 @@ pub async fn run(
             state.workflow_cursor = idx;
         }
     state.view = opts.initial_view;
+    if matches!(state.view, View::Workflows | View::Runs) {
+        state.list_opened_tick = Some(state.tick_count);
+    }
     if state.view == View::Repos {
         // The dashboard's rows sweep in from the top on the first frame, the
         // same entrance they play on every later return to the view.
@@ -459,12 +465,19 @@ async fn event_loop(
                 match app_evt {
                     AppEvent::Quit => return Ok(()),
                     AppEvent::RepoStatuses(runs) => {
+                        // A run that finished while the Workflows list was open
+                        // is news there too, not only on the dashboard.
+                        let label = state.repo_label.clone();
+                        for r in &runs {
+                            announce_if_finished(state, r, &label, &config);
+                        }
                         // Runs are newest-first, so the first hit per workflow wins.
                         // The API's run list doesn't carry the workflow filename, so
                         // fall back to matching the run's name against the workflow's
                         // display name — that's the same string GitHub reports for both.
+                        let tick = state.tick_count;
                         let mut seen = std::collections::HashSet::new();
-                        for r in runs {
+                        for r in runs.iter().cloned() {
                             let slot = match &r.workflow_file {
                                 Some(file) => state
                                     .workflows
@@ -478,10 +491,39 @@ async fn event_loop(
                             if let Some(w) = slot
                                 && seen.insert(w.file_name.clone())
                             {
+                                let was = w.last_status;
+                                let file = w.file_name.clone();
                                 w.last_status = Some(r.status);
                                 w.last_run_at = Some(r.updated_at);
+                                // The row lights up only for a status that
+                                // genuinely moved — and only once it had one to
+                                // move from, so the first sweep of a session is
+                                // silent.
+                                state
+                                    .workflow_pulse
+                                    .entry(file)
+                                    .or_default()
+                                    .note(was, r.status, tick);
                             }
                         }
+                        // The preview pane's own copy of a run it caught mid
+                        // flight, brought up to date. The pane merges the two
+                        // lists when it draws, so this is not what puts the
+                        // verdict on screen — it is what stops a run that has
+                        // landed from counting as live work and holding the
+                        // redraw loop at full rate for the rest of the session.
+                        for cached in &mut state.workflow_preview_runs {
+                            if let Some(fresh) = runs.iter().find(|r| r.id == cached.id) {
+                                cached.status = fresh.status;
+                                cached.updated_at = fresh.updated_at;
+                            }
+                        }
+                        // Kept, not thrown away: these are the runs behind the
+                        // Workflows list's history strips, and they say what is
+                        // in flight without a second request.
+                        state.repo_runs = runs;
+                        let tracked = state.repo_runs.clone();
+                        sync_active_progress(&provider, state, &tracked, &tx);
                     }
                     AppEvent::WorkflowRunsPreviewLoaded(file, runs) => {
                         if state.workflow_preview_file.as_deref() == Some(file.as_str()) {
@@ -511,6 +553,22 @@ async fn event_loop(
                             let held = (state.view != View::Watch)
                                 .then(|| state.selected_run().map(|r| r.id))
                                 .flatten();
+                            // What each row used to say, so the ones that moved
+                            // can light up. Rows arriving for the first time
+                            // have nothing to compare against and stay quiet.
+                            let tick = state.tick_count;
+                            let before: HashMap<u64, Status> =
+                                state.runs.iter().map(|r| (r.id, r.status)).collect();
+                            for r in &runs {
+                                state
+                                    .run_pulse
+                                    .entry(r.id)
+                                    .or_default()
+                                    .note(before.get(&r.id).copied(), r.status, tick);
+                            }
+                            // The map is memory of rows on screen; a run that
+                            // scrolled out of the window has nothing to light.
+                            state.run_pulse.retain(|id, _| runs.iter().any(|r| &r.id == id));
                             state.runs = runs;
                             state.run_cursor = held
                                 .and_then(|id| state.runs.iter().position(|r| r.id == id))
@@ -534,12 +592,16 @@ async fn event_loop(
                         // failed: the first broken step is the only row anyone
                         // opens a red run to see, and Enter from there is its
                         // log. A green run starts at the top as before.
-                        state.detail_cursor = if detail.run.status.is_failure() {
-                            first_failed_item(&detail).unwrap_or(0)
+                        let failed = detail.run.status.is_failure();
+                        state.run_detail = Some(detail);
+                        // The rows the cursor counts depend on how the jobs
+                        // group, so the shape has to be settled first.
+                        state.rebuild_run_shape();
+                        state.detail_cursor = if failed {
+                            first_failed_item(state).unwrap_or(0)
                         } else {
                             0
                         };
-                        state.run_detail = Some(detail);
                         state.pending = state.pending.saturating_sub(1);
                         maybe_spawn_digest(&provider, state, &tx);
                     }
@@ -1035,6 +1097,8 @@ async fn event_loop(
                     || views::services_revealing(state)
                     || views::help_revealing(state)
                     || views::dash_revealing(state)
+                    || views::list_revealing(state)
+                    || views::list_pulsing(state)
                     || views::diff_bands_revealing(state);
                 if state.status_msg.is_some() && state.tick_count.saturating_sub(state.status_msg_tick) > 30 {
                     state.status_msg = None;
@@ -1083,6 +1147,23 @@ async fn event_loop(
                                 }
                             }
                             _ if held => {}
+                            View::Workflows => {
+                                // The list used to be as old as the moment you
+                                // opened it. It refreshes now — but on its own
+                                // clock: every poll while something is in
+                                // flight, because that is what the strip below
+                                // it is showing, and a sixth of that when the
+                                // repo is quiet, because the only news then is
+                                // that a run has started. The request is
+                                // conditional, so a quiet repo answers 304 and
+                                // costs nothing from the hour's budget.
+                                let busy = state.repo_runs.iter().any(|r| !r.status.is_terminal());
+                                let every = if busy { state.poll_ticks } else { state.poll_ticks * 6 };
+                                if state.tick_count.saturating_sub(state.workflows_polled_tick) >= every {
+                                    state.workflows_polled_tick = state.tick_count;
+                                    spawn_repo_status_fetch(provider.clone(), tx.clone());
+                                }
+                            }
                             View::Watch => {
                                 if let Some(file) = state.workflow_for_runs.clone() {
                                     spawn_fetch_runs(provider.clone(), file, tx.clone(), state);
@@ -1099,6 +1180,21 @@ async fn event_loop(
                                 {
                                     spawn_fetch_runs(provider.clone(), file, tx.clone(), state);
                                 }
+                                // Outside the `has_active` gate on purpose: the
+                                // strip's entry is what has to be cleared when
+                                // the last run lands, and the answer that would
+                                // have cleared it carries the run as it was
+                                // when the fetch left — still going. Left
+                                // inside, the strip kept a finished run
+                                // spinning, and `animations_active` kept the
+                                // whole app redrawing for it. This call removes
+                                // the entry itself when nothing is in flight,
+                                // and asks for nothing when there is nothing to
+                                // ask about. `repo_runs` is left alone: it is
+                                // the whole repo's history, and this view knows
+                                // about one workflow.
+                                let tracked = state.runs.clone();
+                                sync_active_progress(&provider, state, &tracked, &tx);
                             }
                             View::RunDetail => {
                                 let run_active = state
@@ -1200,15 +1296,21 @@ async fn handle_key(
         return None;
     }
 
-    // The services overlay is a card, not a document: nothing in it scrolls,
-    // so any key puts it away — except refresh, which re-asks Kuma right now
-    // instead of waiting out the cadence.
+    // The services overlay is a card, not a document, so any key puts it away —
+    // except refresh, which re-asks Kuma right now instead of waiting out the
+    // cadence, and the movement keys once there are more monitors on the
+    // status page than fit on the card.
     if state.show_services {
         if key_is(&key, km.refresh) {
             spawn_kuma_probe(state, tx, true);
             return None;
         }
+        let max = state.last_services_max_scroll.get();
+        if max > 0 && scroll_keys(&mut state.services_scroll, max, &key, km) {
+            return None;
+        }
         state.show_services = false;
+        state.services_scroll = 0;
         state.services_opened_tick = None;
         state.needs_clear = true;
         return None;
@@ -1239,6 +1341,7 @@ async fn handle_key(
     // Global: service health by name, wherever you are.
     if key_is(&key, km.services) {
         state.show_services = true;
+        state.services_scroll = 0;
         // Opening the card is a question about right now. Kuma's own cadence
         // still applies — a reading that landed seconds ago is not re-fetched
         // — but a card opened onto nothing goes and asks rather than waiting
@@ -1384,6 +1487,7 @@ async fn handle_key(
             View::RunDetail | View::Watch => {
                 state.switch_view(View::Runs);
                 state.run_detail = None;
+                state.run_shape.clear();
             }
             View::Logs => {
                 state.switch_view(View::RunDetail);
@@ -1477,8 +1581,12 @@ async fn handle_key(
                 .run_detail.as_ref().map(|d| d.run.url.clone())
                 .or_else(|| state.selected_run().map(|r| r.url.clone())),
             View::RunDetail => state.run_detail.as_ref().and_then(|detail| {
-                let items = build_detail_items(detail);
+                let items = state.detail_items();
                 match items.get(state.detail_cursor) {
+                    Some(DetailItem::Group(ni)) => match state.run_shape.get(*ni) {
+                        Some(RunNode::Matrix { key, .. }) => Some(key.clone()),
+                        _ => None,
+                    },
                     Some(DetailItem::Job(ji)) => detail.jobs.get(*ji).map(|j| j.name.clone()),
                     Some(DetailItem::Step { job: ji, step: si }) => detail.jobs
                         .get(*ji)
@@ -1755,20 +1863,26 @@ async fn handle_key(
         }
         View::RunDetail => {
             if key_is(&key, km.down) || key.code == KeyCode::Down {
-                let max = state.run_detail.as_ref().map(|d| build_detail_items(d).len()).unwrap_or(0);
+                let max = state.detail_items().len();
                 move_cursor(&mut state.detail_cursor, max, 1);
             } else if key_is(&key, km.up) || key.code == KeyCode::Up {
-                let max = state.run_detail.as_ref().map(|d| build_detail_items(d).len()).unwrap_or(0);
+                let max = state.detail_items().len();
                 move_cursor(&mut state.detail_cursor, max, -1);
             } else if key_is(&key, km.diff) {
                 state.switch_view(View::Diff);
-            } else if (key_is(&key, km.confirm) || key.code == KeyCode::Enter || key_is(&key, km.open_logs))
-                && let Some(detail) = &state.run_detail {
-                    let items = build_detail_items(detail);
+            } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter || key_is(&key, km.open_logs) {
+                let item = state.detail_items().get(state.detail_cursor).copied();
+                // A matrix box has no log of its own — Enter on it folds the
+                // legs away, or brings them back.
+                if let Some(DetailItem::Group(ni)) = item {
+                    state.toggle_group(ni);
+                    let rows = state.detail_items().len();
+                    state.detail_cursor = state.detail_cursor.min(rows.saturating_sub(1));
+                } else if let Some(detail) = &state.run_detail {
                     let hms = |dt: chrono::DateTime<chrono::Utc>| {
                         format!("{:02}:{:02}:{:02}", dt.hour(), dt.minute(), dt.second())
                     };
-                    match items.get(state.detail_cursor).copied() {
+                    match item {
                         Some(DetailItem::Job(ji)) => {
                             if let Some(job) = detail.jobs.get(ji).cloned() {
                                 // A failed job's logs open at the step that
@@ -1807,9 +1921,10 @@ async fn handle_key(
                                 spawn_fetch_logs(provider.clone(), job.id, tx.clone(), state);
                             }
                         }
-                        None => {}
+                        Some(DetailItem::Group(_)) | None => {}
                     }
                 }
+            }
         }
         View::Logs => {
             let total_rendered = state.log_rendered.len();
@@ -1956,10 +2071,47 @@ async fn handle_key(
                 submit_trigger_prompt(state, provider, tx);
             }
         }
-        View::Watch => {}
-        View::Diff => {}
+        // Neither view has a cursor to move, so the movement keys move the
+        // view itself — and only ever as far as there is something below.
+        View::Watch => {
+            let max = state.last_watch_max_scroll.get();
+            scroll_keys(&mut state.watch_scroll, max, &key, km);
+        }
+        View::Diff => {
+            let max = state.last_diff_max_scroll.get();
+            scroll_keys(&mut state.diff_scroll, max, &key, km);
+        }
+
     }
     None
+}
+
+/// The scroll keys a view without a cursor answers to: the configured up/down
+/// pair, the arrows, page keys, and home/end.
+///
+/// Returns whether the key was one of them — which is not the same question as
+/// whether the view moved. Pressing up at the top is still a scroll key, and a
+/// caller that reads "didn't move" as "wasn't mine" closes a card under the
+/// hand that was trying to read it.
+fn scroll_keys(at: &mut u16, max: u16, key: &KeyEvent, km: &Keymap) -> bool {
+    let down = |v: u16, by: u16| (v + by).min(max);
+    let (to, mine) = match key.code {
+        KeyCode::Down => (down(*at, 1), true),
+        KeyCode::Up => (at.saturating_sub(1), true),
+        KeyCode::PageDown => (down(*at, 10), true),
+        KeyCode::PageUp => (at.saturating_sub(10), true),
+        KeyCode::Home => (0, true),
+        KeyCode::End => (max, true),
+        _ if key_is(key, km.down) => (down(*at, 1), true),
+        _ if key_is(key, km.up) => (at.saturating_sub(1), true),
+        _ if key_is(key, km.page_down) => (down(*at, 10), true),
+        _ if key_is(key, km.page_up) => (at.saturating_sub(10), true),
+        _ if key_is(key, km.scroll_top) => (0, true),
+        _ if key_is(key, km.scroll_bottom) => (max, true),
+        _ => ((*at).min(max), false),
+    };
+    *at = to;
+    mine
 }
 
 /// Keys while the help card is up. Extracted so the card's own little modes —
@@ -2275,11 +2427,16 @@ fn open_finder(state: &mut AppState) {
             Some(Finder::new(FinderKind::Runs, items))
         }
         View::RunDetail => state.run_detail.as_ref().map(|detail| {
-            let items = build_detail_items(detail)
+            let items = state
+                .detail_items()
                 .iter()
                 .enumerate()
                 .map(|(i, item)| {
                     let label = match item {
+                        DetailItem::Group(ni) => match &state.run_shape[*ni] {
+                            RunNode::Matrix { key, .. } => format!("Matrix: {key}"),
+                            RunNode::Job(ji) => detail.jobs[*ji].name.clone(),
+                        },
                         DetailItem::Job(ji) => detail.jobs[*ji].name.clone(),
                         DetailItem::Step { job, step } => {
                             format!("{}  {}", detail.jobs[*job].steps[*step].name, detail.jobs[*job].name)
@@ -2407,11 +2564,7 @@ fn commit_finder_choice(
             }
         }
         FinderKind::DetailItems => {
-            let max = state
-                .run_detail
-                .as_ref()
-                .map(|d| build_detail_items(d).len())
-                .unwrap_or(0);
+            let max = state.detail_items().len();
             state.detail_cursor = target.min(max.saturating_sub(1));
         }
     }
@@ -3218,8 +3371,11 @@ fn settle_push_watch(state: &mut AppState, spec: &str, runs: &[Run], config: &Co
 
 /// Flat index (as `build_detail_items` counts rows) of the first failed step,
 /// or failing that the first failed job — where the cursor lands on a red run.
-fn first_failed_item(detail: &RunDetail) -> Option<usize> {
-    let items = build_detail_items(detail);
+fn first_failed_item(state: &AppState) -> Option<usize> {
+    let Some(detail) = &state.run_detail else {
+        return None;
+    };
+    let items = state.detail_items();
     items
         .iter()
         .position(|it| {
@@ -3229,6 +3385,19 @@ fn first_failed_item(detail: &RunDetail) -> Option<usize> {
         .or_else(|| {
             items.iter().position(|it| {
                 matches!(it, DetailItem::Job(ji) if detail.jobs[*ji].status.is_failure())
+            })
+        })
+        // Nothing red on screen, which means the red is inside a matrix box
+        // the user folded shut. Land on the box; Enter opens it.
+        .or_else(|| {
+            items.iter().position(|it| match it {
+                DetailItem::Group(ni) => match &state.run_shape[*ni] {
+                    RunNode::Matrix { legs, .. } => {
+                        legs.iter().any(|&ji| detail.jobs[ji].status.is_failure())
+                    }
+                    RunNode::Job(ji) => detail.jobs[*ji].status.is_failure(),
+                },
+                _ => false,
             })
         })
 }
@@ -4182,6 +4351,62 @@ const MAX_TRACKED_RUNS: usize = 4;
 /// Deliberately outside the `pending` counter: it is decoration over the row,
 /// and a repo whose detail fetch is slow or broken must not pause the poll that
 /// keeps every other row current.
+/// Keep the active repo's in-flight runs tracked while a single-repo list view
+/// is open — what the activity strip on Workflows and Runs is drawn from.
+///
+/// Sourced from `repo_runs`, the repo-wide list those views already fetch, so
+/// learning that something is in flight costs nothing extra; only naming the
+/// step it is on does, at one request per run in flight and none when the repo
+/// is quiet.
+fn sync_active_progress(
+    provider: &Arc<GitHubProvider>,
+    state: &mut AppState,
+    from: &[Run],
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    let spec = state.repo_label.clone();
+    let runs: Vec<Run> = from
+        .iter()
+        .filter(|r| !r.status.is_terminal())
+        .take(MAX_TRACKED_RUNS)
+        .cloned()
+        .collect();
+    if runs.is_empty() {
+        // Nothing in flight anymore — dropping the entry is what makes the
+        // strip clear itself the moment the last run lands.
+        state.run_progress.remove(&spec);
+        return;
+    }
+    // Show what the list already knows immediately; the steps land a poll
+    // later. Rebuilt rather than patched so a run that has settled since the
+    // last poll drops out even while its siblings keep going.
+    let previous = state.run_progress.remove(&spec).unwrap_or_default();
+    let details: Vec<RunDetail> = runs
+        .iter()
+        .map(|run| match previous.iter().find(|d| d.run.id == run.id) {
+            Some(d) => RunDetail { run: run.clone(), jobs: d.jobs.clone() },
+            None => RunDetail { run: run.clone(), jobs: Vec::new() },
+        })
+        .collect();
+    state.run_progress.insert(spec.clone(), details);
+
+    for run in runs {
+        let p = provider.clone();
+        let (label, tx) = (spec.clone(), tx.clone());
+        tokio::spawn(async move {
+            // Jobs only: the run itself came back with the list a moment ago.
+            // A failure here is silent on purpose — the strip keeps the run it
+            // already has, and a toast per poll would bury every other message.
+            if let Ok(jobs) = p.run_jobs(run.id).await {
+                let _ = tx.send(AppEvent::RepoProgressLoaded(
+                    label,
+                    RunDetail { run, jobs },
+                ));
+            }
+        });
+    }
+}
+
 fn sync_repo_progress(
     provider: &Arc<GitHubProvider>,
     state: &mut AppState,
@@ -4610,6 +4835,23 @@ fn switch_to_selected_repo(
     *provider = Arc::new(provider.for_repo(spec));
     state.runs.clear();
     state.run_detail = None;
+    state.run_shape.clear();
+    // Another repo has its own workflow files, and its own fold state. Where
+    // they are read from moves with it — a card without a checkout has none,
+    // and its runs fall back to reading GitHub's own leg naming.
+    state.repo_root = local_path.clone();
+    state.workflow_graphs.clear();
+    state.detail_group_open.clear();
+    // Another repo's history is not this one's — and a row must not inherit a
+    // flash from the repo that used to be under it.
+    state.repo_runs.clear();
+    state.workflow_pulse.clear();
+    state.run_pulse.clear();
+    // The repo being switched *to*, by its own name: `repo_label` still holds
+    // the one being left, which only lands in `RepoSwitched`. Dropping that
+    // one's entry would rob the dashboard of a row it is still watching, while
+    // leaving the new repo showing whatever the dashboard last saw of it.
+    state.run_progress.remove(&label);
     state.runs_preview = None;
     state.runs_preview_id = None;
     state.workflow_preview_file = None;
@@ -5398,6 +5640,7 @@ fn animations_active(state: &AppState) -> bool {
         || !state.push_watches.is_empty()
         || state.batch.is_some()
         || flashing(state.all_green_tick, views::CELEBRATE_TICKS)
+        || views::list_pulsing(state)
         || state.repos.iter().any(|c| {
             (c.has_ci() && !c.loaded && c.error.is_none())
                 || c.active_runs().next().is_some()
@@ -6390,12 +6633,16 @@ mod tests {
                     id: 1,
                     name: "build".into(),
                     status: Status::Success,
+                    started_at: None,
+                    completed_at: None,
                     steps: vec![step("compile", Status::Success)],
                 },
                 crate::provider::Job {
                     id: 2,
                     name: "test".into(),
                     status: Status::Failure,
+                    started_at: None,
+                    completed_at: None,
                     steps: vec![
                         step("checkout", Status::Success),
                         step("pytest", Status::Failure),
@@ -6405,7 +6652,10 @@ mod tests {
         };
         // Rows flatten as job, its steps, next job, its steps — the failing
         // `pytest` step is row 4, and that is where a red run should open.
-        assert_eq!(first_failed_item(&detail), Some(4));
+        let mut st = empty_state();
+        st.run_detail = Some(detail);
+        st.rebuild_run_shape();
+        assert_eq!(first_failed_item(&st), Some(4));
     }
 
     #[test]

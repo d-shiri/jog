@@ -234,6 +234,8 @@ mod tests {
                 id: 1,
                 name: "job".into(),
                 status,
+                started_at: None,
+                completed_at: None,
                 steps: steps
                     .iter()
                     .enumerate()

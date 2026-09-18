@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 pub mod discovery;
 pub mod github;
+pub mod graph;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
@@ -151,7 +152,30 @@ pub struct Job {
     pub id: u64,
     pub name: String,
     pub status: Status,
+    /// When the runner picked the job up, and when it let go — what the run
+    /// page prints next to each job (`15s`, `3m 33s`).
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
     pub steps: Vec<Step>,
+}
+
+impl Job {
+    /// How long the job has been going, in seconds — counting from now while
+    /// it is still running. `None` until the runner has started it.
+    ///
+    /// A job that ended without a completion time — which is what GitHub hands
+    /// back for some cancelled and skipped jobs — has no duration to report.
+    /// Counting to `now` there would print a clock still running on a job that
+    /// stopped hours ago.
+    pub fn duration_secs(&self) -> Option<i64> {
+        let start = self.started_at?;
+        let end = match self.completed_at {
+            Some(end) => end,
+            None if self.status.is_terminal() => return None,
+            None => Utc::now(),
+        };
+        Some((end - start).num_seconds().max(0))
+    }
 }
 
 #[derive(Debug, Clone)]
