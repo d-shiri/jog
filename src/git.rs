@@ -470,6 +470,13 @@ pub fn parse_status(raw: &str) -> RepoStatus {
 
 /// Parse the `## main...origin/main [ahead 1, behind 2]` header.
 fn parse_branch_header(rest: &str, out: &mut RepoStatus) {
+    // A repo with no commits yet reads `## No commits yet on main` — a third
+    // header form, with no `...` and no `[...]`, so everything below would take
+    // the whole sentence for the branch name. That is not just a garbled label:
+    // the name goes straight to `git push --set-upstream origin <branch>`, which
+    // answers `fatal: invalid refspec 'No commits yet on main'` on the very
+    // first push a new repo ever makes.
+    let rest = rest.strip_prefix("No commits yet on ").unwrap_or(rest);
     let (names, tracking) = match rest.split_once(" [") {
         Some((n, t)) => (n, t.trim_end_matches(']')),
         None => (rest, ""),
@@ -736,6 +743,30 @@ mod tests {
         // Pushing this would create a remote branch named `HEAD`, so it has to
         // be distinguishable from a real branch.
         assert!(s.detached);
+    }
+
+    #[test]
+    fn a_repo_with_no_commits_still_names_its_branch() {
+        // Verbatim from `git status --porcelain=v1 -b -z` on a fresh `git init
+        // -b main` (git 2.43): a third header form, neither tracking nor
+        // detached.
+        let s = parse_status("## No commits yet on main\0?? a.txt\0");
+        assert_eq!(s.branch, "main");
+        assert!(!s.detached);
+        assert!(!s.has_upstream);
+        // The status line is cosmetic; this is not. The branch goes straight to
+        // `push --set-upstream origin <branch>`, and the sentence came back as
+        // `fatal: invalid refspec`.
+        assert_eq!(s.entries.len(), 1);
+
+        // Once the branch has tracking config, git spells the same state with
+        // an upstream that does not exist yet (verified on git 2.43). The
+        // sentence still has to come off the front, and the upstream is real
+        // config: a bare `git push` publishes the branch from there.
+        let s = parse_status("## No commits yet on main...origin/main [gone]\0");
+        assert_eq!(s.branch, "main");
+        assert!(s.has_upstream);
+        assert!(!s.detached);
     }
 
     #[test]

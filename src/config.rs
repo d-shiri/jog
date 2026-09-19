@@ -363,7 +363,9 @@ impl Config {
 
     /// The merge itself, given both files already parsed — the whole of
     /// [`load_for`](Self::load_for) that doesn't touch the disk.
-    fn layer(mut global: toml::Table, local: toml::Table) -> Result<Self> {
+    fn layer(mut global: toml::Table, mut local: toml::Table) -> Result<Self> {
+        canonicalize_aliases(&mut global);
+        canonicalize_aliases(&mut local);
         merge_tables(&mut global, local);
         let mut cfg: Self = toml::Value::Table(global)
             .try_into()
@@ -409,6 +411,36 @@ fn read_table(path: &Path) -> Result<toml::Table> {
         .with_context(|| format!("parse config {}", path.display()))
 }
 
+/// Fold the spellings serde accepts as aliases into the names it stores them
+/// under, before the two files are merged.
+///
+/// [`merge_tables`] matches on the raw TOML key and knows nothing about serde,
+/// so a global file written with the old name and a local one written with the
+/// new name arrive as two unrelated keys and *both* survive into the merged
+/// table. serde then refuses the duplicate — `duplicate field \`refresh\`` —
+/// and since `main` propagates that, jog does not start at all in that repo.
+/// The README hands out exactly this trap: `refresh = "r"  # was \`git_refresh\`;
+/// the old name still works`. Folding the aliases first is what makes the two
+/// layers talk about the same field.
+fn canonicalize_aliases(t: &mut toml::Table) {
+    // The canonical spelling wins when one file carries both: it is the name
+    // the current docs tell you to write.
+    fn rename(t: &mut toml::Table, from: &str, to: &str) {
+        if let Some(v) = t.remove(from)
+            && !t.contains_key(to)
+        {
+            t.insert(to.to_string(), v);
+        }
+    }
+    rename(t, "kuma", "uptime_kuma");
+    if let Some(toml::Value::Table(k)) = t.get_mut("uptime_kuma") {
+        rename(k, "slug", "status_page");
+    }
+    if let Some(toml::Value::Table(k)) = t.get_mut("keys") {
+        rename(k, "git_refresh", "refresh");
+    }
+}
+
 /// Lay `over` on top of `base`, recursing into tables.
 ///
 /// Sub-tables merge so a local `[ui] theme = …` doesn't erase the global
@@ -431,6 +463,48 @@ mod tests {
 
     fn table(raw: &str) -> toml::Table {
         raw.parse().expect("test fixture parses")
+    }
+
+    /// An old spelling in one layer and the new one in the other used to reach
+    /// serde as two separate keys, and `duplicate field` is a hard error: jog
+    /// refused to start in that repo at all.
+    #[test]
+    fn the_two_layers_may_spell_a_field_differently() {
+        let cfg = Config::layer(
+            table("[keys]\ngit_refresh = \"r\"\n"),
+            table("[keys]\nrefresh = \"R\"\n"),
+        )
+        .expect("old name globally, new name locally");
+        assert_eq!(cfg.keys.refresh, "R", "the local file still wins");
+
+        let cfg = Config::layer(
+            table("[uptime_kuma]\nurl = \"https://up.example.com\"\n"),
+            table("[kuma]\nurl = \"https://local.example.com\"\n"),
+        )
+        .expect("section named both ways");
+        assert_eq!(
+            cfg.uptime_kuma.expect("kept").url,
+            "https://local.example.com"
+        );
+
+        let cfg = Config::layer(
+            table("[uptime_kuma]\nurl = \"https://up.example.com\"\nslug = \"one\"\n"),
+            table("[uptime_kuma]\nstatus_page = \"two\"\n"),
+        )
+        .expect("field named both ways");
+        assert_eq!(cfg.uptime_kuma.expect("kept").status_page, "two");
+    }
+
+    /// One file carrying both spellings is a question the docs answer: the
+    /// current name is the one to write, so it is the one that counts.
+    #[test]
+    fn the_current_spelling_wins_inside_one_file() {
+        let cfg = Config::layer(
+            table("[keys]\nrefresh = \"R\"\ngit_refresh = \"r\"\n"),
+            toml::Table::new(),
+        )
+        .expect("both spellings in one file");
+        assert_eq!(cfg.keys.refresh, "R");
     }
 
     const GLOBAL: &str = r##"

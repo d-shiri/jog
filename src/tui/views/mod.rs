@@ -6962,23 +6962,23 @@ fn draw_watch_matrix(
         if let Some(secs) = job.duration_secs() {
             right = format!("{right}   {:>7}", format_step_dur(secs as f64));
         }
-        let head = format!(
-            "{} {}",
-            animated_glyph(job.status, state.tick_count),
-            job.name
-        );
+        // Measured on the name as drawn, not as stored: a leg whose name is too
+        // long to fit is truncated two lines down, and sizing the gap from the
+        // full name pushed the stats column off the box's right edge exactly
+        // when a matrix is widest and most worth lining up.
+        let glyph = animated_glyph(job.status, state.tick_count);
+        let right_w = UnicodeWidthStr::width(right.as_str());
+        let name = truncate(&job.name, w.saturating_sub(right_w + 4));
         let gap = w
-            .saturating_sub(UnicodeWidthStr::width(head.as_str()))
-            .saturating_sub(UnicodeWidthStr::width(right.as_str()))
+            .saturating_sub(UnicodeWidthStr::width(glyph) + 1)
+            .saturating_sub(UnicodeWidthStr::width(name.as_str()))
+            .saturating_sub(right_w)
             .max(1);
         lines.push(Line::from(vec![
-            Span::styled(
-                animated_glyph(job.status, state.tick_count),
-                style_for_status(job.status, theme),
-            ),
+            Span::styled(glyph, style_for_status(job.status, theme)),
             Span::raw(" "),
             Span::styled(
-                truncate(&job.name, w.saturating_sub(right.len() + 4)),
+                name,
                 if job.status == Status::Running {
                     Style::default().fg(theme.text_bright).bold()
                 } else {
@@ -8751,6 +8751,38 @@ jobs:
                 })
                 .collect(),
         }
+    }
+
+    /// The stats column is measured against the name as *drawn*. Sizing it from
+    /// the untruncated name pushed the count and the clock off the right edge
+    /// exactly on the rows where a matrix is widest.
+    #[test]
+    fn a_matrix_leg_too_long_to_fit_still_lines_its_stats_up() {
+        let st = watching_a_matrix_run(&[
+            ("build db-backup", Status::Success),
+            (
+                "build gojobi-with-a-very-long-service-name-that-overflows",
+                Status::Success,
+            ),
+            ("build ingestor", Status::Success),
+            ("build ollama", Status::Success),
+            ("build wecker", Status::Success),
+        ]);
+        let out = draw_watch(&st, 70, 32);
+        let legs: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with('\u{2502}') && l.contains("build "))
+            .collect();
+        assert_eq!(legs.len(), 5, "one line per leg:\n{out}");
+        // Every row ends flush against the box's own border, the truncated one
+        // included — it used to stop a column short.
+        for l in &legs {
+            assert!(l.ends_with("1m 35s \u{2502}"), "not flush: [{l}]\n{out}");
+        }
+        assert!(
+            legs.iter().any(|l| l.contains('\u{2026}')),
+            "the long name should have been cut:\n{out}"
+        );
     }
 
     #[test]

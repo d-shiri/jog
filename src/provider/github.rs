@@ -481,16 +481,38 @@ impl GitHubProvider {
     /// half the poll's traffic spent on a known answer — and that traffic is
     /// what earns the secondary rate limit.
     pub async fn run_jobs(&self, id: u64) -> Result<Vec<Job>> {
-        let page = gated(
+        // A matrix fans out past one page: GitHub allows 256 combinations per
+        // job, and a page tops out at 100. Taking only the first page dropped
+        // the rest with no error, so a leg that was still running — or the one
+        // that failed — simply did not exist as far as the run detail and the
+        // live strip were concerned.
+        let mut page = gated(
             self.crab
                 .workflows(&self.repo.owner, &self.repo.repo)
                 .list_jobs(octocrab::models::RunId(id))
-                .per_page(50)
+                .per_page(100)
                 .send(),
         )
         .await
         .context("list jobs")?;
-        Ok(page.items.into_iter().map(map_job).collect())
+        let mut jobs: Vec<Job> = page.items.drain(..).map(map_job).collect();
+        // Bounded: a poll that keeps asking is worse than a run we under-report,
+        // and 10 pages is four times the widest matrix GitHub will schedule.
+        const MAX_PAGES: usize = 10;
+        for _ in 1..MAX_PAGES {
+            // A page that fails keeps the ones already in hand rather than
+            // throwing them away: both callers answer `Err` by discarding the
+            // whole poll, so propagating here would trade a run that is one leg
+            // short for a strip that does not update at all.
+            let Ok(Some(mut p)) =
+                gated(self.crab.get_page::<octocrab::models::workflows::Job>(&page.next)).await
+            else {
+                break;
+            };
+            jobs.extend(p.items.drain(..).map(map_job));
+            page = p;
+        }
+        Ok(jobs)
     }
 
     /// The repo-wide run list, asked conditionally.
@@ -616,7 +638,7 @@ impl GitHubProvider {
         }
         // Spread the budget: enough per workflow to reconstruct the window,
         // never more than the window itself.
-        let per = (limit as usize / files.len()).clamp(3, limit.max(1) as usize) as u8;
+        let per = runs_per_workflow(limit, files.len());
         let fetches = files.iter().map(|f| async move {
             let mut runs = self.list_runs(f, per).await.unwrap_or_default();
             // The real endpoint doesn't name the workflow file; here we know
@@ -976,9 +998,36 @@ fn extract_time(s: &str) -> (Option<&str>, &str) {
     (None, s)
 }
 
+/// How many runs to ask each workflow for, spreading `limit` across `files` of
+/// them: enough per workflow to rebuild the window, never more than the window.
+///
+/// Written as max-then-min rather than `clamp(3, limit)`, which panics outright
+/// when its floor rises above its ceiling — every caller today asks for 5 or
+/// more, so the floor of 3 happened to stay below it, but a caller wanting one
+/// or two runs would have brought the poll down instead of shortening it.
+fn runs_per_workflow(limit: u8, files: usize) -> u8 {
+    (limit as usize / files.max(1)).max(3).min(limit.max(1) as usize) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `clamp(3, limit)` panics the moment its floor passes its ceiling, so a
+    /// caller asking for fewer runs than the per-workflow floor brought the
+    /// whole poll down instead of just fetching a shorter window.
+    #[test]
+    fn a_small_run_budget_shortens_the_poll_rather_than_killing_it() {
+        assert_eq!(runs_per_workflow(1, 8), 1);
+        assert_eq!(runs_per_workflow(2, 8), 2);
+        assert_eq!(runs_per_workflow(0, 8), 1);
+        // The ordinary cases are unchanged.
+        assert_eq!(runs_per_workflow(10, 8), 3);
+        assert_eq!(runs_per_workflow(50, 8), 6);
+        // And a workflow list that came back empty must not divide by zero
+        // (the caller returns early on one, so this is only a guard).
+        assert_eq!(runs_per_workflow(10, 0), 10);
+    }
 
     #[tokio::test]
     #[ignore = "live API probe: cargo test etag_roundtrip -- --ignored --nocapture"]

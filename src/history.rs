@@ -128,8 +128,29 @@ impl History {
             entries: self.entries.clone(),
             dispatch_inputs: self.dispatch_inputs.clone(),
         };
-        if let Ok(json) = serde_json::to_string(&file) {
-            let _ = std::fs::write(path, json);
+        // Written beside the target and renamed over it, never into it.
+        // `fs::write` truncates first, so a crash mid-write leaves half a JSON
+        // document — and `HistoryFile::parse` answers unreadable input with an
+        // empty default, silently swapping this repo's whole run history and
+        // every remembered dispatch input for nothing at all. A rename is
+        // atomic, so a reader sees either the old file or the new one.
+        let Ok(json) = serde_json::to_string(&file) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        // Flushed to the disk itself before the rename, not just to the page
+        // cache: without that, a power loss can land the rename while the new
+        // file's bytes are still in flight, and the reader finds exactly the
+        // truncated document this is here to rule out.
+        let written = std::fs::File::create(&tmp).and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(json.as_bytes())?;
+            f.sync_all()
+        });
+        // Either way the scratch file must not outlive the save — including
+        // when it is the *write* that failed and left a partial one behind.
+        if written.is_err() || std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
@@ -212,6 +233,77 @@ mod tests {
     use super::*;
     use crate::provider::{Job, Run, Step};
     use chrono::TimeZone;
+
+    /// `fs::write` truncates before it writes, and `HistoryFile::parse` answers
+    /// unreadable input with an empty default — so a crash mid-save used to
+    /// trade a repo's whole history for nothing at all, silently. The write goes
+    /// to a sibling and is renamed over the target, which is atomic.
+    #[test]
+    fn saving_history_never_leaves_a_half_written_file_behind() {
+        let dir = std::env::temp_dir().join(format!("jog-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("owner__repo.json");
+        let mut h = History {
+            path: Some(path.clone()),
+            entries: Vec::new(),
+            dispatch_inputs: HashMap::new(),
+        };
+        h.record("ci.yml", &detail(1, Status::Success, 9, &[("build", Status::Success)]));
+        h.record_dispatch_inputs("ci.yml", &HashMap::from([("env".to_string(), "prod".to_string())]));
+
+        // Writing through a sibling and renaming is what makes the save atomic,
+        // and it is observable: `rename(2)` needs write permission on the
+        // *directory*, while writing in place needs it on the file. A
+        // read-only destination therefore still takes an update — and a revert
+        // to `fs::write` fails here instead of silently losing the crash
+        // guarantee this test exists to hold.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Root ignores the permission bits this turns on, and so do some
+            // container filesystems — there the check proves nothing, so probe
+            // first and only assert where the probe says the bits are honoured.
+            let probe = dir.join("probe");
+            std::fs::write(&probe, "x").expect("probe written");
+            let mut p = std::fs::metadata(&probe).expect("probe").permissions();
+            p.set_mode(0o444);
+            std::fs::set_permissions(&probe, p).expect("probe read-only");
+            let bits_honoured = std::fs::write(&probe, "y").is_err();
+            let _ = std::fs::remove_file(&probe);
+
+            let mut perms = std::fs::metadata(&path).expect("written").permissions();
+            perms.set_mode(0o444);
+            std::fs::set_permissions(&path, perms).expect("make read-only");
+            h.record("ci.yml", &detail(2, Status::Failure, 10, &[("build", Status::Failure)]));
+            let raw = std::fs::read_to_string(&path).expect("still readable");
+            if bits_honoured {
+                assert_eq!(
+                    HistoryFile::parse(&raw).entries.len(),
+                    2,
+                    "a read-only destination means the save went in place, not through a rename"
+                );
+            }
+        }
+
+        // The scratch file must not outlive the save.
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .expect("history dir")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left behind: {strays:?}");
+
+        let raw = std::fs::read_to_string(&path).expect("history written");
+        let back = HistoryFile::parse(&raw);
+        // Both runs survived, and the file parses — never the empty default
+        // that a half-written document collapses to.
+        assert!(!back.entries.is_empty(), "history survived the save");
+        assert_eq!(
+            back.dispatch_inputs.get("ci.yml").and_then(|m| m.get("env")),
+            Some(&"prod".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn run(id: u64, status: Status, h: u32) -> Run {
         Run {

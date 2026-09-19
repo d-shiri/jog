@@ -183,6 +183,7 @@ pub async fn run(
         }
     }
 
+    install_panic_hook();
     let mut terminal = setup_terminal()?;
     let result = event_loop(&mut terminal, &mut state, provider.clone(), config).await;
     restore_terminal(&mut terminal).ok();
@@ -345,11 +346,58 @@ fn resolve_theme(state: &mut AppState, config: &Config) {
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().context("enable raw mode")?;
+    // Past this point the terminal is already in a mode the shell cannot use.
+    // Every failure below has to hand it back before it propagates: there is no
+    // `Terminal` yet, so `restore_terminal` can never run for these, and the
+    // user would be returned to a prompt with no echo and no line editing.
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("enter alternate screen")?;
+    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        // `execute!` stops at the first command that fails, so the alternate
+        // screen may already be up when mouse capture is what went wrong —
+        // undo the whole set, not just raw mode.
+        hand_terminal_back();
+        return Err(anyhow::Error::new(e).context("enter alternate screen"));
+    }
     let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend).context("create terminal")
+    match Terminal::new(backend).context("create terminal") {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            hand_terminal_back();
+            Err(e)
+        }
+    }
+}
+
+/// Undo everything [`setup_terminal`] did, best effort and in the order the
+/// shell needs it back: cooked mode, the user's own screen, no mouse reporting,
+/// cursor visible again.
+///
+/// The one place that knows the full set, so no caller can put back three of
+/// the four — a hidden cursor is every bit as much a broken prompt as raw mode
+/// is.
+fn hand_terminal_back() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        crossterm::cursor::Show
+    );
+}
+
+/// Hand the terminal back before a panic reaches the user.
+///
+/// The release profile builds with `panic = "abort"`, so nothing unwinds and
+/// `restore_terminal` never runs on the way down. Without this the message is
+/// printed into the alternate screen — which is then torn away — and the shell
+/// underneath is left in raw mode needing `stty sane`. A hook still runs before
+/// the abort, so this is the one place that can put it right.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        hand_terminal_back();
+        previous(info);
+    }));
 }
 
 fn restore_terminal(t: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
@@ -637,7 +685,7 @@ async fn event_loop(
                                     .position(|s| s.trim().to_lowercase() == needle)
                                     .or_else(|| {
                                         started_hms.as_deref().map(|hms| {
-                                            let target = find_raw_line_for_time(&lines, hms);
+                                            let target = find_raw_line_for_time(&lines, hms, 0);
                                             state.log_step_line_starts.iter()
                                                 .enumerate()
                                                 .filter(|&(_, &l)| l <= target)
@@ -3817,10 +3865,36 @@ fn compute_step_line_starts(raw: &[String], steps: &[Step]) -> (Vec<usize>, Vec<
             starts.push(line_idx);
         } else {
             // No group found (post-steps, Complete job): fall back to raw timestamp line.
-            let line_idx = step_hms.as_deref()
-                .map(|hms| find_raw_line_for_time(raw, hms))
-                .unwrap_or_else(|| starts.last().copied().unwrap_or(0));
-            starts.push(line_idx.min(raw.len().saturating_sub(1)));
+            //
+            // Scanned from the previous step's boundary, never from line 0. The
+            // API reports step times to the second, so a job that finishes
+            // inside one second gives every step the same `HH:MM:SS`; searching
+            // from the top then returns the *first* line carrying that stamp —
+            // behind the group the previous step was already given — and the
+            // reversed pair made `extract_step_by_line_range` slice `raw[3..0]`
+            // and take the whole TUI down with it.
+            let prev = starts
+                .iter()
+                .rev()
+                .copied()
+                .find(|s| *s != SKIPPED_START)
+                .unwrap_or(0);
+            let found = step_hms
+                .as_deref()
+                .map(|hms| find_raw_line_for_time(raw, hms, prev));
+            starts.push(match found {
+                // The clock moved on from where the last step began, so it is
+                // saying something: take it.
+                Some(i) if i > prev => i.min(raw.len().saturating_sub(1)),
+                // It did not, and a stamp that cannot tell this step from the
+                // one before it is not evidence. Own nothing rather than take
+                // lines off a step that demonstrably does — which is exactly
+                // what `resolve_skipped_starts` already means, so say it the
+                // same way. Pinning `raw.len()` here instead would hand the
+                // *previous* step every remaining line, including the output of
+                // later steps that did find a group of their own.
+                _ => SKIPPED_START,
+            });
         }
         names.push(step.name.clone());
     }
@@ -3900,8 +3974,13 @@ fn is_step_header(raw: &[String], line: usize) -> bool {
     })
 }
 
-fn find_raw_line_for_time(raw: &[String], hms: &str) -> usize {
-    for (i, line) in raw.iter().enumerate() {
+/// First line at or after `from` whose `HH:MM:SS` prefix has reached `hms`.
+///
+/// `from` is what keeps step boundaries ordered: a second-granularity stamp can
+/// match a line the previous step already owns, and a boundary that goes
+/// backwards is not a smaller step, it is a panic.
+fn find_raw_line_for_time(raw: &[String], hms: &str, from: usize) -> usize {
+    for (i, line) in raw.iter().enumerate().skip(from) {
         if let Some(t) = line.get(..8)
             && t.as_bytes().get(2) == Some(&b':')
             && t.as_bytes().get(5) == Some(&b':')
@@ -3914,9 +3993,16 @@ fn find_raw_line_for_time(raw: &[String], hms: &str) -> usize {
 }
 
 fn extract_step_by_line_range(raw: &[String], step_idx: usize, line_starts: &[usize]) -> Vec<String> {
-    let start = line_starts.get(step_idx).copied().unwrap_or(0);
-    let end = line_starts.get(step_idx + 1).copied().unwrap_or(raw.len());
-    raw[start.min(raw.len())..end.min(raw.len())].to_vec()
+    let start = line_starts.get(step_idx).copied().unwrap_or(0).min(raw.len());
+    let end = line_starts
+        .get(step_idx + 1)
+        .copied()
+        .unwrap_or(raw.len())
+        .min(raw.len());
+    // Boundaries are built in order, but this is the one place a slip would be
+    // fatal rather than ugly: `raw[3..0]` panics even though both ends are in
+    // range. A pair that arrives reversed describes a step with no output.
+    raw[start..end.max(start)].to_vec()
 }
 
 fn parse_log_sections(raw: &[String]) -> Vec<String> {
@@ -6761,6 +6847,93 @@ mod tests {
             step("Complete job", Status::Success, "10:00:00"),
         ];
         (raw, steps)
+    }
+
+    /// Step times land to the second, so a job that finishes inside one second
+    /// reports every step at the same `HH:MM:SS`. The timestamp fallback used to
+    /// answer that by scanning from line 0 and handing a later step a boundary
+    /// *behind* the one before it — and `raw[3..0]` panics even though both ends
+    /// are in range, taking the whole TUI down with `panic = "abort"`.
+    #[test]
+    fn a_job_that_finishes_within_one_second_keeps_its_steps_in_order() {
+        let raw: Vec<String> = vec![
+            "10:00:00 ##[group]Operating System".into(),
+            "10:00:00 Ubuntu 22.04.4 LTS".into(),
+            "10:00:00 ##[endgroup]".into(),
+            "10:00:00 ##[group]Run actions/checkout@v4".into(),
+            "10:00:00 Syncing repository".into(),
+            "10:00:00 ##[endgroup]".into(),
+        ];
+        let steps = vec![
+            step("Set up job", Status::Success, "10:00:00"),
+            step("Run actions/checkout@v4", Status::Success, "10:00:00"),
+            step("Complete job", Status::Success, "10:00:00"),
+        ];
+        let (starts, names) = compute_step_line_starts(&raw, &steps);
+        assert!(
+            starts.windows(2).all(|w| w[0] <= w[1]),
+            "boundaries went backwards: {starts:?}"
+        );
+        // Every step must be extractable — this is what used to panic.
+        for i in 0..names.len() {
+            let _ = extract_step_by_line_range(&raw, i, &starts);
+        }
+        // And the checkout step still owns the group that names it.
+        let idx = names
+            .iter()
+            .position(|n| n == "Run actions/checkout@v4")
+            .expect("named");
+        let text = extract_step_by_line_range(&raw, idx, &starts).join("\n");
+        assert!(text.contains("Syncing repository"), "{text}");
+    }
+
+    /// A step the API gave no start time cannot be placed, so it owns nothing —
+    /// but "nothing" has to collapse against the *next* real boundary, not the
+    /// end of the log. Pinning it at `raw.len()` handed the step before it every
+    /// remaining line, swallowing the output of later steps that did find their
+    /// own group.
+    #[test]
+    fn a_step_with_no_start_time_does_not_swallow_the_rest_of_the_log() {
+        let raw: Vec<String> = vec![
+            "10:00:00 ##[group]Run first".into(),
+            "10:00:00 a".into(),
+            "10:00:00 ##[endgroup]".into(),
+            "10:00:05 ##[group]Run second".into(),
+            "10:00:05 b".into(),
+        ];
+        let steps = vec![
+            step("Set up job", Status::Success, "10:00:00"),
+            step("Run first", Status::Success, "10:00:00"),
+            Step {
+                name: "Mystery".into(),
+                status: Status::Success,
+                started_at: None,
+                completed_at: None,
+            },
+            step("Run second", Status::Success, "10:00:05"),
+        ];
+        let (starts, names) = compute_step_line_starts(&raw, &steps);
+        let at = |n: &str| names.iter().position(|x| x == n).expect("named");
+        let text = |n: &str| extract_step_by_line_range(&raw, at(n), &starts).join("\n");
+
+        // The untimed step owns nothing.
+        assert!(text("Mystery").is_empty(), "{starts:?}");
+        // And the step before it stops where the next real one begins, rather
+        // than running to the end of the log.
+        let first = text("Run first");
+        assert!(first.contains(" a"), "{first:?} from {starts:?}");
+        assert!(
+            !first.contains("Run second") && !first.contains(" b"),
+            "swallowed the next step: {first:?} from {starts:?}"
+        );
+        assert!(text("Run second").contains(" b"), "{starts:?}");
+    }
+
+    /// Reversed boundaries must never be fatal, whatever produced them.
+    #[test]
+    fn a_reversed_boundary_pair_is_an_empty_step_not_a_panic() {
+        let raw: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        assert!(extract_step_by_line_range(&raw, 0, &[2, 0]).is_empty());
     }
 
     #[test]
