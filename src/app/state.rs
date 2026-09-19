@@ -14,7 +14,7 @@ use crate::config::KeymapConfig;
 use crate::git::RepoStatus;
 use crate::history::History;
 use crate::provider::github::{ApiError, Quota};
-use crate::provider::graph::{RunNode, WorkflowGraph, shape};
+use crate::provider::graph::{RunNode, WorkflowGraph, shape, stages};
 use crate::provider::{Job, PrInfo, Run, RunDetail, Status, Workflow};
 
 
@@ -1924,6 +1924,16 @@ pub struct AppState {
     /// siblings, the rest in `needs:` order. Rebuilt whenever the detail is,
     /// by [`AppState::rebuild_run_shape`].
     pub run_shape: Vec<RunNode>,
+    /// The same nodes, kept in their `needs:` columns — what the run graph is
+    /// drawn from. Built beside `run_shape` rather than worked out again at
+    /// draw time, so the graph and the list can never disagree about what is
+    /// a matrix and what is a job.
+    pub run_stages: Vec<Vec<RunNode>>,
+    /// Whether those columns are what the workflow file says, or only what is
+    /// left when there is no file to read. Without one every job lands in the
+    /// first column, which looks exactly like a workflow where nothing waits
+    /// for anything — and the graph must not claim that without knowing.
+    pub run_stages_known: bool,
     /// Matrix boxes the user has folded or unfolded by hand, by job key.
     /// Anything not in here follows [`AppState::group_is_open`]'s default.
     pub detail_group_open: HashMap<String, bool>,
@@ -2288,6 +2298,8 @@ impl AppState {
             workflows_polled_tick: 0,
             run_detail: None,
             run_shape: Vec::new(),
+            run_stages: Vec::new(),
+            run_stages_known: false,
             detail_group_open: HashMap::new(),
             workflow_graphs: HashMap::new(),
             repo_root: None,
@@ -2544,26 +2556,74 @@ impl AppState {
     pub fn rebuild_run_shape(&mut self) {
         let Some(detail) = &self.run_detail else {
             self.run_shape.clear();
+            self.run_stages.clear();
+            self.run_stages_known = false;
             return;
         };
-        // Which file this run came out of. The runs endpoint doesn't say, so
-        // fall back to the workflow we are listing runs for, and then to the
-        // one whose name the run carries as its title.
-        let file = detail
-            .run
-            .workflow_file
+        let graph = self
+            .workflow_file_of(&detail.run)
+            .and_then(|f| self.workflow_graph(&f));
+        let detail = self.run_detail.as_ref().expect("checked above");
+        // Not merely "a file was read": one that no longer names any of these
+        // jobs leaves every one of them in the first column, which is the same
+        // picture as a workflow where nothing waits — and claiming that is
+        // what this flag exists to stop.
+        let known = graph.as_ref().is_some_and(|g| g.describes(&detail.jobs));
+        let by_shape = shape(&detail.jobs, graph.as_deref());
+        let by_stage = stages(&detail.jobs, graph.as_deref());
+        self.run_stages_known = known;
+        self.run_shape = by_shape;
+        self.run_stages = by_stage;
+    }
+
+    /// Which workflow file a run came out of.
+    ///
+    /// The runs endpoint doesn't say, so fall back to the workflow we are
+    /// listing runs for, and then to the one whose name the run carries as its
+    /// title — which is the workflow's own `name:`, the same string on both.
+    pub fn workflow_file_of(&self, run: &Run) -> Option<String> {
+        run.workflow_file
             .clone()
             .or_else(|| self.workflow_for_runs.clone())
             .or_else(|| {
-                let title = detail.run.display_title.as_str();
                 self.workflows
                     .iter()
-                    .find(|w| w.name == title)
+                    .find(|w| w.name == run.display_title)
                     .map(|w| w.file_name.clone())
-            });
-        let graph = file.and_then(|f| self.workflow_graph(&f));
-        let detail = self.run_detail.as_ref().expect("checked above");
-        self.run_shape = shape(&detail.jobs, graph.as_deref());
+            })
+    }
+
+    /// Read a workflow file into the cache without asking anything of it — for
+    /// a run being previewed rather than opened, whose graph the preview pane
+    /// draws but whose shape nothing else needs.
+    pub fn warm_workflow_graph(&mut self, run: &Run) {
+        if let Some(file) = self.workflow_file_of(run) {
+            self.workflow_graph(&file);
+        }
+    }
+
+    /// A run's jobs in the columns its `needs:` edges put them in — the run
+    /// page's graph. Reads the workflow cache without filling it, so a view
+    /// can ask on every frame; [`warm_workflow_graph`](Self::warm_workflow_graph)
+    /// is what puts the file there.
+    pub fn stages_of(&self, detail: &RunDetail) -> Vec<Vec<RunNode>> {
+        let graph = self.graph_of(&detail.run);
+        stages(&detail.jobs, graph.as_deref())
+    }
+
+    /// Whether the stages of [`stages_of`](Self::stages_of) are a workflow
+    /// file's `needs:` edges, or just everything at once for want of anything
+    /// better. A file that was read but no longer names these jobs counts as
+    /// the latter.
+    pub fn graph_known(&self, detail: &RunDetail) -> bool {
+        self.graph_of(&detail.run)
+            .is_some_and(|g| g.describes(&detail.jobs))
+    }
+
+    fn graph_of(&self, run: &Run) -> Option<Arc<WorkflowGraph>> {
+        self.workflow_file_of(run)
+            .and_then(|f| self.workflow_graphs.get(&f))
+            .and_then(|(_, g)| g.clone())
     }
 
     /// The parsed workflow file, read from the checkout the first time it is
@@ -2588,7 +2648,15 @@ impl AppState {
         let parsed = path
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|raw| WorkflowGraph::parse(&raw))
-            .map(Arc::new);
+            .map(|mut g| {
+                // A job that calls a reusable workflow is one job here and a
+                // whole file's worth of jobs in the run. Read that file too,
+                // or the run's chain stops at the call.
+                if let Some(root) = &self.repo_root {
+                    g.resolve_calls(root, 3);
+                }
+                Arc::new(g)
+            });
         self.workflow_graphs
             .insert(file.to_string(), (stamp, parsed.clone()));
         parsed

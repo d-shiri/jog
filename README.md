@@ -259,6 +259,64 @@ wins: it fills in from runs already in hand instead of sitting at `loading…` e
 time the cursor moves, and a run it caught mid-flight stops spinning when that run
 lands rather than when you leave the view.
 
+## The run's graph, in the terminal
+
+The run page draws a workflow as a chain of boxes. `jog` draws the same chain
+from the same source — the `needs:` edges in the workflow file — above the run
+detail, above the live Watch view, and above the run preview in the Runs list:
+
+```
+ ╭────────────────────╮   ╭────────────────────╮   ╭────────────────────╮ ╭────────────────────╮
+ │ ✓ which commit     │──▸│ ⠹ Matrix: build    │──▸│ ✓ deploy-stage …   │ │ ✓ deploy-stage …   │
+ │                 8s │   │   5 legs    4m 46s │   │               55s  │ │             1m 13s │
+ ╰────────────────────╯   ╰────────────────────╯   ╰────────────────────╯ ╰────────────────────╯
+```
+
+While the run is going, the edge it is crossing right now marches: a bright cell
+travels along that one rule and into the box that is working, whose border
+breathes in step with its spinner. Everything behind it is a still green chain
+and everything ahead is a still grey one, so which station a run is on is
+answerable from across the room. When the run lands, the graph stops moving.
+
+An arrow means *after*, and it touches the boxes at both ends — a rule floating
+in a gap reads as three things near each other rather than as one chain. Each
+box wears its verdict on its border, so the band is legible at a glance rather
+than only on inspection.
+
+A band with no arrows in it says why, because there are two reasons for that and
+they are not the same fact:
+
+```
+ │ ✓ python suites │ │ ✓ bench │ │ ✓ website │  ⇉ all at once
+ │ ✓ python suites │ │ ✓ bench │ │ ✓ website │  ⇉ order unknown — no workflow file here
+```
+
+The first is the workflow: nothing in it waits for anything. The second is jog:
+there was no `.github/workflows/…` it could use — no checkout, a file that
+wouldn't parse, or one that no longer names any of the jobs this run actually
+had — so every job landed in the first column for want of anything better, and
+the row of boxes is what is known rather than what is true.
+
+Jobs of one stage — everything that starts at the same time — sit side by side
+with no arrow between them, so a workflow with no `needs:` anywhere is one row
+of boxes, which is what it is. A matrix is one box with its leg count on it:
+five legs are one thing the next stage waits for, and stacking them the way the
+web page does would cost four rows each.
+
+A job that calls a reusable workflow in the same repo — `uses: ./.github/…` —
+is one job in the file and a whole file's worth of jobs in the run, named
+`caller / inner`. jog reads that file too, so the chain runs through the call
+instead of stopping at it, and the boxes carry the job that ran rather than the
+call that ran it. Where two of those would cut down to the same text, they are
+cut from the other end (`…age (GPU box)`), since what tells one from the other
+is the part a plain truncation throws away. A call to another repo's workflow
+can't be read from here, so it stays one box.
+
+The band draws itself only when it has something to say — a run of one job
+doesn't get one — and only where it can show at least half its boxes without
+squeezing the list underneath. It disappears rather than showing two boxes and
+a number.
+
 ## A matrix reads as one job
 
 A workflow that fans `build` out over five services arrives from the API as five

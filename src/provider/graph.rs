@@ -42,6 +42,20 @@ pub struct JobSpec {
     pattern: Vec<Seg>,
     /// Longest chain of `needs:` behind this job — its column in the graph.
     depth: usize,
+    /// A reusable workflow in this repo that this job calls, as written.
+    uses: Option<String>,
+    /// That file, once it has been read. A call is a whole graph standing in
+    /// one job's place: GitHub runs each of its jobs as a job of this run,
+    /// named `caller / inner`, and their order is the called file's business.
+    called: Option<Box<WorkflowGraph>>,
+}
+
+/// Where a run job sits: which column, and which matrix it is a leg of.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Placement {
+    pub depth: usize,
+    /// `Some(key)` for a leg of a matrix — legs sharing a key are one box.
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -81,6 +95,15 @@ impl WorkflowGraph {
                 needs: parse_needs(body.get("needs")),
                 pattern: compile(name.unwrap_or(key)),
                 depth: 0,
+                // Only a path into this repo. `owner/repo/.github/…@ref` names
+                // a file on some other checkout, which there is no reading
+                // from here.
+                uses: body
+                    .get("uses")
+                    .and_then(|v| v.as_str())
+                    .filter(|u| u.starts_with("./"))
+                    .map(str::to_string),
+                called: None,
             });
         }
         if specs.is_empty() {
@@ -88,6 +111,72 @@ impl WorkflowGraph {
         }
         resolve_depths(&mut specs);
         Some(Self { jobs: specs })
+    }
+
+    /// Read the reusable workflows this one calls, so their chains become part
+    /// of this one's.
+    ///
+    /// `budget` bounds the recursion: a workflow that calls itself, directly or
+    /// round a ring, would otherwise be read until the stack gave out.
+    pub fn resolve_calls(&mut self, repo_root: &std::path::Path, budget: u8) {
+        if budget == 0 {
+            return;
+        }
+        for spec in &mut self.jobs {
+            let Some(uses) = spec.uses.as_deref() else {
+                continue;
+            };
+            let path = repo_root.join(uses.trim_start_matches("./"));
+            let Ok(raw) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            if let Some(mut inner) = Self::parse(&raw) {
+                inner.resolve_calls(repo_root, budget - 1);
+                spec.called = Some(Box::new(inner));
+            }
+        }
+        // A job that stands for a two-column workflow occupies two columns, so
+        // whatever waits on it starts two later, not one.
+        resolve_depths(&mut self.jobs);
+    }
+
+    /// Columns this graph occupies — one more than its last job's depth.
+    fn span(&self) -> usize {
+        self.jobs.iter().map(|s| s.depth + 1).max().unwrap_or(1)
+    }
+
+    /// Where a run job belongs in the chain.
+    ///
+    /// A job that came out of a reusable workflow is named `caller / inner`,
+    /// and its column is the caller's plus the inner job's own — which is what
+    /// puts an arrow between two halves of one call, exactly where the run
+    /// page draws one.
+    pub fn place(&self, run_job_name: &str) -> Option<Placement> {
+        let spec = self.spec_for(run_job_name)?;
+        if let Some(inner) = &spec.called
+            && let Some((_, tail)) = run_job_name.split_once(" / ")
+            && let Some(within) = inner.place(tail)
+        {
+            return Some(Placement {
+                depth: spec.depth + within.depth,
+                group: within.group.map(|g| format!("{}/{g}", spec.key)),
+            });
+        }
+        Some(Placement {
+            depth: spec.depth,
+            group: spec.matrix.then(|| spec.key.clone()),
+        })
+    }
+
+    /// Does this file still describe that run?
+    ///
+    /// A job renamed since the run went out matches nothing here, and one that
+    /// matches nothing gets no place in the chain — it inherits the depth of
+    /// whatever came before it. A few of those are survivable; a file where
+    /// *none* of the names land has told us nothing about the order, and a
+    /// caller must not report its columns as fact.
+    pub fn describes(&self, jobs: &[Job]) -> bool {
+        !jobs.is_empty() && jobs.iter().all(|j| self.spec_for(&j.name).is_some())
     }
 
     /// The YAML job a run job's name came from, or `None` when nothing fits.
@@ -166,11 +255,17 @@ fn resolve_depths(specs: &mut [JobSpec]) {
         .iter()
         .map(|s| s.needs.iter().filter_map(|n| index.get(n.as_str()).copied()).collect())
         .collect();
+    // How many columns each job takes: one, unless it stands for a whole
+    // reusable workflow that has been read.
+    let span: Vec<usize> = specs
+        .iter()
+        .map(|s| s.called.as_ref().map(|g| g.span()).unwrap_or(1))
+        .collect();
     let mut depth = vec![0usize; specs.len()];
     for _ in 0..specs.len() {
         let mut moved = false;
         for (i, ups) in edges.iter().enumerate() {
-            let want = ups.iter().map(|&u| depth[u] + 1).max().unwrap_or(0);
+            let want = ups.iter().map(|&u| depth[u] + span[u]).max().unwrap_or(0);
             if want > depth[i] {
                 depth[i] = want;
                 moved = true;
@@ -250,6 +345,27 @@ fn glob_match(segs: &[Seg], s: &str) -> bool {
 /// the matrix job kept its default name, because GitHub writes the combination
 /// in brackets: `test (ubuntu-latest, 3.11)`.
 pub fn shape(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<RunNode> {
+    laid_out(jobs, graph).into_iter().map(|(_, n)| n).collect()
+}
+
+/// The same arrangement, kept in the columns the `needs:` edges put it in:
+/// one entry per stage, in order, each holding what that stage runs at once.
+///
+/// This is the run page's graph — everything in a stage starts when the stage
+/// before it has finished. A workflow with no `needs:` anywhere is one stage
+/// of everything, which is exactly what it is.
+pub fn stages(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<Vec<RunNode>> {
+    let mut out: Vec<(usize, Vec<RunNode>)> = Vec::new();
+    for (depth, node) in laid_out(jobs, graph) {
+        match out.last_mut() {
+            Some((d, stage)) if *d == depth => stage.push(node),
+            _ => out.push((depth, vec![node])),
+        }
+    }
+    out.into_iter().map(|(_, stage)| stage).collect()
+}
+
+fn laid_out(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<(usize, RunNode)> {
     let mut group_of: Vec<Option<String>> = vec![None; jobs.len()];
     let mut depth_of: Vec<usize> = vec![0; jobs.len()];
     match graph {
@@ -259,13 +375,11 @@ pub fn shape(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<RunNode> {
             // the front as a depth of nothing.
             let mut last = 0usize;
             for (i, job) in jobs.iter().enumerate() {
-                match g.spec_for(&job.name) {
-                    Some(spec) => {
-                        depth_of[i] = spec.depth;
-                        last = spec.depth;
-                        if spec.matrix {
-                            group_of[i] = Some(spec.key.clone());
-                        }
+                match g.place(&job.name) {
+                    Some(at) => {
+                        depth_of[i] = at.depth;
+                        last = at.depth;
+                        group_of[i] = at.group;
                     }
                     None => depth_of[i] = last,
                 }
@@ -328,7 +442,7 @@ pub fn shape(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<RunNode> {
         }
     }
     nodes.sort_by_key(|(depth, first, _)| (*depth, *first));
-    nodes.into_iter().map(|(_, _, n)| n).collect()
+    nodes.into_iter().map(|(depth, _, n)| (depth, n)).collect()
 }
 
 #[cfg(test)]
@@ -521,6 +635,125 @@ jobs:
         let g = WorkflowGraph::parse(wf).unwrap();
         assert_eq!(g.spec_for("deploy").unwrap().key, "deploy");
         assert_eq!(g.spec_for("deploy stage").unwrap().key, "deploy-matrix");
+    }
+
+    #[test]
+    fn a_reusable_workflow_s_own_chain_is_part_of_the_run_s() {
+        let root = std::env::temp_dir().join(format!("jog-calls-{}", std::process::id()));
+        let dir = root.join(".github").join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The called file runs two jobs, the second after the first.
+        std::fs::write(
+            dir.join("deploy.yml"),
+            "jobs:\n  stage:\n    name: v0.0.21 → stage\n  gpu:\n    needs: stage\n    name: v0.0.21 → stage (GPU box)\n",
+        )
+        .unwrap();
+        let mut g = WorkflowGraph::parse(WF).unwrap();
+
+        // Unread, both halves of the call are one job and share a column.
+        let flat = stages(
+            &[
+                job(1, "which commit"),
+                job(2, "deploy-stage / v0.0.21 → stage"),
+                job(3, "deploy-stage / v0.0.21 → stage (GPU box)"),
+            ],
+            Some(&g),
+        );
+        assert_eq!(flat.len(), 2, "{flat:?}");
+
+        // Read, the run's chain runs through it: the GPU half waits on the
+        // other, so it gets a column — and an arrow — of its own.
+        g.resolve_calls(&root, 3);
+        let jobs = vec![
+            job(1, "which commit"),
+            job(2, "build gojobi"),
+            job(3, "build ollama"),
+            job(4, "deploy-stage / v0.0.21 → stage"),
+            job(5, "deploy-stage / v0.0.21 → stage (GPU box)"),
+        ];
+        let st = stages(&jobs, Some(&g));
+        assert_eq!(st.len(), 4, "{st:?}");
+        assert_eq!(st[2], vec![RunNode::Job(3)]);
+        assert_eq!(st[3], vec![RunNode::Job(4)]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_workflow_that_calls_itself_does_not_read_forever() {
+        let root = std::env::temp_dir().join(format!("jog-loop-{}", std::process::id()));
+        let dir = root.join(".github").join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two files that call each other. Nothing sane does this; the reader
+        // must not fall over when something does.
+        std::fs::write(
+            dir.join("a.yml"),
+            "jobs:\n  go:\n    uses: ./.github/workflows/b.yml\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.yml"),
+            "jobs:\n  back:\n    uses: ./.github/workflows/a.yml\n",
+        )
+        .unwrap();
+        let mut g = WorkflowGraph::parse(&std::fs::read_to_string(dir.join("a.yml")).unwrap())
+            .unwrap();
+        g.resolve_calls(&root, 3);
+        assert!(g.place("go / back / go").is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_call_we_cannot_open_leaves_the_chain_where_it_was() {
+        let mut g = WorkflowGraph::parse(WF).unwrap();
+        // Nothing to read there; the caller stays one column, as before.
+        g.resolve_calls(std::path::Path::new("/nonexistent-for-this-test"), 3);
+        let jobs = vec![
+            job(1, "which commit"),
+            job(2, "deploy-stage / a"),
+            job(3, "deploy-stage / b"),
+        ];
+        assert_eq!(stages(&jobs, Some(&g)).len(), 2);
+    }
+
+    #[test]
+    fn stages_follow_the_needs_chain() {
+        let g = WorkflowGraph::parse(WF).unwrap();
+        let jobs = vec![
+            job(1, "which commit"),
+            job(2, "build ingestor"),
+            job(3, "build gojobi"),
+            job(4, "deploy-stage / v0.0.21 → stage"),
+            job(5, "deploy-stage / v0.0.21 → stage (GPU box)"),
+        ];
+        let st = stages(&jobs, Some(&g));
+        // Three columns: the commit check, the matrix, then both halves of the
+        // deploy — which are one stage, being one caller job.
+        assert_eq!(st.len(), 3);
+        assert_eq!(st[0], vec![RunNode::Job(0)]);
+        assert_eq!(
+            st[1],
+            vec![RunNode::Matrix { key: "build".into(), legs: vec![2, 1] }]
+        );
+        assert_eq!(st[2], vec![RunNode::Job(3), RunNode::Job(4)]);
+    }
+
+    #[test]
+    fn a_file_that_no_longer_names_the_run_s_jobs_describes_nothing() {
+        let g = WorkflowGraph::parse(WF).unwrap();
+        assert!(g.describes(&[job(1, "which commit"), job(2, "build gojobi")]));
+        // Renamed since: the file parses, and says nothing about these.
+        assert!(!g.describes(&[job(1, "unit tests"), job(2, "smoke tests")]));
+        // Half-known is not known: the chain would be guesswork either way.
+        assert!(!g.describes(&[job(1, "which commit"), job(2, "smoke tests")]));
+        assert!(!g.describes(&[]));
+    }
+
+    #[test]
+    fn a_workflow_with_no_needs_is_one_stage_of_everything() {
+        let jobs = vec![job(1, "lint"), job(2, "test"), job(3, "build")];
+        let st = stages(&jobs, None);
+        assert_eq!(st.len(), 1);
+        assert_eq!(st[0].len(), 3);
     }
 
     #[test]

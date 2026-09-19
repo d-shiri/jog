@@ -4911,6 +4911,53 @@ fn disp_width(s: &str) -> usize {
 }
 
 /// `s` cut to at most `max` terminal columns, with an ellipsis where it was cut.
+/// Cut from the end instead of the start: `…age (GPU box)` rather than
+/// `v0.0.21 → sta…`, for when it is the tail that says which one this is.
+fn truncate_head(s: &str, max: usize) -> String {
+    if disp_width(s) <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let budget = max - 1;
+    let mut kept: Vec<char> = Vec::new();
+    let mut w = 0;
+    for c in s.chars().rev() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > budget {
+            break;
+        }
+        kept.push(c);
+        w += cw;
+    }
+    let mut out = String::from("…");
+    out.extend(kept.into_iter().rev());
+    out
+}
+
+/// Names cut to a width, except where two of them come out the same.
+///
+/// Two halves of one reusable-workflow call differ at the end — `… → stage`
+/// and `… → stage (GPU box)` — which is exactly the part a plain truncation
+/// throws away, leaving two boxes that read identically and a graph that looks
+/// like it drew the same job twice.
+fn fit_labels(names: &[&str], max: usize) -> Vec<String> {
+    let cut: Vec<String> = names.iter().map(|n| truncate(n, max)).collect();
+    names
+        .iter()
+        .zip(&cut)
+        .map(|(full, short)| {
+            let clashes = cut.iter().filter(|c| *c == short).count() > 1;
+            if clashes {
+                truncate_head(full, max)
+            } else {
+                short.clone()
+            }
+        })
+        .collect()
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if disp_width(s) <= max {
         return s.to_string();
@@ -5575,6 +5622,23 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
     }
 
     if let Some(detail) = &state.runs_preview {
+        // The graph of the run under the cursor, above its steps. This pane is
+        // the narrowest of the three that draw it, so most of the time it says
+        // there is no room — which is the right answer rather than a stunted
+        // chain over a stunted list.
+        let stages = state.stages_of(detail);
+        let band = graph_band(state, detail, &stages, state.graph_known(detail), inner);
+        let inner = if let Some(band) = band {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(GRAPH_ROWS), Constraint::Min(0)])
+                .split(inner);
+            render_run_graph(f, split[0], theme, state.tick_count, &band);
+            split[1]
+        } else {
+            inner
+        };
+
         let mut lines: Vec<Line> = Vec::new();
 
         if let Some(run) = selected
@@ -5626,6 +5690,342 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
             scroll_note(f, area, scroll, inner.height, max_scroll, theme);
         }
     }
+}
+
+/// Rows the run graph takes when it is drawn: a box is a border, a name, its
+/// numbers, and a border.
+const GRAPH_ROWS: u16 = 4;
+
+/// Space between two boxes of the same stage, and the connector that runs
+/// between one stage and the next.
+///
+/// The arrow touches both boxes rather than floating in a gap: `│──▸│` reads
+/// as one chain, where ` ──▸ ` reads as three things that happen to be near
+/// each other — and at this size a detached rule is the first thing to
+/// disappear into the background.
+const GRAPH_GAP: usize = 1;
+const GRAPH_ARROW: usize = 3;
+
+/// One box of the graph, resolved to text before anything decides how wide it
+/// may be. `after` marks the boxes an arrow reaches: the first of each stage.
+struct GraphBox {
+    glyph: String,
+    name: String,
+    meta: String,
+    status: Status,
+    after: bool,
+}
+
+/// How much of the graph fits, and how wide its boxes may be.
+struct GraphPlan {
+    box_w: usize,
+    shown: usize,
+    dropped: usize,
+}
+
+/// Lay the chain out against a width.
+///
+/// `None` when what would fit isn't worth the four rows: two boxes out of nine
+/// is not a graph, it is a pair of boxes and a number, and the list underneath
+/// needs the room more.
+fn graph_plan(boxes: &[GraphBox], width: usize) -> Option<GraphPlan> {
+    if boxes.len() < 2 {
+        return None;
+    }
+    let widest = boxes
+        .iter()
+        .map(|b| {
+            UnicodeWidthStr::width(b.name.as_str()).max(UnicodeWidthStr::width(b.meta.as_str()))
+        })
+        .max()
+        .unwrap_or(8);
+    // 2 borders + 2 padding + the glyph and the space after it.
+    const CHROME: usize = 6;
+    let sep = |i: usize| {
+        if boxes[i].after {
+            GRAPH_ARROW
+        } else {
+            GRAPH_GAP
+        }
+    };
+    let fits = |n: usize, box_w: usize| -> bool {
+        let seps: usize = (1..n).map(sep).sum();
+        n * box_w + seps <= width
+    };
+    // Room first, legibility second: a chain that fits whole at a narrower box
+    // beats one that keeps generous boxes and loses half its stages.
+    let roomy = widest.clamp(8, 26) + CHROME;
+    let tight = widest.clamp(8, 14) + CHROME;
+    let box_w = if fits(boxes.len(), roomy) { roomy } else { tight };
+
+    let mut room = 0;
+    while room < boxes.len() && fits(room + 1, box_w) {
+        room += 1;
+    }
+    if room == boxes.len() {
+        return Some(GraphPlan { box_w, shown: room, dropped: 0 });
+    }
+    // One slot goes to saying how many are missing.
+    let shown = room.saturating_sub(1);
+    let dropped = boxes.len() - shown;
+    (shown >= 2 && shown * 2 >= boxes.len()).then_some(GraphPlan { box_w, shown, dropped })
+}
+
+/// The boxes a run's graph would be made of, in chain order.
+fn graph_boxes(detail: &RunDetail, stages: &[Vec<RunNode>], tick: u64) -> Vec<GraphBox> {
+    stages
+        .iter()
+        .enumerate()
+        .flat_map(|(si, stage)| {
+            stage.iter().enumerate().map(move |(ni, node)| {
+                let mut b = graph_box(node, detail, tick);
+                b.after = si > 0 && ni == 0;
+                b
+            })
+        })
+        .collect()
+}
+
+/// Whether a run's graph is worth drawing in `area`, and — when it is — the
+/// boxes and the layout to draw it from, so the caller settles that once and
+/// hands the same answer to [`render_run_graph`] rather than resolving every
+/// job's name and duration a second time on the same frame.
+///
+/// A run of one job is a graph of one box, which says nothing the line above it
+/// doesn't. And the band only earns its four rows where there is still a useful
+/// amount of view left underneath — `area` is the room the band and whatever
+/// it sits above will share, not the whole pane.
+fn graph_band(
+    state: &AppState,
+    detail: &RunDetail,
+    stages: &[Vec<RunNode>],
+    known: bool,
+    area: Rect,
+) -> Option<GraphBand> {
+    if area.height < GRAPH_ROWS + 6 {
+        return None;
+    }
+    let boxes = graph_boxes(detail, stages, state.tick_count);
+    let plan = graph_plan(&boxes, area.width as usize)?;
+    Some(GraphBand { boxes, plan, stages: stages.len(), known })
+}
+
+/// A graph settled against a width: what to draw, how wide, and the two facts
+/// the caption needs.
+struct GraphBand {
+    boxes: Vec<GraphBox>,
+    plan: GraphPlan,
+    stages: usize,
+    /// Whether the columns came from the workflow file. Without it everything
+    /// is in the first column, which is indistinguishable from a workflow
+    /// where nothing waits for anything — so the band says which it is rather
+    /// than letting a missing arrow mean two different things.
+    known: bool,
+}
+
+/// The run's stages as the run page draws them: a box per job, chained left to
+/// right in `needs:` order, everything a stage runs at once sitting side by
+/// side between one pair of arrows and the next.
+///
+/// A matrix folds to a single box — five legs of one job are one thing that has
+/// to finish before the next stage starts, which is the question a graph is
+/// asked. Stacking the legs the way the web page does would cost four rows
+/// each, and a terminal has not got them.
+fn render_run_graph(f: &mut Frame, area: Rect, theme: &Theme, tick: u64, band: &GraphBand) {
+    let GraphBand { boxes, plan, stages: stage_count, known } = band;
+    let (stage_count, known) = (*stage_count, *known);
+    // Fitted together rather than one at a time, so two names that would cut
+    // down to the same thing are cut differently instead.
+    let shown: Vec<&GraphBox> = boxes.iter().take(plan.shown).collect();
+    let names: Vec<&str> = shown.iter().map(|b| b.name.as_str()).collect();
+    // 2 borders + 2 padding + the glyph and its space.
+    let labels = fit_labels(&names, plan.box_w.saturating_sub(6));
+
+    let mut x = area.x;
+    for (i, b) in shown.iter().enumerate() {
+        if i > 0 {
+            if b.after {
+                // The edge the run is crossing right now marches; every other
+                // one is a still rule. One moving thing at a time is what
+                // makes it mean "here".
+                let crossing = !b.status.is_terminal()
+                    && shown[..i].iter().all(|p| p.status.is_terminal());
+                f.render_widget(
+                    Paragraph::new(Line::from(graph_connector(
+                        crossing,
+                        tick,
+                        theme,
+                    ))),
+                    Rect { x, y: area.y + 1, width: GRAPH_ARROW as u16, height: 1 },
+                );
+                x += GRAPH_ARROW as u16;
+            } else {
+                x += GRAPH_GAP as u16;
+            }
+        }
+        draw_graph_box(
+            f,
+            Rect { x, y: area.y, width: plan.box_w as u16, height: GRAPH_ROWS },
+            b,
+            &labels[i],
+            tick,
+            theme,
+        );
+        x += plan.box_w as u16;
+    }
+    // What the empty space to the right of the chain is for: the boxes that
+    // didn't fit, or — when there is only one stage — why there is no arrow in
+    // a band whose whole job is to draw them.
+    let note = if plan.dropped > 0 {
+        format!("  +{} more", plan.dropped)
+    } else if stage_count > 1 {
+        String::new()
+    } else if known {
+        "  ⇉ all at once".to_string()
+    } else {
+        "  ⇉ order unknown — no workflow file here".to_string()
+    };
+    let left = area.right().saturating_sub(x) as usize;
+    if !note.is_empty() && left >= 8 {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::default(),
+                Line::from(Span::styled(
+                    truncate(&note, left),
+                    Style::default().fg(theme.text_faint),
+                )),
+            ]),
+            Rect { x, y: area.y, width: left as u16, height: GRAPH_ROWS },
+        );
+    }
+}
+
+/// The rule between two stages: still, or — while the run is crossing it — a
+/// bright cell travelling along it into the stage that is working.
+///
+/// Three columns is not much to move in, so the travel is carried by weight as
+/// well as colour: the lit cell is drawn heavy, which still reads on a terminal
+/// that has flattened the palette. The pause at the end of each pass keeps it
+/// from reading as a strobe.
+fn graph_connector(crossing: bool, tick: u64, theme: &Theme) -> Vec<Span<'static>> {
+    let still = Style::default().fg(theme.text_muted);
+    if !crossing {
+        return vec![Span::styled("──▸", still)];
+    }
+    // One beat of rest at the end of each pass — enough that it reads as
+    // something travelling rather than a continuous crawl, not so much that the
+    // edge spends half its time looking dead.
+    let head = Motion::new(tick).sweep(GRAPH_ARROW, 1);
+    let lit = Style::default().fg(theme.warning).bold();
+    (0..GRAPH_ARROW)
+        .map(|i| {
+            let on = i == head;
+            match (i == GRAPH_ARROW - 1, on) {
+                (true, true) => Span::styled("▸", lit),
+                (true, false) => Span::styled("▸", still),
+                (false, true) => Span::styled("━", lit),
+                (false, false) => Span::styled("─", still),
+            }
+        })
+        .collect()
+}
+
+/// What one node of the graph says: its verdict, its name, and its numbers.
+fn graph_box(node: &RunNode, detail: &RunDetail, tick: u64) -> GraphBox {
+    match node {
+        RunNode::Job(ji) => {
+            let job = &detail.jobs[*ji];
+            GraphBox {
+                glyph: animated_glyph(job.status, tick).to_string(),
+                // `caller / inner` — the caller names the call, which the
+                // chain is already showing; the box carries the job that
+                // actually ran, so two halves of one call can be told apart
+                // instead of both reading `deploy-stage …`.
+                name: job
+                    .name
+                    .split_once(" / ")
+                    .map(|(_, inner)| inner.to_string())
+                    .unwrap_or_else(|| job.name.clone()),
+                meta: job
+                    .duration_secs()
+                    .map(|s| format_step_dur(s as f64))
+                    .unwrap_or_default(),
+                status: job.status,
+                after: false,
+            }
+        }
+        RunNode::Matrix { key, legs } => {
+            let jobs: Vec<&Job> = legs.iter().map(|&i| &detail.jobs[i]).collect();
+            let status = worst_status(jobs.iter().map(|j| j.status));
+            let dur = group_secs(&jobs)
+                .map(|s| format!("  {}", format_step_dur(s as f64)))
+                .unwrap_or_default();
+            GraphBox {
+                glyph: animated_glyph(status, tick).to_string(),
+                name: format!("Matrix: {key}"),
+                meta: format!("{} legs{dur}", legs.len()),
+                status,
+                after: false,
+            }
+        }
+    }
+}
+
+fn draw_graph_box(
+    f: &mut Frame,
+    area: Rect,
+    b: &GraphBox,
+    label: &str,
+    tick: u64,
+    theme: &Theme,
+) {
+    // The border carries the verdict. A band drawn entirely in the palette's
+    // dimmest grey is legible in a screenshot and invisible on a screen — and
+    // colour here costs nothing, because every box already has a glyph saying
+    // the same thing.
+    //
+    // The box the run is in breathes, so which station it is on is answerable
+    // from across the room rather than by reading four names.
+    let edge = match b.status {
+        Status::Success => theme.success_dim,
+        Status::Failure | Status::Cancelled => theme.failure,
+        Status::Running => mix(
+            theme.warning,
+            theme.text_bright,
+            Motion::new(tick).pulse(16),
+        ),
+        Status::Queued => theme.text_muted,
+        _ => theme.border,
+    };
+    let blk = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(edge))
+        .padding(Padding::horizontal(1));
+    let inner = blk.inner(area);
+    f.render_widget(blk, area);
+    if inner.width == 0 {
+        return;
+    }
+    let w = inner.width as usize;
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(b.glyph.clone(), style_for_status(b.status, theme)),
+                Span::raw(" "),
+                Span::styled(
+                    label.to_string(),
+                    Style::default().fg(theme.text_bright),
+                ),
+            ]),
+            Line::from(Span::styled(
+                truncate(&b.meta, w),
+                Style::default().fg(theme.text_muted),
+            ))
+            .right_aligned(),
+        ]),
+        inner,
+    );
 }
 
 fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
@@ -5820,14 +6220,38 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
         .filter(|h| inner.height >= h + 8)
         .unwrap_or(0);
 
+    // The same shape the rows below are grouped by, so the two can never
+    // disagree about what is a matrix and what is a job.
+    let worked_out;
+    let (stages, known): (&[Vec<RunNode>], bool) = if state.run_stages.is_empty() {
+        worked_out = state.stages_of(detail);
+        (&worked_out, state.graph_known(detail))
+    } else {
+        (&state.run_stages, state.run_stages_known)
+    };
+    // Against what is left after the summary line and the digest, not the
+    // whole pane: the band's own "six rows underneath" rule is about the step
+    // list, and on a red run the digest has already taken its share of them.
+    let band = graph_band(
+        state,
+        detail,
+        stages,
+        known,
+        Rect { height: inner.height.saturating_sub(2 + digest_h), ..inner },
+    );
+    let graph_h = if band.is_some() { GRAPH_ROWS } else { 0 };
     let inner_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
+            Constraint::Length(graph_h),
             Constraint::Length(digest_h),
             Constraint::Min(0),
         ])
         .split(inner);
+    if let Some(band) = &band {
+        render_run_graph(f, inner_chunks[1], theme, state.tick_count, band);
+    }
 
     if let (Some(d), true) = (digest, digest_h > 0) {
         let what = d.step_name.as_deref().unwrap_or(d.job_name.as_str());
@@ -5839,8 +6263,8 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.failure_dim));
-        let dinner = dblk.inner(inner_chunks[1]);
-        f.render_widget(dblk, inner_chunks[1]);
+        let dinner = dblk.inner(inner_chunks[2]);
+        f.render_widget(dblk, inner_chunks[2]);
         let lines: Vec<Line> = d
             .lines
             .iter()
@@ -5877,7 +6301,7 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
 
     // Where in the list the cursor is, when the list is longer than the room
     // for it. A view that scrolls should say so, and say how far it goes.
-    let rows_h = inner_chunks[2].height as usize;
+    let rows_h = inner_chunks[3].height as usize;
     if items.len() > rows_h && rows_h > 0 {
         let first = (cursor + 1).saturating_sub(rows_h);
         f.render_widget(
@@ -5910,8 +6334,8 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
     // because the table was drawn from row 0 every frame.
     let mut ts = TableState::default();
     ts.select(Some(cursor));
-    f.render_stateful_widget(table, inner_chunks[2], &mut ts);
-    register_table_hits(state, inner_chunks[2], 0, 1, items.len(), cursor, |r| {
+    f.render_stateful_widget(table, inner_chunks[3], &mut ts);
+    register_table_hits(state, inner_chunks[3], 0, 1, items.len(), cursor, |r| {
         Some(Hit::DetailItem(r))
     });
 }
@@ -6130,14 +6554,45 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
     } else {
         0
     };
+    // The graph goes between the summary and the jobs: the one place in the
+    // live view that answers "which stage is this run on" without reading.
+    let worked_out;
+    let (stages, known): (&[Vec<RunNode>], bool) = if state.run_stages.is_empty() {
+        worked_out = state
+            .run_detail
+            .as_ref()
+            .map(|d| state.stages_of(d))
+            .unwrap_or_default();
+        let known = state
+            .run_detail
+            .as_ref()
+            .is_some_and(|d| state.graph_known(d));
+        (&worked_out, known)
+    } else {
+        (&state.run_stages, state.run_stages_known)
+    };
+    let band = state.run_detail.as_ref().and_then(|d| {
+        graph_band(
+            state,
+            d,
+            stages,
+            known,
+            Rect { height: area.height.saturating_sub(7 + tail_h), ..area },
+        )
+    });
+    let graph_h = if band.is_some() { GRAPH_ROWS } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(7),
+            Constraint::Length(graph_h),
             Constraint::Min(0),
             Constraint::Length(tail_h),
         ])
         .split(area);
+    if let Some(band) = &band {
+        render_run_graph(f, chunks[1], theme, state.tick_count, band);
+    }
 
     // Drawn before the step lists, whose section returns early when a run has
     // no jobs yet — which is exactly when "waiting for the log" is the only
@@ -6145,7 +6600,7 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
     if let Some(job) = tail_job
         && tail_h > 0
     {
-        let ta = chunks[2];
+        let ta = chunks[3];
         let viewport = ta.height.saturating_sub(2) as usize;
         let (title, lines): (String, Vec<Line>) = match &state.watch_tail {
             Some(t) if t.job_id == job.id && !t.lines.is_empty() => {
@@ -6262,7 +6717,7 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
         // with eight of them asks for more rows than any terminal has. Close
         // the ones nobody opened this view to read — the ones that passed,
         // from the top — and only start on the rest once they've all gone.
-        let avail = chunks[1].height as usize;
+        let avail = chunks[2].height as usize;
         let mut open: Vec<bool> = nodes
             .iter()
             .map(|n| matches!(n, RunNode::Job(_)))
@@ -6300,21 +6755,21 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
         let scroll = state.watch_scroll.min(max_scroll);
 
         if max_scroll == 0 {
-            draw_watch_blocks(f.buffer_mut(), chunks[1], nodes, &open, detail, state);
+            draw_watch_blocks(f.buffer_mut(), chunks[2], nodes, &open, detail, state);
             return;
         }
         // Drawn full height into a buffer of its own, then the window that
         // fits is copied across. Laying the blocks out inside the visible area
         // and clipping would be the same code with every height wrong.
-        let tall = Rect { height: total as u16, ..chunks[1] };
+        let tall = Rect { height: total as u16, ..chunks[2] };
         let mut scratch = ratatui::buffer::Buffer::empty(tall);
         draw_watch_blocks(&mut scratch, tall, nodes, &open, detail, state);
         let buf = f.buffer_mut();
-        for row in 0..chunks[1].height {
+        for row in 0..chunks[2].height {
             let from = tall.y + scroll + row;
-            for x in chunks[1].x..chunks[1].right() {
+            for x in chunks[2].x..chunks[2].right() {
                 if let (Some(src), Some(dst)) =
-                    (scratch.cell((x, from)).cloned(), buf.cell_mut((x, chunks[1].y + row)))
+                    (scratch.cell((x, from)).cloned(), buf.cell_mut((x, chunks[2].y + row)))
                 {
                     *dst = src;
                 }
@@ -6322,7 +6777,7 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
         }
         // Where you are in it, written along the bottom edge of the summary
         // block — the one rule on screen that is not carrying a job.
-        scroll_note(f, chunks[0], scroll, chunks[1].height, max_scroll, theme);
+        scroll_note(f, chunks[0], scroll, chunks[2].height, max_scroll, theme);
     }
 }
 
@@ -8420,6 +8875,203 @@ jobs:
             .join("\n")
     }
 
+    /// The run behind the first screenshot, with its workflow file on disk so
+    /// the chain is the one `needs:` describes.
+    fn a_chained_run() -> AppState {
+        let root = chained_run_dir();
+        let dir = root.join(".github").join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("deploy.yml"),
+            concat!(
+                "jobs:\n",
+                "  which-commit:\n    name: which commit\n",
+                "  build:\n    needs: which-commit\n    name: build ${{ matrix.service }}\n",
+                "    strategy:\n      matrix:\n        service: [a, b, c, d, e]\n",
+                "  deploy-stage:\n    needs: build\n    uses: ./.github/workflows/d.yml\n",
+            ),
+        )
+        .unwrap();
+        // The file that call runs, whose own two jobs are chained — the shape
+        // the run page draws for this workflow.
+        std::fs::write(
+            dir.join("d.yml"),
+            concat!(
+                "jobs:\n",
+                "  stage:\n    name: v0.0.21 → stage\n",
+                "  gpu:\n    needs: stage\n    name: v0.0.21 → stage (GPU box)\n",
+            ),
+        )
+        .unwrap();
+        let mut st = watching_a_matrix_run(&[
+            ("build db-backup", Status::Success),
+            ("build gojobi", Status::Running),
+            ("build ingestor", Status::Success),
+            ("build ollama", Status::Success),
+            ("build wecker", Status::Success),
+        ]);
+        st.repo_root = Some(root);
+        st.workflow_for_runs = Some("deploy.yml".into());
+        st.rebuild_run_shape();
+        st
+    }
+
+    /// Where [`a_chained_run`] puts the workflow file it needs on disk. The
+    /// cache re-stats it, so it has to outlive every `rebuild_run_shape` the
+    /// test makes — which is why the test clears it up rather than the helper.
+    fn chained_run_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("jog-graph-{}", std::process::id()))
+    }
+
+    #[test]
+    fn the_edge_the_run_is_crossing_marches_and_the_others_do_not() {
+        let mut st = a_chained_run();
+        st.view = View::RunDetail;
+        // The matrix is the stage in flight, so the rule into it is the one
+        // that moves — and it moves, rather than sitting on one frame.
+        let mut heads = std::collections::HashSet::new();
+        for tick in 0..12u64 {
+            st.tick_count = tick;
+            let out = draw_detail(&st, 120, 28);
+            let band = out.lines().find(|l| l.contains('▸')).unwrap().to_string();
+            // One lit cell at most, and only ever on the first connector.
+            assert!(band.matches('━').count() <= 1, "{band}");
+            let (before, _) = band.split_once("Matrix").unwrap();
+            assert_eq!(
+                band.matches('━').count(),
+                before.matches('━').count(),
+                "only the edge being crossed moves:\n{band}"
+            );
+            heads.insert(before.find('━'));
+        }
+        assert!(heads.len() > 1, "the lit cell should travel, not sit: {heads:?}");
+
+        // Once the run has landed nothing marches: a still graph is the point
+        // of a finished run.
+        let detail = st.run_detail.as_mut().unwrap();
+        detail.run.status = Status::Success;
+        for job in &mut detail.jobs {
+            job.status = Status::Success;
+            for step in &mut job.steps {
+                step.status = Status::Success;
+            }
+        }
+        for tick in 0..12u64 {
+            st.tick_count = tick;
+            let out = draw_detail(&st, 120, 28);
+            assert!(!out.contains('━'), "a finished run holds still:\n{out}");
+        }
+        std::fs::remove_dir_all(chained_run_dir()).ok();
+    }
+
+    #[test]
+    fn a_band_with_no_arrows_says_why_it_has_none() {
+        // Five jobs and nothing between them — the run behind the screenshot.
+        let root = std::env::temp_dir().join(format!("jog-flat-{}", std::process::id()));
+        let dir = root.join(".github").join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tests.yml"),
+            "jobs:\n  a:\n    name: python suites\n  b:\n    name: bench\n  c:\n    name: website\n",
+        )
+        .unwrap();
+        let mut st = watching_a_matrix_run(&[("build gojobi", Status::Success)]);
+        st.view = View::RunDetail;
+        st.workflow_for_runs = Some("tests.yml".into());
+        let detail = st.run_detail.as_mut().unwrap();
+        // The runs endpoint doesn't name the file, so the view falls back to
+        // the workflow it is listing runs for — as it does in the app.
+        detail.run.workflow_file = None;
+        detail.jobs = ["python suites", "bench", "website"]
+            .iter()
+            .map(|n| a_job_at(n, Status::Success, 30, &[("Set up job", Status::Success)]))
+            .collect();
+
+        // With the file in reach, one stage is a fact about the workflow.
+        st.repo_root = Some(root.clone());
+        st.rebuild_run_shape();
+        let known = draw_detail(&st, 120, 28);
+        assert!(known.contains("all at once"), "{known}");
+        assert!(!known.contains("──▸"), "nothing waits, so nothing points:\n{known}");
+
+        // Without it, one stage is only what is left when nothing is known —
+        // and the band says so rather than asserting the same thing.
+        st.repo_root = None;
+        st.workflow_graphs.clear();
+        st.rebuild_run_shape();
+        let guessed = draw_detail(&st, 120, 28);
+        assert!(guessed.contains("order unknown"), "{guessed}");
+
+        // And a file that reads fine but no longer names any of these jobs is
+        // the same amount of knowledge as no file at all.
+        std::fs::write(
+            dir.join("tests.yml"),
+            "jobs:\n  a:\n    name: renamed since\n  b:\n    name: also renamed\n",
+        )
+        .unwrap();
+        st.repo_root = Some(root.clone());
+        st.workflow_graphs.clear();
+        st.rebuild_run_shape();
+        let stale = draw_detail(&st, 120, 28);
+        assert!(
+            stale.contains("order unknown"),
+            "a file that doesn't know these jobs knows nothing:\n{stale}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_run_graph_chains_the_stages_left_to_right() {
+        let mut st = a_chained_run();
+        st.view = View::RunDetail;
+        let out = draw_detail(&st, 120, 28);
+        assert!(out.contains("Matrix: build"), "the matrix is one box:\n{out}");
+        assert!(out.contains("5 legs"), "{out}");
+        assert!(out.contains("──▸"), "stages are chained:\n{out}");
+        // Four stages, so three arrows: the commit check, the matrix — folded
+        // to one node rather than drawn five times — and then each half of the
+        // deploy, because the file that call runs chains them.
+        assert_eq!(out.matches('▸').count(), 3, "{out}");
+        // The boxes carry the job that ran, not the call that ran it — and
+        // where the two would cut down to the same text, they are cut from the
+        // other end so the pair can still be told apart.
+        assert!(out.contains("(GPU box)"), "{out}");
+        assert!(!out.contains("deploy-stage /"), "the call is what the chain says:\n{out}");
+        // The box says how it went and how long it took, not just its name.
+        assert!(out.contains("5 legs  1m 35s"), "{out}");
+        // The band has to be visible on a screen, not only in a screenshot:
+        // the connector and a passing box's border both carry more than the
+        // palette's faintest grey.
+        let buf = buffer_of(&st, 120, 28, render_run_detail);
+        let arrow = (0..buf.area.width)
+            .map(|x| &buf[(x, 4)])
+            .find(|c| c.symbol() == "▸")
+            .expect("an arrow on the connector row");
+        assert_ne!(arrow.fg, st.theme.border, "the chain should not be the dimmest thing on screen");
+        let corner = (0..buf.area.width)
+            .map(|x| &buf[(x, 3)])
+            .find(|c| c.symbol() == "╭")
+            .expect("a box");
+        assert_eq!(corner.fg, st.theme.success_dim, "a passing box wears its verdict");
+
+        // In the live view too, and there the running stage is the point.
+        st.view = View::Watch;
+        let watch = draw_watch(&st, 120, 34);
+        assert!(watch.contains("Matrix: build"), "{watch}");
+        assert!(watch.contains("──▸"), "{watch}");
+
+        // And in the Runs view's preview pane, where the run under the cursor
+        // gets the same chain above its steps.
+        st.view = View::Runs;
+        st.runs = vec![st.run_detail.as_ref().unwrap().run.clone()];
+        st.runs_preview_id = Some(st.runs[0].id);
+        st.runs_preview = st.run_detail.clone();
+        let runs = draw_view(&st, 200, 30, render_runs);
+        assert!(runs.contains("──▸"), "{runs}");
+        std::fs::remove_dir_all(chained_run_dir()).ok();
+
+    }
+
     #[test]
     fn the_detail_list_scrolls_the_cursor_into_view() {
         let mut st = watching_a_matrix_run(&[
@@ -8442,7 +9094,17 @@ jobs:
             bottom.contains("Complete job") || bottom.contains("Set up job"),
             "the last row should be on screen:\n{bottom}"
         );
-        assert!(!bottom.contains("which commit"), "the top should have scrolled away:\n{bottom}");
+        // (The graph band at the top may keep naming the first job — it is the
+        // list underneath that scrolled. The pane's own border is stripped
+        // first, or every row would look like a box and the check would pass
+        // whatever the list was showing.)
+        assert!(
+            !bottom
+                .lines()
+                .map(|l| l.trim_start_matches('│').trim_end_matches('│'))
+                .any(|l| l.contains("which commit") && !l.contains('│')),
+            "the top of the list should have scrolled away:\n{bottom}"
+        );
         // And the header says where in the list you are.
         assert!(bottom.contains(&format!("of {rows}")), "{bottom}");
     }

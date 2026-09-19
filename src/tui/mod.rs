@@ -610,6 +610,9 @@ async fn event_loop(
                             state.history.record(file, &detail);
                         }
                         if state.runs_preview_id == Some(run_id) {
+                            // The pane draws this run's graph, which wants the
+                            // workflow file read — once, then cached.
+                            state.warm_workflow_graph(&detail.run);
                             state.runs_preview = Some(detail);
                         }
                         state.pending = state.pending.saturating_sub(1);
@@ -1488,6 +1491,8 @@ async fn handle_key(
                 state.switch_view(View::Runs);
                 state.run_detail = None;
                 state.run_shape.clear();
+                state.run_stages.clear();
+                state.run_stages_known = false;
             }
             View::Logs => {
                 state.switch_view(View::RunDetail);
@@ -4836,6 +4841,8 @@ fn switch_to_selected_repo(
     state.runs.clear();
     state.run_detail = None;
     state.run_shape.clear();
+    state.run_stages.clear();
+    state.run_stages_known = false;
     // Another repo has its own workflow files, and its own fold state. Where
     // they are read from moves with it — a card without a checkout has none,
     // and its runs fall back to reading GitHub's own leg naming.
