@@ -1871,7 +1871,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                 ])
                 .split(inner);
             f.render_widget(Paragraph::new(caption), split[0]);
-            render_run_graph(f, split[1], theme, state.tick_count, &band);
+            render_run_graph(f, split[1], state, &band);
             split[3]
         }
         None => inner,
@@ -5660,7 +5660,7 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(band.height), Constraint::Min(0)])
                 .split(inner);
-            render_run_graph(f, split[0], theme, state.tick_count, &band);
+            render_run_graph(f, split[0], state, &band);
             split[1]
         } else {
             inner
@@ -5724,6 +5724,15 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
 /// copy of the list underneath it.
 const GRAPH_ROWS_MAX: usize = 12;
 
+/// The same ceiling once a matrix has been opened by hand.
+///
+/// Opening a box is a request for more rows, so the cap that keeps the band
+/// from quietly becoming a second job list is the wrong one to hold it to —
+/// but it still needs *a* ceiling, and the view underneath still gets its
+/// [`GRAPH_KEEP`] rows either way. A twelve-leg matrix opens to as much of
+/// itself as fits and says how many it is still holding back.
+const GRAPH_ROWS_MAX_OPEN: usize = 24;
+
 /// Rows the list under the graph keeps for itself. The band only earns its
 /// height where there is still a useful amount of view left below it.
 const GRAPH_KEEP: u16 = 6;
@@ -5738,12 +5747,17 @@ const GRAPH_KEEP: u16 = 6;
 const GRAPH_GAP: usize = 1;
 const GRAPH_ARROW: usize = 3;
 
-/// One line of a box: a job, or a matrix folded to a single line.
+/// One line of a box: a job, a matrix folded to a single line, or one leg of
+/// a matrix that has been opened.
 struct GraphRow {
     glyph: String,
     name: String,
     meta: String,
     status: Status,
+    /// The matrix this row belongs to, when clicking the row folds or unfolds
+    /// one. Every row of an open box carries it, so a click anywhere in the
+    /// box closes it again rather than only one on its first line.
+    toggle: Option<String>,
 }
 
 /// One box of the graph — a column's jobs that share their edges, inside one
@@ -5756,6 +5770,12 @@ struct GraphBox {
     status: Status,
     /// Rows given up to fit the height. The last row drawn then says how many.
     hidden: usize,
+    /// Holds a matrix the user has opened.
+    ///
+    /// Such a box gives up its rows last: it is the one that was *asked* to
+    /// say more, and silencing it first is the one outcome that would make
+    /// the click read as broken.
+    open: bool,
 }
 
 impl GraphBox {
@@ -5767,8 +5787,14 @@ impl GraphBox {
     /// Can this box give up another row? Giving one up costs a row to the
     /// note as well, and a box that is nothing but "+4 more" has stopped
     /// saying anything — so it stops with a real row still under it.
+    ///
+    /// An opened matrix stops a row sooner. Its first row is the box's own
+    /// name, so the ordinary floor leaves `− Matrix: build` over `+5 more` —
+    /// a box that says it is open and shows not one leg, which is worse than
+    /// a click that did nothing. Below this it does not shrink; it gives up
+    /// being open, back in [`graph_band`].
     fn can_give(&self) -> bool {
-        self.drawn() >= 3
+        self.drawn() >= if self.open { 4 } else { 3 }
     }
 }
 
@@ -5801,7 +5827,8 @@ impl GraphCol {
                 .boxes
                 .iter_mut()
                 .filter(|b| b.can_give())
-                .max_by_key(|b| b.drawn())
+                // An opened box goes last, and the tallest of the rest first.
+                .min_by_key(|b| (b.open, std::cmp::Reverse(b.drawn())))
             else {
                 break;
             };
@@ -5815,9 +5842,10 @@ impl GraphCol {
         // Which jobs are in the column is the part to keep, so they fold into
         // one box and the trimming starts again.
         let feeds = self.boxes.iter().any(|b| b.feeds);
+        let open = self.boxes.iter().any(|b| b.open);
         let rows: Vec<GraphRow> = self.boxes.drain(..).flat_map(|b| b.rows).collect();
         let status = worst_status(rows.iter().map(|r| r.status));
-        self.boxes = vec![GraphBox { rows, feeds, status, hidden: 0 }];
+        self.boxes = vec![GraphBox { rows, feeds, status, hidden: 0, open }];
         self.trim_to(cap);
     }
 }
@@ -5942,33 +5970,46 @@ fn graph_band(
         });
     }
 
-    let mut cols: Vec<GraphCol> = stages
-        .iter()
-        .map(|boxes| GraphCol {
-            boxes: boxes
-                .iter()
-                .map(|g| graph_box(g, detail, state.tick_count))
-                .collect(),
-        })
-        .collect();
-    let plan = graph_plan(&cols, area.width as usize)?;
-    cols.truncate(plan.shown);
+    // Settling the chain against the rows available, with the matrices the
+    // user has opened opened. `None` when it cannot be made to fit at all.
+    let settle = |unfold: bool| -> Option<(Vec<GraphCol>, GraphPlan, usize)> {
+        let open = |key: &str| unfold && state.graph_box_open(key);
+        let mut cols: Vec<GraphCol> = stages
+            .iter()
+            .map(|boxes| GraphCol {
+                boxes: boxes
+                    .iter()
+                    .map(|g| graph_box(g, detail, state.tick_count, &open))
+                    .collect(),
+            })
+            .collect();
+        let plan = graph_plan(&cols, area.width as usize)?;
+        cols.truncate(plan.shown);
+        let ceiling = if cols.iter().flat_map(|c| c.boxes.iter()).any(|b| b.open) {
+            GRAPH_ROWS_MAX_OPEN
+        } else {
+            GRAPH_ROWS_MAX
+        };
+        let cap = room.min(ceiling);
+        // Two borders and a row is the least a box can be.
+        if cap < 3 {
+            return None;
+        }
+        for col in cols.iter_mut() {
+            col.trim_to(cap);
+        }
+        let height = cols.iter().map(GraphCol::height).max().unwrap_or(0);
+        // A column of many one-row boxes can refuse to go below its cap — two
+        // borders apiece is a floor. Better no band than one that takes the
+        // rows the list was promised.
+        (height <= room).then_some((cols, plan, height))
+    };
 
-    let cap = room.min(GRAPH_ROWS_MAX);
-    // Two borders and a row is the least a box can be.
-    if cap < 3 {
-        return None;
-    }
-    for col in cols.iter_mut() {
-        col.trim_to(cap);
-    }
-    let height = cols.iter().map(GraphCol::height).max().unwrap_or(0);
-    // A column of many one-row boxes can refuse to go below its cap — two
-    // borders apiece is a floor. Better no band than one that takes the rows
-    // the list was promised.
-    if height > room {
-        return None;
-    }
+    // Two passes at most. If the chain will not fit with a box opened, it is
+    // drawn folded instead — a click that makes the whole graph disappear is
+    // very much worse than one that appears to do nothing, and the band is
+    // the only thing on screen saying what the run is doing.
+    let (cols, plan, height) = settle(true).or_else(|| settle(false))?;
     let height = height as u16;
     // What the empty space to the right of the chain is for: the columns that
     // didn't fit, or — when there is only one — why there is no arrow in a
@@ -6102,7 +6143,7 @@ fn workflow_graph_below(f: &mut Frame, area: Rect, state: &AppState) -> Rect {
         Paragraph::new(graph_caption(&detail.run, state.tick_count, theme)),
         inset(chunks[1]),
     );
-    render_run_graph(f, inset(chunks[2]), theme, state.tick_count, &band);
+    render_run_graph(f, inset(chunks[2]), state, &band);
     chunks[0]
 }
 
@@ -6125,7 +6166,8 @@ struct GraphBand {
 /// to finish before the next column starts, which is the question a graph is
 /// asked. Stacking the legs the way the web page does would cost a row each,
 /// and the column has already spent its rows on jobs.
-fn render_run_graph(f: &mut Frame, area: Rect, theme: &Theme, tick: u64, band: &GraphBand) {
+fn render_run_graph(f: &mut Frame, area: Rect, state: &AppState, band: &GraphBand) {
+    let (theme, tick) = (&state.theme, state.tick_count);
     let GraphBand { cols, plan, note, .. } = band;
     // Fitted together rather than one at a time, so two names that would cut
     // down to the same thing are cut differently instead.
@@ -6157,6 +6199,7 @@ fn render_run_graph(f: &mut Frame, area: Rect, theme: &Theme, tick: u64, band: &
     for (ci, col) in cols.iter().enumerate() {
         for (bi, b) in col.boxes.iter().enumerate() {
             draw_graph_box(f, placed[ci][bi], b, &labels[label..], plan.meta_w, tick, theme);
+            register_graph_hits(state, placed[ci][bi], b);
             label += b.rows.len();
             // The arrow leaves this box only if something is waiting on it,
             // and lands on the next column rather than in the air beside it.
@@ -6231,13 +6274,77 @@ fn graph_connector(crossing: bool, tick: u64, theme: &Theme) -> Vec<Span<'static
 }
 
 /// A column's box, resolved to text before anything decides how wide it may be.
-fn graph_box(g: &NodeGroup, detail: &RunDetail, tick: u64) -> GraphBox {
-    let rows: Vec<GraphRow> = g.nodes.iter().map(|n| graph_row(n, detail, tick)).collect();
+fn graph_box(
+    g: &NodeGroup,
+    detail: &RunDetail,
+    tick: u64,
+    open: &dyn Fn(&str) -> bool,
+) -> GraphBox {
+    let rows: Vec<GraphRow> = g
+        .nodes
+        .iter()
+        .flat_map(|n| graph_rows(n, detail, tick, open))
+        .collect();
     let status = worst_status(rows.iter().map(|r| r.status));
-    GraphBox { rows, feeds: g.feeds, status, hidden: 0 }
+    // A folded matrix carries a toggle too, so `open` is what the box is
+    // actually showing rather than merely what could be clicked.
+    let is_open = g
+        .nodes
+        .iter()
+        .any(|n| matches!(n, RunNode::Matrix { key, .. } if open(key)));
+    GraphBox { rows, feeds: g.feeds, status, hidden: 0, open: is_open }
 }
 
 /// What one node of the graph says: its verdict, its name, and its numbers.
+///
+/// One row, except for a matrix the user has opened: that is a row naming the
+/// box and a row per leg. A matrix folds by default — five legs of one job are
+/// one thing the next column waits for, which is the question a graph is
+/// asked — and unfolds when someone wants the legs themselves, which is the
+/// question the *list* is usually opened for.
+fn graph_rows(
+    node: &RunNode,
+    detail: &RunDetail,
+    tick: u64,
+    open: &dyn Fn(&str) -> bool,
+) -> Vec<GraphRow> {
+    if let RunNode::Matrix { key, legs } = node
+        && open(key)
+    {
+        let jobs: Vec<&Job> = legs.iter().map(|&i| &detail.jobs[i]).collect();
+        let status = worst_status(jobs.iter().map(|j| j.status));
+        let dur = group_secs(&jobs)
+            .map(|s| format!("  {}", format_step_dur(s as f64)))
+            .unwrap_or_default();
+        let mut rows = vec![GraphRow {
+            glyph: animated_glyph(status, tick).to_string(),
+            name: format!("− Matrix: {key}"),
+            meta: format!("{} legs{dur}", legs.len()),
+            status,
+            toggle: Some(key.clone()),
+        }];
+        rows.extend(jobs.iter().map(|j| GraphRow {
+            glyph: animated_glyph(j.status, tick).to_string(),
+            // The box above already says `build`; repeating it on every leg
+            // spends the width the part that differs needs.
+            name: format!(
+                "  {}",
+                j.name.strip_prefix(&format!("{key} ")).unwrap_or(&j.name)
+            ),
+            meta: j
+                .duration_secs()
+                .map(|s| format_step_dur(s as f64))
+                .unwrap_or_default(),
+            status: j.status,
+            // Every leg folds the box, so closing it does not mean hunting
+            // for the one line that opened it.
+            toggle: Some(key.clone()),
+        }));
+        return rows;
+    }
+    vec![graph_row(node, detail, tick)]
+}
+
 fn graph_row(node: &RunNode, detail: &RunDetail, tick: u64) -> GraphRow {
     match node {
         RunNode::Job(ji) => {
@@ -6258,6 +6365,7 @@ fn graph_row(node: &RunNode, detail: &RunDetail, tick: u64) -> GraphRow {
                     .map(|s| format_step_dur(s as f64))
                     .unwrap_or_default(),
                 status: job.status,
+                toggle: None,
             }
         }
         // A stage the run has not reached: drawn, but drawn as nothing having
@@ -6283,6 +6391,9 @@ fn graph_row(node: &RunNode, detail: &RunDetail, tick: u64) -> GraphRow {
                 },
                 meta: String::new(),
                 status,
+                // Nothing to unfold: the run has not created the legs, so
+                // there is no list behind this box yet.
+                toggle: None,
             }
         }
         RunNode::Matrix { key, legs } => {
@@ -6293,11 +6404,40 @@ fn graph_row(node: &RunNode, detail: &RunDetail, tick: u64) -> GraphRow {
                 .unwrap_or_default();
             GraphRow {
                 glyph: animated_glyph(status, tick).to_string(),
-                name: format!("Matrix: {key}"),
+                // The marker is the whole advertisement that the box opens.
+                // Not the list's own `▸`: inside a band that glyph is the
+                // arrow head between two stages, and one shape must not mean
+                // two things a few columns apart.
+                name: format!("+ Matrix: {key}"),
                 meta: format!("{} legs{dur}", legs.len()),
                 status,
+                toggle: Some(key.clone()),
             }
         }
+    }
+}
+
+/// Make a box's matrix rows clickable.
+///
+/// Registered per row rather than per box, because a box can hold a matrix
+/// and an ordinary job side by side and only one of them folds. Row `i` of a
+/// box sits one line inside its border, which is where `draw_graph_box` puts
+/// it — the two walk the same rows in the same order.
+fn register_graph_hits(state: &AppState, area: Rect, b: &GraphBox) {
+    // The "+N more" line stands for rows that are not on screen, so it is not
+    // any one of them to click.
+    let real = if b.hidden > 0 { b.drawn() - 1 } else { b.drawn() };
+    let mut hits = state.hits.borrow_mut();
+    for (i, row) in b.rows.iter().take(real).enumerate() {
+        let Some(key) = &row.toggle else { continue };
+        let y = area.y + 1 + i as u16;
+        if y >= area.bottom().saturating_sub(1) {
+            break;
+        }
+        hits.push((
+            Rect { x: area.x + 1, y, width: area.width.saturating_sub(2), height: 1 },
+            Hit::GraphNode(key.clone()),
+        ));
     }
 }
 
@@ -6589,7 +6729,7 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
         ])
         .split(inner);
     if let Some(band) = &band {
-        render_run_graph(f, inner_chunks[1], theme, state.tick_count, band);
+        render_run_graph(f, inner_chunks[1], state, band);
     }
 
     if let (Some(d), true) = (digest, digest_h > 0) {
@@ -6969,7 +7109,7 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
         ])
         .split(area);
     if let Some(band) = &band {
-        render_run_graph(f, chunks[1], theme, state.tick_count, band);
+        render_run_graph(f, chunks[1], state, band);
     }
 
     // Drawn before the step lists, whose section returns early when a run has
@@ -9433,12 +9573,149 @@ jobs:
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The band's box rows, so a test can ask what the chain says without the
+    /// job list underneath answering for it.
+    fn band_of(out: &str) -> String {
+        out.lines()
+            .filter(|l| l.matches('╭').count() > 1 || l.contains('│') && l.contains('▸')
+                || l.matches('╰').count() > 1
+                || (l.contains('│') && l.contains("  ") && l.matches('│').count() > 2))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Does the chain exist at all? Its box tops are the one thing on screen
+    /// that draws several rounded corners on a single row.
+    fn has_band(out: &str) -> bool {
+        out.lines().any(|l| l.matches('╭').count() > 1)
+    }
+
+    /// A matrix is one node of a chain by default — five legs of one job are
+    /// one thing the next column waits for. Clicking it says "show me the
+    /// legs anyway", and clicking again puts it back.
+    #[test]
+    fn clicking_a_matrix_box_unfolds_it_and_clicking_again_folds_it() {
+        let mut st = a_chained_run();
+        st.view = View::RunDetail;
+
+        let folded = band_of(&draw_detail(&st, 120, 28));
+        assert!(folded.contains("+ Matrix: build"), "not folded by default:\n{folded}");
+        assert!(!folded.contains("db-backup"), "legs before a click:\n{folded}");
+
+        st.toggle_graph_box("build");
+        let open = band_of(&draw_detail(&st, 120, 28));
+        assert!(open.contains("− Matrix: build"), "no open marker:\n{open}");
+        for leg in ["db-backup", "gojobi", "ingestor", "ollama", "wecker"] {
+            assert!(open.contains(leg), "leg {leg} missing:\n{open}");
+        }
+
+        st.toggle_graph_box("build");
+        let refolded = band_of(&draw_detail(&st, 120, 28));
+        assert_eq!(refolded, folded, "folding again did not undo it");
+        std::fs::remove_dir_all(chained_run_dir()).ok();
+    }
+
+    /// Every row of an open box folds it, so closing costs no hunting for the
+    /// one line that opened it — and a folded box is clickable on its only row.
+    #[test]
+    fn every_row_of_a_matrix_box_is_a_click_target() {
+        let mut st = a_chained_run();
+        st.view = View::RunDetail;
+
+        let keys = |st: &AppState| -> usize {
+            st.hits.borrow_mut().clear();
+            draw_detail(st, 120, 28);
+            st.hits
+                .borrow()
+                .iter()
+                .filter(|(_, h)| matches!(h, Hit::GraphNode(k) if k == "build"))
+                .count()
+        };
+        assert_eq!(keys(&st), 1, "a folded box is one target");
+        st.toggle_graph_box("build");
+        // The header and all five legs.
+        assert_eq!(keys(&st), 6, "an open box is clickable on every row");
+        std::fs::remove_dir_all(chained_run_dir()).ok();
+    }
+
+    /// The height rule that decides whether this feels solid: opening a box
+    /// asks for rows, and if they are not there the chain is drawn folded
+    /// instead. A click that makes the whole graph disappear is very much
+    /// worse than one that appears to do nothing.
+    #[test]
+    fn opening_a_matrix_never_costs_the_band_itself() {
+        let mut st = a_chained_run();
+        st.view = View::RunDetail;
+        let mut ever_fell_back = false;
+        for h in 9..32u16 {
+            let folded = draw_detail(&st, 120, h);
+            st.toggle_graph_box("build");
+            let opened = draw_detail(&st, 120, h);
+            st.toggle_graph_box("build");
+            if !has_band(&folded) {
+                continue;
+            }
+            assert!(has_band(&opened), "opening took the band away at h={h}:\n{opened}");
+            // Either it opened, or it stayed folded because there was no room
+            // — never a box that claims to be open and shows nothing.
+            let band = band_of(&opened);
+            if band.contains("+ Matrix") {
+                ever_fell_back = true;
+            } else {
+                assert!(band.contains("db-backup"), "open but empty at h={h}:\n{band}");
+            }
+        }
+        assert!(ever_fell_back, "the folded fallback was never exercised");
+        std::fs::remove_dir_all(chained_run_dir()).ok();
+    }
+
+    /// The box that was *asked* to say more must not be the first one
+    /// silenced: when a column has to shrink, every other box gives up its
+    /// rows before the open one does.
+    #[test]
+    fn an_open_box_gives_up_its_rows_last() {
+        let mut col = GraphCol {
+            boxes: vec![
+                GraphBox {
+                    rows: (0..6).map(|i| test_row(&format!("quiet{i}"))).collect(),
+                    feeds: true,
+                    status: Status::Success,
+                    hidden: 0,
+                    open: false,
+                },
+                GraphBox {
+                    rows: (0..6).map(|i| test_row(&format!("asked{i}"))).collect(),
+                    feeds: false,
+                    status: Status::Success,
+                    hidden: 0,
+                    open: true,
+                },
+            ],
+        };
+        // Two six-row boxes, two borders each and a gap: 17 rows down to 13,
+        // so four have to go — and all four come off the quiet box.
+        col.trim_to(13);
+        assert_eq!(col.boxes[1].hidden, 0, "the open box gave first");
+        assert_eq!(col.boxes[0].hidden, 4, "the quiet box should have given");
+    }
+
+    fn test_row(name: &str) -> GraphRow {
+        GraphRow {
+            glyph: "✓".into(),
+            name: name.into(),
+            meta: String::new(),
+            status: Status::Success,
+            toggle: None,
+        }
+    }
+
     #[test]
     fn the_run_graph_chains_the_stages_left_to_right() {
         let mut st = a_chained_run();
         st.view = View::RunDetail;
         let out = draw_detail(&st, 120, 28);
-        assert!(out.contains("Matrix: build"), "the matrix is one box:\n{out}");
+        // Folded, and saying so: the `+` is what advertises that it opens.
+        assert!(out.contains("+ Matrix: build"), "the matrix is one box:\n{out}");
         assert!(out.contains("5 legs"), "{out}");
         assert!(out.contains("──▸"), "stages are chained:\n{out}");
         // Four stages, so three arrows: the commit check, the matrix — folded

@@ -71,13 +71,20 @@ pub enum DetailItem {
 /// the click handler never re-derives table offsets — it asks the frame that
 /// was actually drawn. The index is into the view's own list (repos, runs, …),
 /// not into table rows, so headings and scrolling are already accounted for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hit {
     Repo(usize),
     Workflow(usize),
     Run(usize),
     DetailItem(usize),
     GitEntry(usize),
+    /// A matrix box in a graph band, by its matrix key. Clicking it unfolds
+    /// the box into its legs, and clicking it again folds it back.
+    ///
+    /// Carries the key rather than an index because the band is rebuilt from
+    /// scratch every frame and a position in it means nothing between two of
+    /// them — the key is the one thing about a matrix that holds still.
+    GraphNode(String),
 }
 
 /// The part of a failed run's log worth reading before opening the log at all:
@@ -1979,6 +1986,15 @@ pub struct AppState {
     /// Matrix boxes the user has folded or unfolded by hand, by job key.
     /// Anything not in here follows [`AppState::group_is_open`]'s default.
     pub detail_group_open: HashMap<String, bool>,
+    /// Matrix boxes opened in a *graph band*, by matrix key.
+    ///
+    /// Deliberately not [`detail_group_open`](Self::detail_group_open), which
+    /// is the run page's job list. There a box opens itself when a leg is
+    /// worth looking at, and the same default here would make the band change
+    /// height on its own the moment a leg went red. A band that resizes
+    /// unasked is the one thing that makes the view under it unreadable, so a
+    /// graph box stays folded until it is clicked.
+    pub graph_open: HashSet<String>,
     /// Parsed workflow files, by [`graph_key`] — the checkout they were read
     /// from and the file's name in it — each stamped with the file's
     /// modification time so an edit in the checkout re-reads it. A `None`
@@ -2371,6 +2387,7 @@ impl AppState {
             run_stages: Vec::new(),
             run_stages_known: false,
             detail_group_open: HashMap::new(),
+            graph_open: HashSet::new(),
             workflow_graphs: HashMap::new(),
             repo_root: None,
             detail_cursor: 0,
@@ -2854,6 +2871,19 @@ impl AppState {
         legs.iter()
             .filter_map(|&i| jobs?.get(i))
             .any(|j| j.status != Status::Success && j.status != Status::Skipped)
+    }
+
+    /// Is this matrix unfolded in the graph band? Folded unless asked — see
+    /// [`graph_open`](Self::graph_open).
+    pub fn graph_box_open(&self, key: &str) -> bool {
+        self.graph_open.contains(key)
+    }
+
+    /// Unfold a folded graph box, fold an unfolded one.
+    pub fn toggle_graph_box(&mut self, key: &str) {
+        if !self.graph_open.remove(key) {
+            self.graph_open.insert(key.to_string());
+        }
     }
 
     /// Fold an open matrix box, unfold a shut one.

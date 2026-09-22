@@ -3620,7 +3620,7 @@ async fn handle_click(
         .borrow()
         .iter()
         .find(|(r, _)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
-        .map(|(_, h)| *h);
+        .map(|(_, h)| h.clone());
     let Some(hit) = hit else { return };
     // The view guard looks redundant — hits come from the frame this view just
     // drew — but it keeps a click racing a view switch from moving a cursor it
@@ -3653,6 +3653,9 @@ async fn handle_click(
                 g.cursor = i;
             }
         }
+        // Not guarded by view: a band is the same widget wherever it is
+        // drawn, and folding a box is the same gesture on all of them.
+        Hit::GraphNode(key) => state.toggle_graph_box(&key),
         _ => {}
     }
     if open {
@@ -5123,6 +5126,7 @@ fn switch_to_selected_repo(
     state.repo_root = local_path.clone();
     state.workflow_graphs.clear();
     state.detail_group_open.clear();
+    state.graph_open.clear();
     // Another repo's history is not this one's — and a row must not inherit a
     // flash from the repo that used to be under it.
     state.repo_runs.clear();
