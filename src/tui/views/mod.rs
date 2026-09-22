@@ -1853,6 +1853,30 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
+    // The stage chain of whatever the cursor's repo is running, or last ran,
+    // above the table: GitHub's own picture of the workflow, on the view jog
+    // actually lands on rather than three keystrokes into it. It is given room
+    // on the same terms the live strip is — only while the list below it can
+    // still show a useful number of rows, which `graph_band` settles — and it
+    // simply isn't there for a row whose shape jog cannot read.
+    let inner = match dash_graph_band(state, inner) {
+        Some((caption, band)) => {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(band.height),
+                    Constraint::Length(1),
+                    Constraint::Min(0),
+                ])
+                .split(inner);
+            f.render_widget(Paragraph::new(caption), split[0]);
+            render_run_graph(f, split[1], theme, state.tick_count, &band);
+            split[3]
+        }
+        None => inner,
+    };
+
     // What fits. Columns are dropped by how much they add per column of width,
     // rather than letting every one of them shrink until they all truncate —
     // eight half-legible columns are worse than five whole ones.
@@ -5956,6 +5980,67 @@ fn graph_band(
     Some(GraphBand { cols, plan, note, height })
 }
 
+/// The dashboard's graph band: the stage chain of the run on the row under the
+/// cursor, and the one line above it that says whose run that is.
+///
+/// The caption is not decoration. The chain is drawn at the top of the view
+/// while the row it belongs to can be anywhere in the table below — without a
+/// line naming the workflow, the branch and how long ago, the boxes are a
+/// picture of nothing in particular.
+///
+/// `None` whenever the chain would be a guess: a row with no jobs fetched yet,
+/// and — the common one — a repo whose workflow file jog cannot read, because
+/// the `needs:` edges are the entire content of a graph and inventing them
+/// would make every run look like one that fans out from nothing.
+fn dash_graph_band(state: &AppState, area: Rect) -> Option<(Line<'static>, GraphBand)> {
+    let theme = &state.theme;
+    let (card, detail) = state.dash_graph_target()?;
+    if !state.dash_graph_known(&card.spec, detail) {
+        return None;
+    }
+    // Two rows of the area are the caption and the blank line under the
+    // chain; the band must settle against what is left, not against the whole
+    // pane, or it takes the rows the table was promised.
+    let room = Rect {
+        height: area.height.checked_sub(2)?,
+        ..area
+    };
+    let stages = state.dash_stages(&card.spec, detail);
+    let band = graph_band(state, detail, &stages, true, room)?;
+    // A band with no columns is the "order unknown" note, which has just been
+    // ruled out — but the table's rows are too dear to spend three of them on
+    // a sentence either way.
+    if band.cols.is_empty() {
+        return None;
+    }
+
+    let run = &detail.run;
+    let (when, when_style) = relative_styled(run.updated_at, theme);
+    let caption = Line::from(vec![
+        Span::styled(
+            animated_glyph(run.status, state.tick_count),
+            style_for_status(run.status, theme),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            truncate(&run.display_title, 40),
+            Style::default().fg(theme.text_bright).bold(),
+        ),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            truncate(&run.head_branch, 28),
+            Style::default().fg(theme.accent),
+        ),
+        Span::styled("  · ", Style::default().fg(theme.border_dim)),
+        Span::styled(when, when_style),
+        Span::styled(
+            format!("  · {}", format_elapsed(elapsed_seconds(run))),
+            Style::default().fg(theme.text_muted),
+        ),
+    ]);
+    Some((caption, band))
+}
+
 /// A graph settled against an area: what to draw, how wide, how tall, and what
 /// the space beside it says.
 struct GraphBand {
@@ -9915,6 +10000,128 @@ jobs:
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A dashboard whose cursor repo has a checkout, a chained workflow file
+    /// on disk, and a run part-way through it — everything the graph band
+    /// needs, which is what makes the "without it" tests below meaningful.
+    fn dashboard_with_a_chain(dir_tag: &str) -> (AppState, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("jog-dash-{dir_tag}-{}", std::process::id()));
+        let wf = root.join(".github").join("workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("deploy.yml"),
+            "jobs:\n  lint:\n  unit:\n  build:\n    needs: [lint, unit]\n  ship:\n    needs: [build]\n",
+        )
+        .unwrap();
+
+        let mut st = dashboard_with_live_ci();
+        st.repo_cursor = 0;
+        st.repos[0].path = Some(root.clone());
+        let run = st.repos[0].runs[0].clone();
+        let done = |name: &str| {
+            let mut j = a_job(name, &[("Checkout", Status::Success)]);
+            j.status = Status::Success;
+            j
+        };
+        let jobs = vec![
+            done("lint"),
+            done("unit"),
+            a_job("build", &[("Push image", Status::Running)]),
+        ];
+        st.warm_dash_graph("muufree/backend", &run);
+        st.run_progress.insert(
+            "muufree/backend".into(),
+            vec![crate::provider::RunDetail { run, jobs }],
+        );
+        (st, root)
+    }
+
+    /// The whole point of the band: GitHub's picture of the workflow, on the
+    /// view jog opens on rather than three keystrokes into it.
+    #[test]
+    fn the_dashboard_draws_the_cursor_repos_stage_chain() {
+        let (st, root) = dashboard_with_a_chain("chain");
+        let out = draw_repos(&st, 150, 30);
+
+        // Every stage of the run, in its own box, chained left to right.
+        for job in ["lint", "unit", "build"] {
+            assert!(out.contains(job), "no {job} in the band:\n{out}");
+        }
+        assert!(out.contains('▸'), "no arrow between the stages:\n{out}");
+        // And the line that says whose run it is — the row itself can be
+        // anywhere in the table below.
+        assert!(out.contains("Deploy to Stage"), "no caption:\n{out}");
+
+        // The table is still the view: the band sits above it, it does not
+        // replace it.
+        assert!(out.contains("muufree/website"), "the table went missing:\n{out}");
+        assert!(out.contains("Local branch"), "the header went missing:\n{out}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The band is only ever as true as the workflow file behind it. Without
+    /// one, every job lands in the first column — which draws as a workflow
+    /// where nothing waits for anything, a claim jog has no grounds for. The
+    /// dashboard has no rows to spare for saying so, so it draws nothing.
+    #[test]
+    fn the_dashboard_draws_no_chain_for_a_repo_it_cannot_read() {
+        let (mut st, root) = dashboard_with_a_chain("noroot");
+        let with_chain = draw_repos(&st, 150, 30);
+
+        st.repos[0].path = None;
+        let without = draw_repos(&st, 150, 30);
+        assert!(!without.contains('▸'), "a chain with no file behind it:\n{without}");
+        // And the rows the band was using go back to the table, which starts
+        // that much higher up the pane.
+        let header_at = |out: &str| {
+            out.lines()
+                .position(|l| l.contains("Local branch"))
+                .expect("a table header")
+        };
+        assert!(
+            header_at(&without) < header_at(&with_chain),
+            "the band kept its rows:\n{without}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A row with something in flight has its jobs polled for the activity
+    /// strip; a row that has gone quiet does not, and a graph of what just
+    /// happened is the one people stand in front of. `dash_graphs` is where
+    /// that lands, and the band has to read it.
+    #[test]
+    fn the_dashboard_chain_outlives_the_run_that_drew_it() {
+        let (mut st, root) = dashboard_with_a_chain("settled");
+        let live = st.run_progress.remove("muufree/backend").unwrap();
+        let mut settled = live.into_iter().next().unwrap();
+        settled.run.status = Status::Success;
+        for job in &mut settled.jobs {
+            job.status = Status::Success;
+        }
+        st.repos[0].runs[0].status = Status::Success;
+        st.dash_graphs.insert("muufree/backend".into(), settled);
+
+        let out = draw_repos(&st, 150, 30);
+        assert!(out.contains("ship") || out.contains("build"), "no band:\n{out}");
+        assert!(out.contains('▸'), "no arrow between the stages:\n{out}");
+        // Nothing is crossing an edge of a run that has landed. Asked of the
+        // band's own rows: the live strip along the bottom draws its progress
+        // gauge out of the same heavy rule.
+        let edges: String = out.lines().filter(|l| l.contains('▸')).collect();
+        assert!(!edges.contains('━'), "a finished run holds still:\n{out}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The table is the view. A terminal with barely enough rows for the list
+    /// must not spend a third of them on a picture.
+    #[test]
+    fn a_short_dashboard_keeps_its_rows_for_the_table() {
+        let (st, root) = dashboard_with_a_chain("short");
+        let out = draw_repos(&st, 150, 12);
+        assert!(!out.contains('▸'), "the band took the table's rows:\n{out}");
+        assert!(out.contains("muufree/website"), "{out}");
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

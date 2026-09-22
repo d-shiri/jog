@@ -54,6 +54,12 @@ pub enum AppEvent {
     /// Jobs and steps of the run currently in flight on one dashboard row —
     /// what the activity strip needs to name the step, not just the workflow.
     RepoProgressLoaded(String, RunDetail),
+    /// Jobs of the *latest* run on one dashboard row — what the graph band
+    /// over the cursor's repo is drawn from once that run has settled and
+    /// `RepoProgressLoaded` has stopped carrying it. Repo, the run asked
+    /// about, and the answer — `None` when the fetch failed, which is what
+    /// releases the row to be asked again.
+    DashGraphLoaded(String, u64, Option<RunDetail>),
     /// Working-tree state for a local checkout.
     GitStatusLoaded(String, crate::git::RepoStatus),
     /// The combined working-tree diff: repo spec, then every changed file with
@@ -771,6 +777,11 @@ async fn event_loop(
                             state.clear_api_hold();
                         }
                         sync_repo_progress(&provider, state, &spec, &tx);
+                        // The graph band wants the cursor row's latest run, and
+                        // this is the first moment there is one to ask about —
+                        // waiting for the next poll would leave the view jog
+                        // opens on without its picture for a whole interval.
+                        maybe_fetch_dash_graph(state, &provider, &tx);
                         state.pending = state.pending.saturating_sub(1);
                     }
                     AppEvent::RepoCardFailed(spec, err) => {
@@ -824,6 +835,14 @@ async fn event_loop(
                         // Only fold in detail for a run the row is still waiting
                         // on: a push during the fetch means this answer
                         // describes a run that has already been superseded.
+                        // A run that has just landed is the one the graph band
+                        // most wants: it is the picture of what happened. Kept
+                        // here rather than re-fetched a moment later, when the
+                        // row's poll drops it out of `run_progress`.
+                        if detail.run.status.is_terminal() {
+                            state.warm_dash_graph(&spec, &detail.run);
+                            state.dash_graphs.insert(spec.clone(), detail.clone());
+                        }
                         if let Some(ds) = state.run_progress.get_mut(&spec)
                             && let Some(i) = ds.iter().position(|d| d.run.id == detail.run.id)
                         {
@@ -839,6 +858,20 @@ async fn event_loop(
                             }
                         }
                         note_all_green(state);
+                    }
+                    AppEvent::DashGraphLoaded(spec, run_id, detail) => {
+                        // Cleared whichever way the fetch went: a row held by a
+                        // request that failed would never be asked again.
+                        if state.dash_graph_pending == Some(run_id) {
+                            state.dash_graph_pending = None;
+                        }
+                        if let Some(detail) = detail {
+                            // The `needs:` edges come off the workflow file in
+                            // that row's own checkout, read here rather than
+                            // on every frame the band is drawn.
+                            state.warm_dash_graph(&spec, &detail.run);
+                            state.dash_graphs.insert(spec, detail);
+                        }
                     }
                     AppEvent::GitStatusLoaded(spec, status) => {
                         if let Some(card) = state.repos.iter_mut().find(|c| c.spec == spec) {
@@ -1195,6 +1228,10 @@ async fn event_loop(
                                 // terminal is wide enough to be showing one.
                                 if !held {
                                     spawn_dash_tail(&provider, state, &tx);
+                                    // Catches the band up when the cursor has
+                                    // not moved but the row under it has: the
+                                    // first load, and every new run after it.
+                                    maybe_fetch_dash_graph(state, &provider, &tx);
                                 }
                             }
                             _ if held => {}
@@ -1679,8 +1716,10 @@ async fn handle_key(
         View::Repos => {
             if key_is(&key, km.down) || key.code == KeyCode::Down {
                 move_cursor(&mut state.repo_cursor, state.repos.len(), 1);
+                maybe_fetch_dash_graph(state, provider, tx);
             } else if key_is(&key, km.up) || key.code == KeyCode::Up {
                 move_cursor(&mut state.repo_cursor, state.repos.len(), -1);
+                maybe_fetch_dash_graph(state, provider, tx);
             } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter {
                 switch_to_selected_repo(state, provider, tx);
             } else if key_is(&key, km.git_view) {
@@ -2602,6 +2641,7 @@ fn commit_finder_choice(
     match kind {
         FinderKind::Repos => {
             state.repo_cursor = target.min(state.repos.len().saturating_sub(1));
+            maybe_fetch_dash_graph(state, provider, tx);
         }
         FinderKind::Workflows => {
             state.workflow_cursor = target.min(state.workflows.len().saturating_sub(1));
@@ -3546,6 +3586,7 @@ async fn handle_click(
         Hit::Repo(i) if state.view == View::Repos => {
             open = state.repo_cursor == i;
             state.repo_cursor = i;
+            maybe_fetch_dash_graph(state, provider, tx);
         }
         Hit::Workflow(i) if state.view == View::Workflows => {
             open = state.workflow_cursor == i;
@@ -4549,6 +4590,56 @@ fn sync_repo_progress(
             }
         });
     }
+}
+
+/// Fetch the jobs behind the dashboard graph band: the latest run on the row
+/// the cursor is resting on.
+///
+/// One request per row you stop at, and only once per run — a row whose CI
+/// hasn't moved is never asked twice, and a row with something in flight is
+/// never asked at all, because `sync_repo_progress` is already fetching
+/// exactly these jobs for the activity strip.
+///
+/// Deliberately outside the `pending` counter, on the same grounds as the
+/// row's own detail fetch: the band is a picture over the table, and a slow
+/// answer must not make the dashboard read as still loading — or pause the
+/// poll that keeps every other row current.
+fn maybe_fetch_dash_graph(
+    state: &mut AppState,
+    provider: &Arc<GitHubProvider>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    if state.view != View::Repos || state.api_held() {
+        return;
+    }
+    let Some(card) = state.repos.get(state.repo_cursor) else {
+        return;
+    };
+    if state.run_progress.contains_key(&card.spec) {
+        return;
+    }
+    let Some(run) = card.runs.first() else { return };
+    if state.dash_graphs.get(&card.spec).is_some_and(|d| d.run.id == run.id)
+        || state.dash_graph_pending == Some(run.id)
+    {
+        return;
+    }
+    let Some(rspec) = card.remote.as_deref().and_then(|r| RepoSpec::parse(r).ok()) else {
+        return;
+    };
+    let (spec, run) = (card.spec.clone(), run.clone());
+    let run_id = run.id;
+    state.dash_graph_pending = Some(run_id);
+    let p = provider.for_repo(rspec);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let detail = p
+            .run_jobs(run_id)
+            .await
+            .ok()
+            .map(|jobs| RunDetail { run, jobs });
+        let _ = tx.send(AppEvent::DashGraphLoaded(spec, run_id, detail));
+    });
 }
 
 /// Read a checkout's working-tree state off-thread.

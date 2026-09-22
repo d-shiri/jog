@@ -580,12 +580,7 @@ impl GitHubProvider {
             .body_to_string(resp)
             .await
             .context("read repo runs body")?;
-        #[derive(serde::Deserialize)]
-        struct RunsPage {
-            workflow_runs: Vec<gh_workflows::Run>,
-        }
-        let page: RunsPage = serde_json::from_str(&body).context("parse repo runs")?;
-        let runs: Vec<Run> = page.workflow_runs.into_iter().map(map_run).collect();
+        let runs = parse_runs_page(&body).context("parse repo runs")?;
         match etag {
             Some(etag) => {
                 lock(&self.run_etags).insert(key.to_string(), CachedRuns { etag, runs: runs.clone() });
@@ -676,6 +671,47 @@ impl GitHubProvider {
             .and_then(|c| c.decoded_content())
             .ok_or_else(|| anyhow!("no decodable content at {path}"))
     }
+}
+
+/// A repo-wide runs page, as the runs the rest of jog speaks in.
+///
+/// Parsed by hand rather than through octocrab's typed page because the
+/// endpoint names each run's workflow file and octocrab's model drops it.
+/// That name is the only thing that says which YAML a *dashboard row's* run
+/// came out of: every fallback jog has — the workflow being listed, the names
+/// in the workflow list — describes the repo it was launched in, and the
+/// dashboard's cursor is usually somewhere else. Without it the stage graph
+/// over a row would be drawn from another repo's `needs:` edges.
+fn parse_runs_page(body: &str) -> Result<Vec<Run>> {
+    #[derive(serde::Deserialize)]
+    struct RunsPage {
+        workflow_runs: Vec<RawRun>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawRun {
+        #[serde(flatten)]
+        run: gh_workflows::Run,
+        /// `.github/workflows/tests.yml`, when the endpoint says.
+        #[serde(default)]
+        path: Option<String>,
+    }
+    let page: RunsPage = serde_json::from_str(body)?;
+    Ok(page
+        .workflow_runs
+        .into_iter()
+        .map(|raw| {
+            let mut run = map_run(raw.run);
+            // Stored as the bare file name, which is what every other part of
+            // jog — the workflow list, the run history, the graph cache —
+            // calls a workflow by.
+            run.workflow_file = raw
+                .path
+                .as_deref()
+                .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
+                .filter(|f| !f.is_empty());
+            run
+        })
+        .collect())
 }
 
 fn map_run(r: gh_workflows::Run) -> Run {
@@ -1027,6 +1063,62 @@ mod tests {
         // And a workflow list that came back empty must not divide by zero
         // (the caller returns early on one, so this is only a guard).
         assert_eq!(runs_per_workflow(10, 0), 10);
+    }
+
+    /// One run out of a real `/actions/runs` body, trimmed to the fields
+    /// octocrab's model insists on plus the one it drops.
+    fn a_runs_page(path: &str) -> String {
+        let repo = r#"{"id":1,"node_id":"R_1","name":"backend","full_name":"muufree/backend","owner":{"login":"muufree","id":2,"node_id":"U_2","avatar_url":"https://x/a.png","gravatar_id":"","url":"https://api.github.com/users/muufree","html_url":"https://github.com/muufree","followers_url":"https://api.github.com/users/muufree/followers","following_url":"https://api.github.com/users/muufree/following{/other_user}","gists_url":"https://api.github.com/users/muufree/gists{/gist_id}","starred_url":"https://api.github.com/users/muufree/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/muufree/subscriptions","organizations_url":"https://api.github.com/users/muufree/orgs","repos_url":"https://api.github.com/users/muufree/repos","events_url":"https://api.github.com/users/muufree/events{/privacy}","received_events_url":"https://api.github.com/users/muufree/received_events","type":"User","site_admin":false},"private":false,"html_url":"https://github.com/muufree/backend","url":"https://api.github.com/repos/muufree/backend","fork":false}"#;
+        format!(
+            r#"{{"total_count":1,"workflow_runs":[{{
+              "id":42,"workflow_id":7,"node_id":"WFR_1","name":"Deploy to Stage",
+              "head_branch":"main","head_sha":"abc","run_number":11,"event":"push",
+              "status":"completed","conclusion":"success",
+              "created_at":"2026-09-22T10:00:00Z","updated_at":"2026-09-22T10:02:00Z",
+              "path":{path},
+              "url":"https://api.github.com/repos/muufree/backend/actions/runs/42",
+              "html_url":"https://github.com/muufree/backend/actions/runs/42",
+              "jobs_url":"https://api.github.com/repos/muufree/backend/actions/runs/42/jobs",
+              "logs_url":"https://api.github.com/repos/muufree/backend/actions/runs/42/logs",
+              "check_suite_url":"https://api.github.com/repos/muufree/backend/check-suites/9",
+              "artifacts_url":"https://api.github.com/repos/muufree/backend/actions/runs/42/artifacts",
+              "cancel_url":"https://api.github.com/repos/muufree/backend/actions/runs/42/cancel",
+              "rerun_url":"https://api.github.com/repos/muufree/backend/actions/runs/42/rerun",
+              "workflow_url":"https://api.github.com/repos/muufree/backend/actions/workflows/7",
+              "head_commit":{{"id":"abc","tree_id":"def","message":"ship it","timestamp":"2026-09-22T09:59:00Z",
+                "author":{{"name":"a","email":"a@b.c"}},"committer":{{"name":"a","email":"a@b.c"}}}},
+              "repository":{repo}
+            }}]}}"#
+        )
+    }
+
+    /// The whole dashboard graph hangs off this one field. octocrab's `Run`
+    /// has no `path`, so it is read back out of the body by hand — and if that
+    /// ever silently stops working, every row's stage chain quietly vanishes
+    /// with no error anywhere to say why.
+    #[test]
+    fn a_runs_page_carries_each_runs_workflow_file() {
+        let runs = parse_runs_page(&a_runs_page(r#"".github/workflows/deploy_to_stage.yml""#))
+            .expect("a runs page");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].display_title, "Deploy to Stage");
+        assert_eq!(runs[0].status, Status::Success);
+        // The bare name, which is what the rest of jog calls a workflow by.
+        assert_eq!(runs[0].workflow_file.as_deref(), Some("deploy_to_stage.yml"));
+    }
+
+    /// A body without the field still has to parse — it is the run list, and
+    /// losing it would blank every dashboard row over a missing graph.
+    #[test]
+    fn a_runs_page_without_a_path_is_still_a_runs_page() {
+        let body = a_runs_page("null");
+        let runs = parse_runs_page(&body).expect("a runs page");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].workflow_file, None);
+
+        let missing = body.replace("\"path\":null,", "");
+        let runs = parse_runs_page(&missing).expect("a runs page with no path at all");
+        assert_eq!(runs[0].workflow_file, None);
     }
 
     #[tokio::test]

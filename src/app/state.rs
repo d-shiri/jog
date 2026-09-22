@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -17,6 +17,19 @@ use crate::provider::github::{ApiError, Quota};
 use crate::provider::graph::{NodeGroup, RunNode, WorkflowGraph, shape, stages};
 use crate::provider::{Job, PrInfo, Run, RunDetail, Status, Workflow};
 
+
+/// Cache key for a parsed workflow file: which checkout it came out of, and
+/// its name inside it.
+///
+/// The name alone is not a key. A dashboard watching eight repos will be asked
+/// about eight different `tests.yml`, and answering one repo's question with
+/// another's `needs:` edges draws a chain that is simply not this run's.
+fn graph_key(root: Option<&Path>, file: &str) -> String {
+    match root {
+        Some(r) => format!("{}\u{1f}{file}", r.display()),
+        None => format!("\u{1f}{file}"),
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum DetailItem {
@@ -1938,10 +1951,15 @@ pub struct AppState {
     /// Matrix boxes the user has folded or unfolded by hand, by job key.
     /// Anything not in here follows [`AppState::group_is_open`]'s default.
     pub detail_group_open: HashMap<String, bool>,
-    /// Parsed workflow files, by file name, each stamped with the file's
+    /// Parsed workflow files, by [`graph_key`] — the checkout they were read
+    /// from and the file's name in it — each stamped with the file's
     /// modification time so an edit in the checkout re-reads it. A `None`
     /// parse is cached too: a repo without a checkout must not be re-read on
     /// every poll for an answer that will not change.
+    ///
+    /// Keyed by checkout as well as name because the dashboard asks about
+    /// several repos in one session, and `tests.yml` is a different file with
+    /// different `needs:` edges in each of them.
     pub workflow_graphs: HashMap<String, (Option<std::time::SystemTime>, Option<Arc<WorkflowGraph>>)>,
     /// The checkout jog was launched in, when there is one — where the
     /// workflow YAML behind `run_shape` is read from.
@@ -2166,6 +2184,18 @@ pub struct AppState {
     /// Entries are dropped the moment a run settles, so the strip appears and
     /// clears itself.
     pub run_progress: HashMap<String, Vec<RunDetail>>,
+    /// The jobs of each dashboard row's *latest* run, for the stage graph the
+    /// dashboard draws over the row under the cursor.
+    ///
+    /// `run_progress` covers anything in flight and is dropped the moment a
+    /// run settles — which is exactly when a graph is most worth looking at,
+    /// because it is the picture of what just happened. So a settled run's
+    /// jobs are fetched once, when the cursor comes to rest on its row, and
+    /// kept: one entry per repo, replaced when that repo's latest run changes.
+    pub dash_graphs: HashMap<String, RunDetail>,
+    /// The run a `dash_graphs` fetch is out for, so a cursor sitting on a row
+    /// asks once rather than once a poll.
+    pub dash_graph_pending: Option<u64>,
     /// Pushes being followed into CI — see [`PushWatch`]. A vec, not an option:
     /// a batch push starts one per repo.
     pub push_watches: Vec<PushWatch>,
@@ -2386,6 +2416,8 @@ impl AppState {
             poll_ticks: 50,
             last_poll_tick: 0,
             run_progress: HashMap::new(),
+            dash_graphs: HashMap::new(),
+            dash_graph_pending: None,
             push_watches: Vec::new(),
             git_poll_gate: HashMap::new(),
             all_green_tick: None,
@@ -2430,6 +2462,25 @@ impl AppState {
                 .find(|j| j.status == Status::Running)
                 .map(|j| (card.spec.as_str(), d, j))
         })
+    }
+
+    /// The run the dashboard's graph band is drawn from: the cursor row's,
+    /// live when that row has something in flight and its last one otherwise.
+    ///
+    /// In flight wins because that is the run the chain is *about* — the
+    /// arrow between two stages only marches while something is crossing it.
+    /// A quiet row falls back to the picture of what last happened on it,
+    /// which is what a dashboard is being asked the rest of the time.
+    pub fn dash_graph_target(&self) -> Option<(&RepoCard, &RunDetail)> {
+        let card = self.repos.get(self.repo_cursor)?;
+        // A run whose jobs haven't landed yet has no chain to draw, and an
+        // empty box where a graph was is worse than the table's own row.
+        let live = self
+            .run_progress
+            .get(&card.spec)
+            .and_then(|ds| ds.iter().find(|d| !d.jobs.is_empty()));
+        let settled = self.dash_graphs.get(&card.spec).filter(|d| !d.jobs.is_empty());
+        Some((card, live.or(settled)?))
     }
 
     /// Whether the repo the app is pointed at has a checkout on disk — i.e.
@@ -2622,8 +2673,55 @@ impl AppState {
     }
 
     fn graph_of(&self, run: &Run) -> Option<Arc<WorkflowGraph>> {
-        self.workflow_file_of(run)
-            .and_then(|f| self.workflow_graphs.get(&f))
+        let file = self.workflow_file_of(run)?;
+        self.cached_graph(self.repo_root.as_deref(), &file)
+    }
+
+    /// The dashboard twin of [`stages_of`](Self::stages_of): a row's run, read
+    /// against that row's own checkout.
+    pub fn dash_stages(&self, spec: &str, detail: &RunDetail) -> Vec<Vec<NodeGroup>> {
+        stages(&detail.jobs, self.dash_graph_of(spec, &detail.run).as_deref())
+    }
+
+    /// The dashboard twin of [`graph_known`](Self::graph_known).
+    pub fn dash_graph_known(&self, spec: &str, detail: &RunDetail) -> bool {
+        self.dash_graph_of(spec, &detail.run)
+            .is_some_and(|g| g.describes(&detail.jobs))
+    }
+
+    /// Read a dashboard row's workflow file into the cache — the mutable half
+    /// of [`dash_stages`](Self::dash_stages), called when its run arrives
+    /// rather than on every frame.
+    pub fn warm_dash_graph(&mut self, spec: &str, run: &Run) {
+        let (Some(root), Some(file)) = (self.checkout_of(spec), run.workflow_file.clone()) else {
+            return;
+        };
+        self.workflow_graph_in(Some(&root), &file);
+    }
+
+    /// The parsed shape behind a dashboard row's run.
+    ///
+    /// The file has to come off the run itself. `workflow_file_of`'s fallbacks
+    /// — the workflow being listed, the names in `self.workflows` — all
+    /// describe the repo jog was launched in, and on the dashboard the cursor
+    /// is usually somewhere else; taking them would draw one repo's `needs:`
+    /// edges over another repo's jobs.
+    fn dash_graph_of(&self, spec: &str, run: &Run) -> Option<Arc<WorkflowGraph>> {
+        let root = self.checkout_of(spec)?;
+        self.cached_graph(Some(&root), run.workflow_file.as_deref()?)
+    }
+
+    /// The checkout on disk behind a dashboard row, if it has one.
+    fn checkout_of(&self, spec: &str) -> Option<PathBuf> {
+        self.repos
+            .iter()
+            .find(|c| c.spec == spec)
+            .and_then(|c| c.path.clone())
+    }
+
+    fn cached_graph(&self, root: Option<&Path>, file: &str) -> Option<Arc<WorkflowGraph>> {
+        self.workflow_graphs
+            .get(&graph_key(root, file))
             .and_then(|(_, g)| g.clone())
     }
 
@@ -2631,17 +2729,20 @@ impl AppState {
     /// asked for. `None` without a checkout, or for a file that won't parse —
     /// the shape then falls back to reading GitHub's own leg naming.
     fn workflow_graph(&mut self, file: &str) -> Option<Arc<WorkflowGraph>> {
-        let path = self
-            .repo_root
-            .as_ref()
-            .map(|root| root.join(".github").join("workflows").join(file));
+        let root = self.repo_root.clone();
+        self.workflow_graph_in(root.as_deref(), file)
+    }
+
+    fn workflow_graph_in(&mut self, root: Option<&Path>, file: &str) -> Option<Arc<WorkflowGraph>> {
+        let path = root.map(|root| root.join(".github").join("workflows").join(file));
         // One stat per poll, against a file the editor next to jog may well be
         // rewriting: a workflow whose jobs were renamed an hour ago should not
         // keep being read through the shape it used to have.
         let stamp = path
             .as_ref()
             .and_then(|p| std::fs::metadata(p).ok()?.modified().ok());
-        if let Some((seen, hit)) = self.workflow_graphs.get(file)
+        let key = graph_key(root, file);
+        if let Some((seen, hit)) = self.workflow_graphs.get(&key)
             && *seen == stamp
         {
             return hit.clone();
@@ -2653,13 +2754,12 @@ impl AppState {
                 // A job that calls a reusable workflow is one job here and a
                 // whole file's worth of jobs in the run. Read that file too,
                 // or the run's chain stops at the call.
-                if let Some(root) = &self.repo_root {
+                if let Some(root) = root {
                     g.resolve_calls(root, 3);
                 }
                 Arc::new(g)
             });
-        self.workflow_graphs
-            .insert(file.to_string(), (stamp, parsed.clone()));
+        self.workflow_graphs.insert(key, (stamp, parsed.clone()));
         parsed
     }
 
