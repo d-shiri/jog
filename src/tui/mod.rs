@@ -60,6 +60,10 @@ pub enum AppEvent {
     /// about, and the answer — `None` when the fetch failed, which is what
     /// releases the row to be asked again.
     DashGraphLoaded(String, u64, Option<RunDetail>),
+    /// Jobs of the newest run of the workflow under the cursor, for the graph
+    /// band along the bottom of the Workflows view. The run asked about, and
+    /// the answer — `None` when the fetch failed.
+    WorkflowGraphLoaded(u64, Option<RunDetail>),
     /// Working-tree state for a local checkout.
     GitStatusLoaded(String, crate::git::RepoStatus),
     /// The combined working-tree diff: repo spec, then every changed file with
@@ -578,6 +582,11 @@ async fn event_loop(
                         state.repo_runs = runs;
                         let tracked = state.repo_runs.clone();
                         sync_active_progress(&provider, state, &tracked, &tx);
+                        // The graph band's first chance to learn which run to
+                        // draw: waiting for the next poll would leave the view
+                        // jog opens on without its picture for a whole
+                        // interval.
+                        maybe_fetch_workflow_graph(state, &provider, &tx);
                     }
                     AppEvent::WorkflowRunsPreviewLoaded(file, runs) => {
                         if state.workflow_preview_file.as_deref() == Some(file.as_str()) {
@@ -871,6 +880,20 @@ async fn event_loop(
                             // on every frame the band is drawn.
                             state.warm_dash_graph(&spec, &detail.run);
                             state.dash_graphs.insert(spec, detail);
+                        }
+                    }
+                    AppEvent::WorkflowGraphLoaded(run_id, detail) => {
+                        // Cleared whichever way the fetch went: a workflow held
+                        // by a request that failed would never be asked again.
+                        if state.workflow_graph_pending == Some(run_id) {
+                            state.workflow_graph_pending = None;
+                        }
+                        if let Some(detail) = detail {
+                            // The `needs:` edges come off the workflow file in
+                            // the checkout, read here rather than on every
+                            // frame the band is drawn.
+                            state.warm_workflow_graph(&detail.run);
+                            state.workflow_graph_run = Some(detail);
                         }
                     }
                     AppEvent::GitStatusLoaded(spec, status) => {
@@ -1251,6 +1274,12 @@ async fn event_loop(
                                     state.workflows_polled_tick = state.tick_count;
                                     spawn_repo_status_fetch(provider.clone(), tx.clone());
                                 }
+                                // Catches the band up when the cursor has not
+                                // moved but the workflow under it has run
+                                // again — and gives it its first run at all,
+                                // since this is the view jog lands on inside a
+                                // checkout.
+                                maybe_fetch_workflow_graph(state, &provider, &tx);
                             }
                             View::Watch => {
                                 if let Some(file) = state.workflow_for_runs.clone() {
@@ -1877,9 +1906,11 @@ async fn handle_key(
             if key_is(&key, km.down) || key.code == KeyCode::Down {
                 move_cursor(&mut state.workflow_cursor, state.workflows.len(), 1);
                 maybe_fetch_workflow_preview(state, provider, tx);
+                maybe_fetch_workflow_graph(state, provider, tx);
             } else if key_is(&key, km.up) || key.code == KeyCode::Up {
                 move_cursor(&mut state.workflow_cursor, state.workflows.len(), -1);
                 maybe_fetch_workflow_preview(state, provider, tx);
+                maybe_fetch_workflow_graph(state, provider, tx);
             } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter {
                 if let Some(w) = state.selected_workflow().cloned() {
                     state.switch_view(View::Runs);
@@ -2528,6 +2559,9 @@ fn open_finder(state: &mut AppState) {
                         DetailItem::Group(ni) => match &state.run_shape[*ni] {
                             RunNode::Matrix { key, .. } => format!("Matrix: {key}"),
                             RunNode::Job(ji) => detail.jobs[*ji].name.clone(),
+                            // `shape` emits no pending stages — only the
+                            // graph's `stages` does.
+                            RunNode::Pending { label, .. } => label.clone(),
                         },
                         DetailItem::Job(ji) => detail.jobs[*ji].name.clone(),
                         DetailItem::Step { job, step } => {
@@ -2646,6 +2680,7 @@ fn commit_finder_choice(
         FinderKind::Workflows => {
             state.workflow_cursor = target.min(state.workflows.len().saturating_sub(1));
             maybe_fetch_workflow_preview(state, provider, tx);
+            maybe_fetch_workflow_graph(state, provider, tx);
         }
         FinderKind::Runs => {
             state.run_cursor = target.min(state.runs.len().saturating_sub(1));
@@ -3489,6 +3524,7 @@ fn first_failed_item(state: &AppState) -> Option<usize> {
                         legs.iter().any(|&ji| detail.jobs[ji].status.is_failure())
                     }
                     RunNode::Job(ji) => detail.jobs[*ji].status.is_failure(),
+                    RunNode::Pending { .. } => false,
                 },
                 _ => false,
             })
@@ -3592,6 +3628,7 @@ async fn handle_click(
             open = state.workflow_cursor == i;
             state.workflow_cursor = i;
             maybe_fetch_workflow_preview(state, provider, tx);
+            maybe_fetch_workflow_graph(state, provider, tx);
         }
         Hit::Run(i) if state.view == View::Runs => {
             open = state.run_cursor == i;
@@ -4639,6 +4676,49 @@ fn maybe_fetch_dash_graph(
             .ok()
             .map(|jobs| RunDetail { run, jobs });
         let _ = tx.send(AppEvent::DashGraphLoaded(spec, run_id, detail));
+    });
+}
+
+/// Fetch the jobs behind the Workflows view's graph band: the newest run of
+/// the workflow the cursor is on.
+///
+/// Same bargain as [`maybe_fetch_dash_graph`]: one request per workflow you
+/// stop at, only once per run, and never for a run already in flight —
+/// `sync_active_progress` is fetching exactly those jobs for the strip along
+/// the bottom. Outside the `pending` counter, because the band is a picture
+/// over the lists and a slow answer must not make the view read as loading.
+fn maybe_fetch_workflow_graph(
+    state: &mut AppState,
+    provider: &Arc<GitHubProvider>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    if state.view != View::Workflows || state.api_held() {
+        return;
+    }
+    let Some(run) = state.workflow_latest_run() else {
+        return;
+    };
+    let (run_id, in_flight) = (run.id, !run.status.is_terminal());
+    if in_flight
+        || state.workflow_graph_pending == Some(run_id)
+        || state
+            .workflow_graph_run
+            .as_ref()
+            .is_some_and(|d| d.run.id == run_id)
+    {
+        return;
+    }
+    let run = run.clone();
+    state.workflow_graph_pending = Some(run_id);
+    let p = provider.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let detail = p
+            .run_jobs(run_id)
+            .await
+            .ok()
+            .map(|jobs| RunDetail { run, jobs });
+        let _ = tx.send(AppEvent::WorkflowGraphLoaded(run_id, detail));
     });
 }
 

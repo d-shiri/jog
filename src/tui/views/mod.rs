@@ -5088,6 +5088,9 @@ fn render_finder_overlay(f: &mut Frame, area: Rect, state: &AppState) {
 
 fn render_workflows(f: &mut Frame, area: Rect, state: &AppState) {
     let area = live_strip_below(f, area, state, &state.active_repo_progress());
+    // Between the lists and the strip: both of those are read as rows, and the
+    // chain is the one thing on this screen that is read across.
+    let area = workflow_graph_below(f, area, state);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
@@ -6014,19 +6017,24 @@ fn dash_graph_band(state: &AppState, area: Rect) -> Option<(Line<'static>, Graph
         return None;
     }
 
-    let run = &detail.run;
+    Some((graph_caption(&detail.run, state.tick_count, theme), band))
+}
+
+/// The line over a graph band that says whose run it is drawing.
+///
+/// Not decoration: a band is drawn at one edge of the view while the row it
+/// belongs to is somewhere else in it, and without the workflow, the branch
+/// and how long ago, the boxes are a picture of nothing in particular.
+fn graph_caption(run: &Run, tick: u64, theme: &Theme) -> Line<'static> {
     let (when, when_style) = relative_styled(run.updated_at, theme);
-    let caption = Line::from(vec![
-        Span::styled(
-            animated_glyph(run.status, state.tick_count),
-            style_for_status(run.status, theme),
-        ),
+    Line::from(vec![
+        Span::styled(animated_glyph(run.status, tick), style_for_status(run.status, theme)),
         Span::raw(" "),
         Span::styled(
             truncate(&run.display_title, 40),
             Style::default().fg(theme.text_bright).bold(),
         ),
-        Span::styled("  ", Style::default()),
+        Span::raw("  "),
         Span::styled(
             truncate(&run.head_branch, 28),
             Style::default().fg(theme.accent),
@@ -6037,8 +6045,62 @@ fn dash_graph_band(state: &AppState, area: Rect) -> Option<(Line<'static>, Graph
             format!("  · {}", format_elapsed(elapsed_seconds(run))),
             Style::default().fg(theme.text_muted),
         ),
-    ]);
-    Some((caption, band))
+    ])
+}
+
+/// The Workflows view's graph band, along the bottom of the whole pane.
+///
+/// Returns what is left of `area` for the lists above it. Full width rather
+/// than inside the preview pane on the right: a stage chain is read left to
+/// right and a real pipeline has more stages than two fifths of a terminal
+/// has room for — the same reason the activity strip below it is full width.
+///
+/// It draws the newest run of the workflow under the cursor, and it is not
+/// there at all for a workflow whose file jog cannot read: the `needs:` edges
+/// are the whole content of a graph, and without them every job lands in one
+/// column, which draws as a pipeline where nothing waits for anything.
+/// Rows the Workflows view's two lists keep for themselves before the band may
+/// have any. They are bordered and carry a header, so the six rows
+/// [`graph_band`] reserves against its own area — enough for a bare list —
+/// leave about three rows of content here. The lists are the view.
+const WORKFLOW_LIST_KEEP: u16 = 12;
+
+fn workflow_graph_below(f: &mut Frame, area: Rect, state: &AppState) -> Rect {
+    let theme = &state.theme;
+    let Some(detail) = state.workflow_graph_target() else {
+        return area;
+    };
+    if !state.graph_known(detail) {
+        return area;
+    }
+    // One row for the caption, one for the gap under the chain.
+    let Some(height) = area.height.checked_sub(2) else {
+        return area;
+    };
+    let room = Rect { height, ..area };
+    let stages = state.stages_of(detail);
+    let Some(band) = graph_band(state, detail, &stages, true, room) else {
+        return area;
+    };
+    if band.cols.is_empty() || area.height < band.height + 2 + WORKFLOW_LIST_KEEP {
+        return area;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(band.height),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    f.render_widget(
+        Paragraph::new(graph_caption(&detail.run, state.tick_count, theme)),
+        Rect { x: chunks[1].x + 1, width: chunks[1].width.saturating_sub(2), ..chunks[1] },
+    );
+    let chain = Rect { x: chunks[2].x + 1, width: chunks[2].width.saturating_sub(2), ..chunks[2] };
+    render_run_graph(f, chain, theme, state.tick_count, &band);
+    chunks[0]
 }
 
 /// A graph settled against an area: what to draw, how wide, how tall, and what
@@ -6193,6 +6255,31 @@ fn graph_row(node: &RunNode, detail: &RunDetail, tick: u64) -> GraphRow {
                     .map(|s| format_step_dur(s as f64))
                     .unwrap_or_default(),
                 status: job.status,
+            }
+        }
+        // A stage the run has not reached: drawn, but drawn as nothing having
+        // happened — no glyph that spins, no duration to report, and a grey
+        // that keeps the eye on the stages that have.
+        RunNode::Pending { key, label, matrix } => {
+            // Once the run itself has landed, a stage with no job behind it is
+            // not "still to come" — it was skipped, or the run stopped before
+            // reaching it. Saying so with a terminal status is what keeps the
+            // chain from holding an arrow marching into a run that is over.
+            let over = detail.run.status.is_terminal();
+            let status = if over { Status::Skipped } else { Status::Unknown };
+            GraphRow {
+                glyph: if over {
+                    animated_glyph(status, tick).to_string()
+                } else {
+                    "·".to_string()
+                },
+                name: if *matrix {
+                    format!("Matrix: {key}")
+                } else {
+                    label.clone()
+                },
+                meta: String::new(),
+                status,
             }
         }
         RunNode::Matrix { key, legs } => {
@@ -7091,6 +7178,8 @@ fn draw_watch_blocks(
 
     for ((node, &open), area) in nodes.iter().zip(open).zip(areas.iter()) {
         match node {
+            // Watch is built from `shape`, which emits no pending stages.
+            RunNode::Pending { .. } => {}
             RunNode::Job(ji) => draw_watch_job(buf, *area, &detail.jobs[*ji], open, state),
             RunNode::Matrix { key, legs } => {
                 draw_watch_matrix(buf, *area, key, legs, detail, state)
@@ -7103,6 +7192,7 @@ fn draw_watch_blocks(
 /// underneath — its steps, or a box's legs.
 fn watch_block_height(node: &RunNode, jobs: &[Job], open: bool) -> usize {
     match node {
+        RunNode::Pending { .. } => 0,
         RunNode::Job(ji) => 1 + if open { jobs[*ji].steps.len() } else { 0 },
         RunNode::Matrix { legs, .. } => {
             let rows: usize = legs
@@ -9741,6 +9831,162 @@ jobs:
             }],
         );
         st
+    }
+
+    /// [`single_repo_session`] with a real workflow file behind the deploy, so
+    /// the graph band has `needs:` edges to draw.
+    fn workflows_session_with_a_chain(tag: &str) -> (AppState, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("jog-wf-{tag}-{}", std::process::id()));
+        let wf = root.join(".github").join("workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("deploy_to_stage.yml"),
+            "jobs:\n  lint:\n    name: lint\n  build:\n    name: build gojobi\n    needs: [lint]\n  ship:\n    name: deploy\n    needs: [build]\n",
+        )
+        .unwrap();
+        let mut st = single_repo_session();
+        st.repo_root = Some(root.clone());
+        st.workflow_cursor = 0;
+        // The in-flight deploy, with the jobs the file names.
+        let run = st.repo_runs[0].clone();
+        let mut lint = a_job("lint", &[("Set up job", Status::Success)]);
+        lint.status = Status::Success;
+        st.warm_workflow_graph(&run);
+        st.run_progress.insert(
+            "vakanzo/vakanzo".into(),
+            vec![crate::provider::RunDetail {
+                run,
+                jobs: vec![
+                    lint,
+                    a_job("build gojobi", &[("Run docker/build-push-action@v6", Status::Running)]),
+                ],
+            }],
+        );
+        (st, root)
+    }
+
+    /// The view jog lands on inside a checkout is Workflows, not the
+    /// dashboard — so this is the band most people ever see. Full width, along
+    /// the bottom, because a chain is read across and a real pipeline has more
+    /// stages than a side pane has room for.
+    #[test]
+    fn the_workflows_view_draws_the_selected_workflows_chain_full_width() {
+        let (st, root) = workflows_session_with_a_chain("chain");
+        let out = draw_view(&st, 150, 30, render_workflows);
+
+        assert!(out.contains("lint"), "no first stage:\n{out}");
+        assert!(out.contains("build gojobi"), "no second stage:\n{out}");
+        assert!(out.contains('▸'), "no arrow between the stages:\n{out}");
+
+        // Full width, not inside a pane: the row the chain is drawn on has no
+        // pane border running through it, which every list row does. That is
+        // the whole reason it is down here rather than in the preview on the
+        // right — a chain is read across, and a real pipeline has more stages
+        // than two fifths of a terminal has room for.
+        let chain = out
+            .lines()
+            .find(|l| l.contains('▸'))
+            .expect("a chain row")
+            .to_string();
+        let list_row = out
+            .lines()
+            .find(|l| l.contains("deploy_to_stage.yml"))
+            .expect("a list row");
+        // Where the two panes meet. On every list row that column is a border;
+        // on the band's rows it is not, which is what "full width" means here.
+        let divider = list_row
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| *c == '│')
+            .map(|(i, _)| i)
+            .find(|i| *i > 40)
+            .expect("a pane divider");
+        assert_ne!(
+            chain.chars().nth(divider),
+            Some('│'),
+            "the chain is boxed into a pane:\n{chain}"
+        );
+
+        // And both lists are still there above it.
+        assert!(out.contains("Recent runs"), "the list went missing:\n{out}");
+        assert!(out.contains("deploy_to_stage.yml"), "{out}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The point of drawing the file's jobs and not just the run's: GitHub
+    /// creates a job only when its stage is reached, so a chain built from the
+    /// run alone is one box for the first half-minute and grows a stage at a
+    /// time. The shape should be whole from the start and fill in as it goes.
+    #[test]
+    fn the_chain_shows_the_whole_pipeline_before_the_run_reaches_it() {
+        let (mut st, root) = workflows_session_with_a_chain("pending");
+
+        // Nothing created yet — GitHub has accepted the run and no more.
+        let run = st.repo_runs[0].clone();
+        st.run_progress.insert(
+            "vakanzo/vakanzo".into(),
+            vec![crate::provider::RunDetail { run: run.clone(), jobs: Vec::new() }],
+        );
+        let cold = draw_view(&st, 150, 30, render_workflows);
+        for stage in ["lint", "build gojobi", "deploy"] {
+            assert!(cold.contains(stage), "no {stage} before the run got there:\n{cold}");
+        }
+        assert!(cold.contains('▸'), "no chain at all:\n{cold}");
+
+        // The first job lands. The shape does not change — the same stages are
+        // there, one of them is simply no longer waiting.
+        let mut lint = a_job("lint", &[("Set up job", Status::Success)]);
+        lint.status = Status::Success;
+        st.run_progress.insert(
+            "vakanzo/vakanzo".into(),
+            vec![crate::provider::RunDetail { run, jobs: vec![lint] }],
+        );
+        let warm = draw_view(&st, 150, 30, render_workflows);
+        let boxes = |out: &str| out.matches('╭').count();
+        assert_eq!(boxes(&cold), boxes(&warm), "the chain changed shape:\n{warm}");
+        assert!(warm.contains("✓ lint"), "the finished stage is not green:\n{warm}");
+        assert!(warm.contains("· deploy"), "later stages should still wait:\n{warm}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A stage with no job behind it once the run is over was skipped, or the
+    /// run stopped before it — not "still to come". It must not hold the chain
+    /// open with an arrow marching into a run that has already landed.
+    #[test]
+    fn a_stage_that_never_ran_settles_with_the_run() {
+        let (mut st, root) = workflows_session_with_a_chain("never");
+        let mut run = st.repo_runs[0].clone();
+        run.status = Status::Success;
+        let mut lint = a_job("lint", &[("Set up job", Status::Success)]);
+        lint.status = Status::Success;
+        st.repo_runs[0].status = Status::Success;
+        // A landed run is no longer tracked as in flight — its jobs come from
+        // the fetch the band makes once the row goes quiet.
+        st.run_progress.remove("vakanzo/vakanzo");
+        st.workflow_graph_run = Some(crate::provider::RunDetail { run, jobs: vec![lint] });
+        let out = draw_view(&st, 150, 30, render_workflows);
+        let edges: String = out.lines().filter(|l| l.contains('▸')).collect();
+        assert!(!edges.is_empty(), "no chain:\n{out}");
+        assert!(!edges.contains('━'), "a finished run holds still:\n{out}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The lists are the view. Nothing about the band may cost them the rows
+    /// they need, and a workflow whose file jog cannot read gets no band at
+    /// all — inventing the edges would draw a pipeline that isn't this one.
+    #[test]
+    fn the_workflows_chain_yields_to_the_lists() {
+        let (mut st, root) = workflows_session_with_a_chain("yield");
+        let tall = draw_view(&st, 150, 30, render_workflows);
+        assert!(tall.contains('▸'), "{tall}");
+
+        let short = draw_view(&st, 150, 14, render_workflows);
+        assert!(!short.contains('▸'), "the band took the lists' rows:\n{short}");
+
+        st.repo_root = None;
+        let unknown = draw_view(&st, 150, 30, render_workflows);
+        assert!(!unknown.contains('▸'), "a chain with no file behind it:\n{unknown}");
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -142,6 +142,9 @@ pub fn build_detail_items(
     }
     for (ni, node) in shape.iter().enumerate() {
         match node {
+            // `shape` never emits one — the list is of jobs that exist and
+            // the steps inside them, and a stage still to come has neither.
+            RunNode::Pending { .. } => {}
             RunNode::Job(ji) => push_job(&mut items, *ji),
             RunNode::Matrix { key, legs } => {
                 items.push(DetailItem::Group(ni));
@@ -2196,6 +2199,17 @@ pub struct AppState {
     /// The run a `dash_graphs` fetch is out for, so a cursor sitting on a row
     /// asks once rather than once a poll.
     pub dash_graph_pending: Option<u64>,
+    /// The jobs of the newest run of the workflow under the cursor, for the
+    /// stage graph the Workflows view draws beside its list.
+    ///
+    /// The Workflows view is where `jog` lands when it is started inside a
+    /// checkout, so this — not the dashboard's — is the band most people see.
+    /// Same bargain as [`dash_graphs`](Self::dash_graphs): anything in flight
+    /// already has its jobs polled for the strip along the bottom, so this
+    /// only ever holds a run that has settled.
+    pub workflow_graph_run: Option<RunDetail>,
+    /// The run a `workflow_graph_run` fetch is out for.
+    pub workflow_graph_pending: Option<u64>,
     /// Pushes being followed into CI — see [`PushWatch`]. A vec, not an option:
     /// a batch push starts one per repo.
     pub push_watches: Vec<PushWatch>,
@@ -2418,6 +2432,8 @@ impl AppState {
             run_progress: HashMap::new(),
             dash_graphs: HashMap::new(),
             dash_graph_pending: None,
+            workflow_graph_run: None,
+            workflow_graph_pending: None,
             push_watches: Vec::new(),
             git_poll_gate: HashMap::new(),
             all_green_tick: None,
@@ -2473,14 +2489,57 @@ impl AppState {
     /// which is what a dashboard is being asked the rest of the time.
     pub fn dash_graph_target(&self) -> Option<(&RepoCard, &RunDetail)> {
         let card = self.repos.get(self.repo_cursor)?;
-        // A run whose jobs haven't landed yet has no chain to draw, and an
-        // empty box where a graph was is worse than the table's own row.
-        let live = self
-            .run_progress
-            .get(&card.spec)
-            .and_then(|ds| ds.iter().find(|d| !d.jobs.is_empty()));
+        // The live run is taken even with no jobs at all. GitHub creates them
+        // a stage at a time, so "accepted, nothing started" is a real and
+        // common state — and the one where seeing the whole pipeline is worth
+        // most, because none of it has happened yet. The file fills it in.
+        let live = self.run_progress.get(&card.spec).and_then(|ds| ds.first());
+        // A *past* run with no jobs is a different thing: not a pipeline
+        // waiting to start, just an answer we never got. Nothing to draw.
         let settled = self.dash_graphs.get(&card.spec).filter(|d| !d.jobs.is_empty());
         Some((card, live.or(settled)?))
+    }
+
+    /// The newest run of the workflow under the cursor, as the Workflows view
+    /// knows it: the repo-wide poll first, because it is re-read every poll,
+    /// and the per-workflow fetch for a workflow too quiet to appear in it.
+    pub fn workflow_latest_run(&self) -> Option<&Run> {
+        let wf = self.selected_workflow()?;
+        let newest = self.runs_of(wf).into_iter().next();
+        let fallback = self
+            .workflow_preview_file
+            .as_deref()
+            .filter(|f| *f == wf.file_name)
+            .and_then(|_| self.workflow_preview_runs.first());
+        match (newest, fallback) {
+            (Some(a), Some(b)) => Some(if a.created_at >= b.created_at { a } else { b }),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The run the Workflows view's graph band is drawn from — the same
+    /// bargain [`dash_graph_target`](Self::dash_graph_target) strikes, for the
+    /// workflow under the cursor rather than the repo under it.
+    pub fn workflow_graph_target(&self) -> Option<&RunDetail> {
+        let wf = self.selected_workflow()?;
+        let mine = |r: &Run| match &r.workflow_file {
+            Some(f) => f == &wf.file_name,
+            None => r.display_title == wf.name,
+        };
+        // Taken even with no jobs yet — see `dash_graph_target` for why.
+        let live = self
+            .active_repo_progress()
+            .into_iter()
+            .map(|(_, d)| d)
+            .find(|d| mine(&d.run));
+        // A stale settled run — the cursor has moved on and its jobs have not
+        // landed yet — would draw another workflow's chain under this one's
+        // name, which is worse than drawing nothing.
+        let settled = self
+            .workflow_graph_run
+            .as_ref()
+            .filter(|d| mine(&d.run) && !d.jobs.is_empty());
+        live.or(settled)
     }
 
     /// Whether the repo the app is pointed at has a checkout on disk — i.e.

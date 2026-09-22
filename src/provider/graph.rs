@@ -60,6 +60,17 @@ pub struct JobSpec {
     called: Option<Box<WorkflowGraph>>,
 }
 
+/// A job the file declares that the run has not reached, ready to be placed.
+#[derive(Debug, Clone)]
+pub struct Unstarted {
+    /// The key under `jobs:`.
+    pub key: String,
+    /// What to call it before it has run — see [`JobSpec::label`].
+    pub label: String,
+    pub matrix: bool,
+    pub at: Placement,
+}
+
 /// Where a run job sits: which column, which box of it, and which matrix it
 /// is a leg of.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +98,18 @@ pub enum RunNode {
     Job(usize),
     /// Legs of one matrix job, alphabetical like GitHub's box.
     Matrix { key: String, legs: Vec<usize> },
+    /// A job the workflow file declares that the run has not created yet.
+    ///
+    /// GitHub only creates a job once its stage is reached, so a run a second
+    /// old is one box — and a chain drawn from the run alone grows a stage at
+    /// a time instead of showing the pipeline the run is walking through.
+    /// These are the stages still to come, and they carry no index because
+    /// there is nothing in `RunDetail::jobs` to point at yet.
+    ///
+    /// Only [`stages`] emits these. [`shape`] is what the run page's job list
+    /// is built from, and a list of steps for a job that does not exist would
+    /// be a list of nothing.
+    Pending { key: String, label: String, matrix: bool },
 }
 
 impl WorkflowGraph {
@@ -209,8 +232,44 @@ impl WorkflowGraph {
     /// whatever came before it. A few of those are survivable; a file where
     /// *none* of the names land has told us nothing about the order, and a
     /// caller must not report its columns as fact.
+    ///
+    /// A run with no jobs at all passes. There is nothing yet to contradict
+    /// the file, and that moment — GitHub has accepted the run and created
+    /// nothing — is exactly when the whole shape is most worth drawing. The
+    /// first job to land puts the file back on trial against a real name.
     pub fn describes(&self, jobs: &[Job]) -> bool {
-        !jobs.is_empty() && jobs.iter().all(|j| self.spec_for(&j.name).is_some())
+        jobs.iter().all(|j| self.spec_for(&j.name).is_some())
+    }
+
+    /// The stages still to come: every job this file declares that no job of
+    /// the run has landed on yet, placed the way [`place`](Self::place) would
+    /// place it.
+    ///
+    /// A job that calls a reusable workflow counts as one entry until it
+    /// starts, because what that call expands into is the called file's
+    /// business and nothing here knows which of its jobs will be skipped.
+    pub fn unstarted(&self, jobs: &[Job]) -> Vec<Unstarted> {
+        let taken: Vec<&str> = jobs
+            .iter()
+            .filter_map(|j| self.spec_for(&j.name))
+            .map(|s| s.key.as_str())
+            .collect();
+        self.jobs
+            .iter()
+            .filter(|s| !taken.contains(&s.key.as_str()))
+            .map(|s| Unstarted {
+                label: s.label(),
+                key: s.key.clone(),
+                matrix: s.matrix,
+                at: Placement {
+                    depth: s.depth,
+                    group: None,
+                    band: s.band.clone(),
+                    feeds: s.feeds,
+                    ord: s.ord,
+                },
+            })
+            .collect()
     }
 
     /// The YAML job a run job's name came from, or `None` when nothing fits.
@@ -224,6 +283,28 @@ impl WorkflowGraph {
             .filter_map(|s| score(s, run_job_name).map(|sc| (sc, s)))
             .max_by_key(|(sc, _)| *sc)
             .map(|(_, s)| s)
+    }
+}
+
+impl JobSpec {
+    /// What to call this job before it has run.
+    ///
+    /// A `name:` with no `${{ … }}` in it is the name GitHub will print, so
+    /// it is the one to show. A template with an expression in it has holes
+    /// only the run can fill — `v0.0.24 → stage` is not knowable from the
+    /// file — so the key is the honest answer, and it is what GitHub itself
+    /// falls back to for a job with no `name:`.
+    fn label(&self) -> String {
+        if self.pattern.iter().any(|s| matches!(s, Seg::Wild)) {
+            return self.key.clone();
+        }
+        self.pattern
+            .iter()
+            .map(|s| match s {
+                Seg::Lit(l) => l.as_str(),
+                Seg::Wild => "",
+            })
+            .collect()
     }
 }
 
@@ -425,8 +506,29 @@ pub struct NodeGroup {
 /// before it has finished. A workflow with no `needs:` anywhere is one stage
 /// of one box, which is exactly what it is.
 pub fn stages(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<Vec<NodeGroup>> {
+    let mut placed = laid_out(jobs, graph);
+    // The rest of the pipeline, so the chain is whole from the first second of
+    // a run rather than growing a box at a time as GitHub creates the jobs.
+    // Only where the file is there to say so: without one there is no such
+    // thing as a stage that hasn't started, only jobs that have.
+    if let Some(g) = graph {
+        for u in g.unstarted(jobs) {
+            placed.push(Placed {
+                depth: u.at.depth,
+                band: u.at.band,
+                feeds: u.at.feeds,
+                ord: u.at.ord,
+                // Behind everything that actually ran when they share a slot:
+                // what happened outranks what is merely going to.
+                first: usize::MAX,
+                node: RunNode::Pending { key: u.key, label: u.label, matrix: u.matrix },
+            });
+        }
+        placed.sort_by_key(|p| (p.depth, p.ord, p.first));
+    }
+
     let mut out: Vec<(usize, Vec<NodeGroup>)> = Vec::new();
-    for p in laid_out(jobs, graph) {
+    for p in placed {
         if out.last().map(|(d, _)| *d != p.depth).unwrap_or(true) {
             out.push((p.depth, Vec::new()));
         }
@@ -766,15 +868,20 @@ jobs:
         let mut g = WorkflowGraph::parse(WF).unwrap();
 
         // Unread, both halves of the call are one job and share a column.
+        // The matrix is in the list so that nothing is left pending — a stage
+        // the run has not reached is drawn too, and would add a column here
+        // that this case is not about.
         let flat = stages(
             &[
                 job(1, "which commit"),
-                job(2, "deploy-stage / v0.0.21 → stage"),
-                job(3, "deploy-stage / v0.0.21 → stage (GPU box)"),
+                job(2, "build gojobi"),
+                job(3, "deploy-stage / v0.0.21 → stage"),
+                job(4, "deploy-stage / v0.0.21 → stage (GPU box)"),
             ],
             Some(&g),
         );
-        assert_eq!(flat.len(), 2, "{flat:?}");
+        assert_eq!(flat.len(), 3, "{flat:?}");
+        assert_eq!(col(&flat, 2), vec![RunNode::Job(2), RunNode::Job(3)]);
 
         // Read, the run's chain runs through it: the GPU half waits on the
         // other, so it gets a column — and an arrow — of its own.
@@ -822,12 +929,16 @@ jobs:
         let mut g = WorkflowGraph::parse(WF).unwrap();
         // Nothing to read there; the caller stays one column, as before.
         g.resolve_calls(std::path::Path::new("/nonexistent-for-this-test"), 3);
+        // The matrix is in the list so nothing is left pending: a stage the
+        // run has not reached is drawn too, and would add a column of its own
+        // here, which is not what this case is about.
         let jobs = vec![
             job(1, "which commit"),
-            job(2, "deploy-stage / a"),
-            job(3, "deploy-stage / b"),
+            job(2, "build gojobi"),
+            job(3, "deploy-stage / a"),
+            job(4, "deploy-stage / b"),
         ];
-        assert_eq!(stages(&jobs, Some(&g)).len(), 2);
+        assert_eq!(stages(&jobs, Some(&g)).len(), 3);
     }
 
     #[test]
@@ -860,7 +971,49 @@ jobs:
         assert!(!g.describes(&[job(1, "unit tests"), job(2, "smoke tests")]));
         // Half-known is not known: the chain would be guesswork either way.
         assert!(!g.describes(&[job(1, "which commit"), job(2, "smoke tests")]));
-        assert!(!g.describes(&[]));
+        // A run with no jobs yet has nothing to contradict the file — and
+        // that moment is exactly when drawing the whole pipeline is worth
+        // most, because none of it has happened.
+        assert!(g.describes(&[]));
+    }
+
+    /// A run a second old is one job and a pipeline of six. Drawing only what
+    /// GitHub has created grows the chain a box at a time and never shows the
+    /// shape the run is walking through — so the rest is drawn too, pending.
+    #[test]
+    fn the_stages_still_to_come_are_in_the_chain_from_the_start() {
+        let g = WorkflowGraph::parse(WF).unwrap();
+
+        // Nothing created yet: the file is the whole picture.
+        let cold = stages(&[], Some(&g));
+        assert!(cold.len() > 1, "a pipeline, not a box: {cold:?}");
+        assert!(
+            cold.iter().flatten().flat_map(|b| b.nodes.iter()).all(|n| matches!(n, RunNode::Pending { .. })),
+            "nothing has run yet: {cold:?}"
+        );
+
+        // The first job lands and takes its own place; the rest stay pending,
+        // and the number of columns does not move.
+        let warm = stages(&[job(1, "which commit")], Some(&g));
+        assert_eq!(warm.len(), cold.len(), "the chain changed shape: {warm:?}");
+        assert_eq!(col(&warm, 0), vec![RunNode::Job(0)]);
+        assert!(
+            warm.iter().skip(1).flatten().flat_map(|b| b.nodes.iter()).all(|n| matches!(n, RunNode::Pending { .. })),
+            "later stages should still be pending: {warm:?}"
+        );
+    }
+
+    /// A job whose `name:` has an expression in it cannot be named before the
+    /// run fills it in, so the key — what GitHub itself falls back to — is
+    /// what a pending box says.
+    #[test]
+    fn a_pending_job_is_named_by_its_key_when_its_name_is_a_template() {
+        let g = WorkflowGraph::parse(
+            "jobs:\n  check:\n    name: which commit\n  ship:\n    name: ${{ env.V }} → stage\n    needs: [check]\n",
+        )
+        .unwrap();
+        let labels: Vec<String> = g.unstarted(&[]).into_iter().map(|u| u.label).collect();
+        assert_eq!(labels, vec!["which commit".to_string(), "ship".to_string()]);
     }
 
     #[test]
