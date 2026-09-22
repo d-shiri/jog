@@ -24,6 +24,31 @@ use crate::provider::{Job, PrInfo, Run, RunDetail, Status, Workflow};
 /// The name alone is not a key. A dashboard watching eight repos will be asked
 /// about eight different `tests.yml`, and answering one repo's question with
 /// another's `needs:` edges draws a chain that is simply not this run's.
+/// Did this run come out of this workflow?
+///
+/// GitHub's repo-wide run list doesn't name the file a run came out of, so the
+/// run's title — which is the workflow's own `name:` — is what ties the two
+/// together. One predicate, because two copies of it drift: the list of a
+/// workflow's runs and the graph band's pick of which run to draw have to agree
+/// about what belongs to the row under the cursor.
+fn run_is_of(wf: &Workflow, r: &Run) -> bool {
+    match &r.workflow_file {
+        Some(f) => f == &wf.file_name,
+        None => r.display_title == wf.name,
+    }
+}
+
+/// A run that is over and has no jobs to show for it.
+///
+/// An empty job list before the verdict is a pipeline GitHub has accepted and
+/// not started — the whole point of drawing the file's own stages. After the
+/// verdict it is the opposite: not a run about to happen, just an answer we
+/// never got. Drawing the file's stages then would report every one of them as
+/// skipped, which is a claim about a run nobody made.
+fn answered_with_nothing(detail: &RunDetail) -> bool {
+    detail.jobs.is_empty() && detail.run.status.is_terminal()
+}
+
 fn graph_key(root: Option<&Path>, file: &str) -> String {
     match root {
         Some(r) => format!("{}\u{1f}{file}", r.display()),
@@ -2505,7 +2530,9 @@ impl AppState {
     /// and the per-workflow fetch for a workflow too quiet to appear in it.
     pub fn workflow_latest_run(&self) -> Option<&Run> {
         let wf = self.selected_workflow()?;
-        let newest = self.runs_of(wf).into_iter().next();
+        // `find`, not `runs_of`: this wants the first match, and the list it is
+        // scanning is already newest first.
+        let newest = self.repo_runs.iter().find(|r| run_is_of(wf, r));
         let fallback = self
             .workflow_preview_file
             .as_deref()
@@ -2522,10 +2549,7 @@ impl AppState {
     /// workflow under the cursor rather than the repo under it.
     pub fn workflow_graph_target(&self) -> Option<&RunDetail> {
         let wf = self.selected_workflow()?;
-        let mine = |r: &Run| match &r.workflow_file {
-            Some(f) => f == &wf.file_name,
-            None => r.display_title == wf.name,
-        };
+        let mine = |r: &Run| run_is_of(wf, r);
         // Taken even with no jobs yet — see `dash_graph_target` for why.
         let live = self
             .active_repo_progress()
@@ -2625,13 +2649,7 @@ impl AppState {
     /// the run's title — which is the workflow's own `name:` — is what ties the
     /// two together. That is the same match the status sweep uses.
     pub fn runs_of(&self, wf: &Workflow) -> Vec<&Run> {
-        self.repo_runs
-            .iter()
-            .filter(|r| match &r.workflow_file {
-                Some(f) => f == &wf.file_name,
-                None => r.display_title == wf.name,
-            })
-            .collect()
+        self.repo_runs.iter().filter(|r| run_is_of(wf, r)).collect()
     }
 
     /// Runs in flight on the repo the app is pointed at, with the card they
@@ -2679,7 +2697,8 @@ impl AppState {
         // jobs leaves every one of them in the first column, which is the same
         // picture as a workflow where nothing waits — and claiming that is
         // what this flag exists to stop.
-        let known = graph.as_ref().is_some_and(|g| g.describes(&detail.jobs));
+        let known = graph.as_ref().is_some_and(|g| g.describes(&detail.jobs))
+            && !answered_with_nothing(detail);
         let by_shape = shape(&detail.jobs, graph.as_deref());
         let by_stage = stages(&detail.jobs, graph.as_deref());
         self.run_stages_known = known;
@@ -2729,6 +2748,7 @@ impl AppState {
     pub fn graph_known(&self, detail: &RunDetail) -> bool {
         self.graph_of(&detail.run)
             .is_some_and(|g| g.describes(&detail.jobs))
+            && !answered_with_nothing(detail)
     }
 
     fn graph_of(&self, run: &Run) -> Option<Arc<WorkflowGraph>> {
@@ -2746,6 +2766,7 @@ impl AppState {
     pub fn dash_graph_known(&self, spec: &str, detail: &RunDetail) -> bool {
         self.dash_graph_of(spec, &detail.run)
             .is_some_and(|g| g.describes(&detail.jobs))
+            && !answered_with_nothing(detail)
     }
 
     /// Read a dashboard row's workflow file into the cache — the mutable half

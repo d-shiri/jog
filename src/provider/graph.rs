@@ -18,7 +18,7 @@
 //! `name:` of its own, and `caller / inner job` for a job that calls a reusable
 //! workflow.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_yml::Value;
 
@@ -249,14 +249,14 @@ impl WorkflowGraph {
     /// starts, because what that call expands into is the called file's
     /// business and nothing here knows which of its jobs will be skipped.
     pub fn unstarted(&self, jobs: &[Job]) -> Vec<Unstarted> {
-        let taken: Vec<&str> = jobs
+        let taken: HashSet<&str> = jobs
             .iter()
             .filter_map(|j| self.spec_for(&j.name))
             .map(|s| s.key.as_str())
             .collect();
         self.jobs
             .iter()
-            .filter(|s| !taken.contains(&s.key.as_str()))
+            .filter(|s| !taken.contains(s.key.as_str()))
             .map(|s| Unstarted {
                 label: s.label(),
                 key: s.key.clone(),
@@ -510,9 +510,15 @@ pub fn stages(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<Vec<NodeGroup>
     // The rest of the pipeline, so the chain is whole from the first second of
     // a run rather than growing a box at a time as GitHub creates the jobs.
     // Only where the file is there to say so: without one there is no such
-    // thing as a stage that hasn't started, only jobs that have.
-    if let Some(g) = graph {
-        for u in g.unstarted(jobs) {
+    // thing as a stage that hasn't started, only jobs that have — and a file
+    // that no longer names this run's jobs is no better than none. Its `jobs:`
+    // keys would be invented stages of a pipeline that is not this one, and
+    // they would pad the node count past the "too small to draw" floor every
+    // caller leans on.
+    if let Some(g) = graph.filter(|g| g.describes(jobs)) {
+        let unstarted = g.unstarted(jobs);
+        let any = !unstarted.is_empty();
+        for u in unstarted {
             placed.push(Placed {
                 depth: u.at.depth,
                 band: u.at.band,
@@ -524,7 +530,11 @@ pub fn stages(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<Vec<NodeGroup>
                 node: RunNode::Pending { key: u.key, label: u.label, matrix: u.matrix },
             });
         }
-        placed.sort_by_key(|p| (p.depth, p.ord, p.first));
+        // `laid_out` hands its part over already in this order, so the sort is
+        // only for the tail just appended — nothing to do when there is none.
+        if any {
+            placed.sort_by_key(|p| (p.depth, p.ord, p.first));
+        }
     }
 
     let mut out: Vec<(usize, Vec<NodeGroup>)> = Vec::new();
@@ -975,6 +985,18 @@ jobs:
         // that moment is exactly when drawing the whole pipeline is worth
         // most, because none of it has happened.
         assert!(g.describes(&[]));
+    }
+
+    /// A file that no longer names this run's jobs is no better than no file:
+    /// its `jobs:` keys are stages of some other pipeline. Inventing them
+    /// would draw a chain that is not this run's — and pad a one-job run past
+    /// the floor below which a caller draws nothing at all.
+    #[test]
+    fn a_file_that_does_not_describe_the_run_invents_no_stages() {
+        let g = WorkflowGraph::parse(WF).unwrap();
+        let st = stages(&[job(1, "renamed since the run")], Some(&g));
+        let nodes = st.iter().flatten().flat_map(|b| b.nodes.iter()).count();
+        assert_eq!(nodes, 1, "the file's own jobs got in: {st:?}");
     }
 
     /// A run a second old is one job and a pipeline of six. Drawing only what

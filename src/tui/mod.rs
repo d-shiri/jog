@@ -883,17 +883,25 @@ async fn event_loop(
                         }
                     }
                     AppEvent::WorkflowGraphLoaded(run_id, detail) => {
-                        // Cleared whichever way the fetch went: a workflow held
-                        // by a request that failed would never be asked again.
+                        // The band keeps one run, not one per workflow, so an
+                        // answer is only folded in while it is still the one
+                        // being waited for. Two fetches can be out at once —
+                        // the cursor moved, or the workflow ran again — and
+                        // they do not have to come back in the order they
+                        // left. A repo switch clears the slot outright, which
+                        // is what drops an answer about the repo being left.
                         if state.workflow_graph_pending == Some(run_id) {
+                            // Cleared whichever way the fetch went: a workflow
+                            // held by a request that failed would never be
+                            // asked again.
                             state.workflow_graph_pending = None;
-                        }
-                        if let Some(detail) = detail {
-                            // The `needs:` edges come off the workflow file in
-                            // the checkout, read here rather than on every
-                            // frame the band is drawn.
-                            state.warm_workflow_graph(&detail.run);
-                            state.workflow_graph_run = Some(detail);
+                            if let Some(detail) = detail {
+                                // The `needs:` edges come off the workflow file
+                                // in the checkout, read here rather than on
+                                // every frame the band is drawn.
+                                state.warm_workflow_graph(&detail.run);
+                                state.workflow_graph_run = Some(detail);
+                            }
                         }
                     }
                     AppEvent::GitStatusLoaded(spec, status) => {
@@ -4699,8 +4707,17 @@ fn maybe_fetch_workflow_graph(
         return;
     };
     let (run_id, in_flight) = (run.id, !run.status.is_terminal());
-    if in_flight
-        || state.workflow_graph_pending == Some(run_id)
+    if in_flight {
+        // Its jobs are already being polled for the strip, so there is nothing
+        // to ask for — but the `needs:` edges come off the file on disk, and
+        // nothing else reads it for a run that has never settled. Without this
+        // the band is blank for exactly the run it is most wanted for: one
+        // GitHub has accepted and not yet built a single job of.
+        let run = run.clone();
+        state.warm_workflow_graph(&run);
+        return;
+    }
+    if state.workflow_graph_pending == Some(run_id)
         || state
             .workflow_graph_run
             .as_ref()
@@ -5122,6 +5139,13 @@ fn switch_to_selected_repo(
     state.workflow_preview_runs.clear();
     state.workflow_for_runs = None;
     state.workflows.clear();
+    // The graph band keeps one run for the whole view, matched to the cursor by
+    // workflow file name alone — and `ci.yml` is `ci.yml` in every repo there
+    // is. Left standing, the run the last repo was showing would be drawn under
+    // this one's workflow of the same name. Dropping the request with it is
+    // what stops the answer landing here after the switch.
+    state.workflow_graph_run = None;
+    state.workflow_graph_pending = None;
     state.set_status(format!("loading {label}…"));
 
     let p = provider.clone();

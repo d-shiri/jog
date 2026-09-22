@@ -6048,6 +6048,12 @@ fn graph_caption(run: &Run, tick: u64, theme: &Theme) -> Line<'static> {
     ])
 }
 
+/// Rows the Workflows view's two lists keep for themselves before the band may
+/// have any. They are bordered and carry a header, so the six rows
+/// [`graph_band`] reserves against its own area — enough for a bare list —
+/// leave about three rows of content here. The lists are the view.
+const WORKFLOW_LIST_KEEP: u16 = 12;
+
 /// The Workflows view's graph band, along the bottom of the whole pane.
 ///
 /// Returns what is left of `area` for the lists above it. Full width rather
@@ -6059,12 +6065,6 @@ fn graph_caption(run: &Run, tick: u64, theme: &Theme) -> Line<'static> {
 /// there at all for a workflow whose file jog cannot read: the `needs:` edges
 /// are the whole content of a graph, and without them every job lands in one
 /// column, which draws as a pipeline where nothing waits for anything.
-/// Rows the Workflows view's two lists keep for themselves before the band may
-/// have any. They are bordered and carry a header, so the six rows
-/// [`graph_band`] reserves against its own area — enough for a bare list —
-/// leave about three rows of content here. The lists are the view.
-const WORKFLOW_LIST_KEEP: u16 = 12;
-
 fn workflow_graph_below(f: &mut Frame, area: Rect, state: &AppState) -> Rect {
     let theme = &state.theme;
     let Some(detail) = state.workflow_graph_target() else {
@@ -6073,11 +6073,14 @@ fn workflow_graph_below(f: &mut Frame, area: Rect, state: &AppState) -> Rect {
     if !state.graph_known(detail) {
         return area;
     }
-    // One row for the caption, one for the gap under the chain.
+    // Settled against the rows and the columns the chain will actually get:
+    // two rows go to the caption and the gap under it, and a column at each
+    // side to the inset below. A band planned against the full width lays its
+    // last box out past the edge it is drawn into.
     let Some(height) = area.height.checked_sub(2) else {
         return area;
     };
-    let room = Rect { height, ..area };
+    let room = Rect { height, width: area.width.saturating_sub(2), ..area };
     let stages = state.stages_of(detail);
     let Some(band) = graph_band(state, detail, &stages, true, room) else {
         return area;
@@ -6094,12 +6097,12 @@ fn workflow_graph_below(f: &mut Frame, area: Rect, state: &AppState) -> Rect {
             Constraint::Length(1),
         ])
         .split(area);
+    let inset = |r: Rect| Rect { x: r.x + 1, width: r.width.saturating_sub(2), ..r };
     f.render_widget(
         Paragraph::new(graph_caption(&detail.run, state.tick_count, theme)),
-        Rect { x: chunks[1].x + 1, width: chunks[1].width.saturating_sub(2), ..chunks[1] },
+        inset(chunks[1]),
     );
-    let chain = Rect { x: chunks[2].x + 1, width: chunks[2].width.saturating_sub(2), ..chunks[2] };
-    render_run_graph(f, chain, theme, state.tick_count, &band);
+    render_run_graph(f, inset(chunks[2]), theme, state.tick_count, &band);
     chunks[0]
 }
 
@@ -9968,6 +9971,28 @@ jobs:
         let edges: String = out.lines().filter(|l| l.contains('▸')).collect();
         assert!(!edges.is_empty(), "no chain:\n{out}");
         assert!(!edges.contains('━'), "a finished run holds still:\n{out}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// An empty job list means two opposite things either side of the verdict.
+    /// Before it: GitHub has accepted the run and built nothing yet, which is
+    /// the whole reason the file's own stages are drawn. After it: no answer
+    /// ever came. Drawing the stages then reports every one of them as
+    /// skipped — a claim about a run nobody made.
+    #[test]
+    fn a_run_that_ended_with_nothing_is_not_a_pipeline_waiting_to_start() {
+        let (mut st, root) = workflows_session_with_a_chain("nothing");
+        let mut run = st.repo_runs[0].clone();
+        st.run_progress.remove("vakanzo/vakanzo");
+
+        // Accepted, nothing built: the file is the whole picture.
+        let waiting = crate::provider::RunDetail { run: run.clone(), jobs: Vec::new() };
+        assert!(st.graph_known(&waiting), "no chain before the run got going");
+
+        // The same empty list, once the run is over.
+        run.status = Status::Cancelled;
+        let over = crate::provider::RunDetail { run, jobs: Vec::new() };
+        assert!(!st.graph_known(&over), "every stage reported as skipped");
         std::fs::remove_dir_all(root).ok();
     }
 
