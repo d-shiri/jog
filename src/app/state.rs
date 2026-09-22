@@ -14,7 +14,7 @@ use crate::config::KeymapConfig;
 use crate::git::RepoStatus;
 use crate::history::History;
 use crate::provider::github::{ApiError, Quota};
-use crate::provider::graph::{RunNode, WorkflowGraph, shape, stages};
+use crate::provider::graph::{NodeGroup, RunNode, WorkflowGraph, shape, stages};
 use crate::provider::{Job, PrInfo, Run, RunDetail, Status, Workflow};
 
 
@@ -1924,11 +1924,12 @@ pub struct AppState {
     /// siblings, the rest in `needs:` order. Rebuilt whenever the detail is,
     /// by [`AppState::rebuild_run_shape`].
     pub run_shape: Vec<RunNode>,
-    /// The same nodes, kept in their `needs:` columns — what the run graph is
-    /// drawn from. Built beside `run_shape` rather than worked out again at
-    /// draw time, so the graph and the list can never disagree about what is
-    /// a matrix and what is a job.
-    pub run_stages: Vec<Vec<RunNode>>,
+    /// The same nodes, kept in their `needs:` columns and cut into the boxes
+    /// each column is drawn in — what the run graph is drawn from. Built
+    /// beside `run_shape` rather than worked out again at draw time, so the
+    /// graph and the list can never disagree about what is a matrix and what
+    /// is a job.
+    pub run_stages: Vec<Vec<NodeGroup>>,
     /// Whether those columns are what the workflow file says, or only what is
     /// left when there is no file to read. Without one every job lands in the
     /// first column, which looks exactly like a workflow where nothing waits
@@ -2606,7 +2607,7 @@ impl AppState {
     /// page's graph. Reads the workflow cache without filling it, so a view
     /// can ask on every frame; [`warm_workflow_graph`](Self::warm_workflow_graph)
     /// is what puts the file there.
-    pub fn stages_of(&self, detail: &RunDetail) -> Vec<Vec<RunNode>> {
+    pub fn stages_of(&self, detail: &RunDetail) -> Vec<Vec<NodeGroup>> {
         let graph = self.graph_of(&detail.run);
         stages(&detail.jobs, graph.as_deref())
     }

@@ -42,6 +42,16 @@ pub struct JobSpec {
     pattern: Vec<Seg>,
     /// Longest chain of `needs:` behind this job — its column in the graph.
     depth: usize,
+    /// Position under `jobs:`. A column is stacked in the order the file
+    /// declares, which is the order the run page stacks it — the API reports
+    /// jobs in the order they happened to start, which is not the same.
+    ord: usize,
+    /// Which box of its column this job is drawn in: everything that waits
+    /// for the same jobs and has the same jobs waiting on it shares one.
+    band: String,
+    /// Does anything `needs:` this job? Only a box something waits on gets an
+    /// arrow out of it.
+    feeds: bool,
     /// A reusable workflow in this repo that this job calls, as written.
     uses: Option<String>,
     /// That file, once it has been read. A call is a whole graph standing in
@@ -50,12 +60,19 @@ pub struct JobSpec {
     called: Option<Box<WorkflowGraph>>,
 }
 
-/// Where a run job sits: which column, and which matrix it is a leg of.
+/// Where a run job sits: which column, which box of it, and which matrix it
+/// is a leg of.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Placement {
     pub depth: usize,
     /// `Some(key)` for a leg of a matrix — legs sharing a key are one box.
     pub group: Option<String>,
+    /// See [`JobSpec::band`].
+    pub band: String,
+    /// See [`JobSpec::feeds`].
+    pub feeds: bool,
+    /// See [`JobSpec::ord`].
+    pub ord: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -82,7 +99,7 @@ impl WorkflowGraph {
             _ => None,
         })?;
         let mut specs = Vec::new();
-        for (key, body) in jobs {
+        for (ord, (key, body)) in jobs.iter().enumerate() {
             let Some(key) = key.as_str() else { continue };
             let name = body.get("name").and_then(|v| v.as_str());
             let matrix = body
@@ -95,6 +112,11 @@ impl WorkflowGraph {
                 needs: parse_needs(body.get("needs")),
                 pattern: compile(name.unwrap_or(key)),
                 depth: 0,
+                ord,
+                // Both are the business of `relink`, which needs every spec in
+                // hand to work them out.
+                band: String::new(),
+                feeds: false,
                 // Only a path into this repo. `owner/repo/.github/…@ref` names
                 // a file on some other checkout, which there is no reading
                 // from here.
@@ -109,7 +131,7 @@ impl WorkflowGraph {
         if specs.is_empty() {
             return None;
         }
-        resolve_depths(&mut specs);
+        relink(&mut specs);
         Some(Self { jobs: specs })
     }
 
@@ -137,7 +159,7 @@ impl WorkflowGraph {
         }
         // A job that stands for a two-column workflow occupies two columns, so
         // whatever waits on it starts two later, not one.
-        resolve_depths(&mut self.jobs);
+        relink(&mut self.jobs);
     }
 
     /// Columns this graph occupies — one more than its last job's depth.
@@ -160,11 +182,23 @@ impl WorkflowGraph {
             return Some(Placement {
                 depth: spec.depth + within.depth,
                 group: within.group.map(|g| format!("{}/{g}", spec.key)),
+                // Inside a call the boxes are the called file's own. Naming
+                // them after the caller keeps two calls of the same file from
+                // pooling into one box.
+                band: format!("{}/{}", spec.key, within.band),
+                // The last column of a call is what the caller's dependants
+                // are really waiting for, so that is where the arrow out of it
+                // starts.
+                feeds: within.feeds || (spec.feeds && within.depth + 1 == inner.span()),
+                ord: spec.ord,
             });
         }
         Some(Placement {
             depth: spec.depth,
             group: spec.matrix.then(|| spec.key.clone()),
+            band: spec.band.clone(),
+            feeds: spec.feeds,
+            ord: spec.ord,
         })
     }
 
@@ -243,9 +277,13 @@ fn parse_needs(v: Option<&Value>) -> Vec<String> {
     }
 }
 
-/// Longest path to each job along `needs:`. Bounded by the job count, so a
-/// malformed file that points a cycle at itself stops instead of spinning.
-fn resolve_depths(specs: &mut [JobSpec]) {
+/// Work out what the `needs:` edges say about every job: its column, the box
+/// of that column it is drawn in, and whether anything is waiting on it.
+///
+/// The depth pass is a longest path, bounded by the job count so a malformed
+/// file that points a cycle at itself stops instead of spinning.
+fn relink(specs: &mut [JobSpec]) {
+    let keys: Vec<String> = specs.iter().map(|s| s.key.clone()).collect();
     let index: HashMap<&str, usize> = specs
         .iter()
         .enumerate()
@@ -275,8 +313,27 @@ fn resolve_depths(specs: &mut [JobSpec]) {
             break;
         }
     }
-    for (spec, d) in specs.iter_mut().zip(depth) {
+
+    // Who waits on each job. A column's boxes are cut along these: the run
+    // page draws two jobs together when they wait for the same things and the
+    // same things wait for them — which is why `guards`, the one job anything
+    // needs, sits alone while the two nothing needs share a box.
+    let mut succs: Vec<Vec<&str>> = vec![Vec::new(); specs.len()];
+    for (i, ups) in edges.iter().enumerate() {
+        for &u in ups {
+            succs[u].push(keys[i].as_str());
+        }
+    }
+
+    for ((spec, d), mut down) in specs.iter_mut().zip(depth).zip(succs) {
         spec.depth = d;
+        spec.feeds = !down.is_empty();
+        // Sorted, because a box is decided by *which* jobs are on either side
+        // of it, not by the order the file happens to list them in.
+        let mut up: Vec<&str> = spec.needs.iter().map(String::as_str).collect();
+        up.sort_unstable();
+        down.sort_unstable();
+        spec.band = format!("{}\u{1}{}", up.join(","), down.join(","));
     }
 }
 
@@ -345,48 +402,99 @@ fn glob_match(segs: &[Seg], s: &str) -> bool {
 /// the matrix job kept its default name, because GitHub writes the combination
 /// in brackets: `test (ubuntu-latest, 3.11)`.
 pub fn shape(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<RunNode> {
-    laid_out(jobs, graph).into_iter().map(|(_, n)| n).collect()
+    laid_out(jobs, graph).into_iter().map(|p| p.node).collect()
+}
+
+/// One box of a column: the jobs the run page draws inside a single border,
+/// because they wait for the same jobs and the same jobs wait for them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeGroup {
+    pub nodes: Vec<RunNode>,
+    /// See [`JobSpec::band`] — what the box was cut along.
+    pub band: String,
+    /// Whether anything downstream is waiting on this box. A column's boxes
+    /// are not all alike: `guards` holds up the next column, while the box
+    /// beside it holds up nothing, and only one of them has earned an arrow.
+    pub feeds: bool,
 }
 
 /// The same arrangement, kept in the columns the `needs:` edges put it in:
-/// one entry per stage, in order, each holding what that stage runs at once.
+/// one entry per stage, in order, each holding that stage's boxes.
 ///
 /// This is the run page's graph — everything in a stage starts when the stage
 /// before it has finished. A workflow with no `needs:` anywhere is one stage
-/// of everything, which is exactly what it is.
-pub fn stages(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<Vec<RunNode>> {
-    let mut out: Vec<(usize, Vec<RunNode>)> = Vec::new();
-    for (depth, node) in laid_out(jobs, graph) {
-        match out.last_mut() {
-            Some((d, stage)) if *d == depth => stage.push(node),
-            _ => out.push((depth, vec![node])),
+/// of one box, which is exactly what it is.
+pub fn stages(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<Vec<NodeGroup>> {
+    let mut out: Vec<(usize, Vec<NodeGroup>)> = Vec::new();
+    for p in laid_out(jobs, graph) {
+        if out.last().map(|(d, _)| *d != p.depth).unwrap_or(true) {
+            out.push((p.depth, Vec::new()));
+        }
+        let boxes = &mut out.last_mut().expect("just pushed").1;
+        match boxes.iter_mut().find(|b| b.band == p.band) {
+            Some(b) => b.nodes.push(p.node),
+            None => boxes.push(NodeGroup {
+                nodes: vec![p.node],
+                band: p.band,
+                feeds: p.feeds,
+            }),
         }
     }
-    out.into_iter().map(|(_, stage)| stage).collect()
+    for (_, boxes) in out.iter_mut() {
+        // The box the chain runs through goes on top, where the arrow out of
+        // it has the shortest way to go — the run page puts it there too.
+        boxes.sort_by_key(|b| !b.feeds);
+    }
+    out.into_iter().map(|(_, boxes)| boxes).collect()
 }
 
-fn laid_out(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<(usize, RunNode)> {
+/// One node of the graph with everything the layout needs to place it.
+struct Placed {
+    depth: usize,
+    band: String,
+    feeds: bool,
+    /// Where the workflow file declares the job, and where the API reported
+    /// it — the first decides the order, the second breaks its ties.
+    ord: usize,
+    first: usize,
+    node: RunNode,
+}
+
+fn laid_out(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<Placed> {
     let mut group_of: Vec<Option<String>> = vec![None; jobs.len()];
     let mut depth_of: Vec<usize> = vec![0; jobs.len()];
+    let mut band_of: Vec<String> = vec![String::new(); jobs.len()];
+    let mut feeds_of: Vec<bool> = vec![false; jobs.len()];
+    let mut ord_of: Vec<usize> = vec![0; jobs.len()];
     match graph {
         Some(g) => {
             // A job nothing in the file matches — renamed since the run, most
             // likely — keeps the company it arrived in rather than sorting to
             // the front as a depth of nothing.
-            let mut last = 0usize;
+            let mut last = Placement {
+                depth: 0,
+                group: None,
+                band: String::new(),
+                feeds: false,
+                ord: 0,
+            };
             for (i, job) in jobs.iter().enumerate() {
-                match g.place(&job.name) {
-                    Some(at) => {
-                        depth_of[i] = at.depth;
-                        last = at.depth;
-                        group_of[i] = at.group;
-                    }
-                    None => depth_of[i] = last,
-                }
+                let at = g.place(&job.name).unwrap_or_else(|| Placement {
+                    group: None,
+                    ..last.clone()
+                });
+                depth_of[i] = at.depth;
+                band_of[i] = at.band.clone();
+                feeds_of[i] = at.feeds;
+                ord_of[i] = at.ord;
+                group_of[i] = at.group.clone();
+                last = at;
             }
         }
         None => {
             for (i, job) in jobs.iter().enumerate() {
+                // Nothing to order by but arrival, so arrival it is.
+                ord_of[i] = i;
                 if let Some(head) = job
                     .name
                     .strip_suffix(')')
@@ -413,11 +521,11 @@ fn laid_out(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<(usize, RunNode)
 
     // Emit each node where its first member sits, so a run whose YAML we
     // couldn't read keeps the order the API gave us.
-    let mut nodes: Vec<(usize, usize, RunNode)> = Vec::new();
+    let mut nodes: Vec<Placed> = Vec::new();
     let mut seen: Vec<&str> = Vec::new();
     for (i, key) in group_of.iter().enumerate() {
-        match key {
-            None => nodes.push((depth_of[i], i, RunNode::Job(i))),
+        let node = match key {
+            None => RunNode::Job(i),
             Some(key) => {
                 if seen.contains(&key.as_str()) {
                     continue;
@@ -430,19 +538,20 @@ fn laid_out(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<(usize, RunNode)
                     .map(|(j, _)| j)
                     .collect();
                 legs.sort_by(|&a, &b| jobs[a].name.cmp(&jobs[b].name));
-                nodes.push((
-                    depth_of[i],
-                    i,
-                    RunNode::Matrix {
-                        key: key.clone(),
-                        legs,
-                    },
-                ));
+                RunNode::Matrix { key: key.clone(), legs }
             }
-        }
+        };
+        nodes.push(Placed {
+            depth: depth_of[i],
+            band: band_of[i].clone(),
+            feeds: feeds_of[i],
+            ord: ord_of[i],
+            first: i,
+            node,
+        });
     }
-    nodes.sort_by_key(|(depth, first, _)| (*depth, *first));
-    nodes.into_iter().map(|(depth, _, n)| (depth, n)).collect()
+    nodes.sort_by_key(|p| (p.depth, p.ord, p.first));
+    nodes
 }
 
 #[cfg(test)]
@@ -468,6 +577,12 @@ jobs:
     needs: [build]
     uses: ./.github/workflows/deploy.yml
 "#;
+
+    /// Everything in one column, boxes and all — for the tests that are about
+    /// which column a job landed in rather than which box.
+    fn col(st: &[Vec<NodeGroup>], i: usize) -> Vec<RunNode> {
+        st[i].iter().flat_map(|b| b.nodes.clone()).collect()
+    }
 
     fn job(id: u64, name: &str) -> Job {
         Job {
@@ -673,8 +788,8 @@ jobs:
         ];
         let st = stages(&jobs, Some(&g));
         assert_eq!(st.len(), 4, "{st:?}");
-        assert_eq!(st[2], vec![RunNode::Job(3)]);
-        assert_eq!(st[3], vec![RunNode::Job(4)]);
+        assert_eq!(col(&st, 2), vec![RunNode::Job(3)]);
+        assert_eq!(col(&st, 3), vec![RunNode::Job(4)]);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -729,12 +844,12 @@ jobs:
         // Three columns: the commit check, the matrix, then both halves of the
         // deploy — which are one stage, being one caller job.
         assert_eq!(st.len(), 3);
-        assert_eq!(st[0], vec![RunNode::Job(0)]);
+        assert_eq!(col(&st, 0), vec![RunNode::Job(0)]);
         assert_eq!(
-            st[1],
+            col(&st, 1),
             vec![RunNode::Matrix { key: "build".into(), legs: vec![2, 1] }]
         );
-        assert_eq!(st[2], vec![RunNode::Job(3), RunNode::Job(4)]);
+        assert_eq!(col(&st, 2), vec![RunNode::Job(3), RunNode::Job(4)]);
     }
 
     #[test]
@@ -753,7 +868,9 @@ jobs:
         let jobs = vec![job(1, "lint"), job(2, "test"), job(3, "build")];
         let st = stages(&jobs, None);
         assert_eq!(st.len(), 1);
-        assert_eq!(st[0].len(), 3);
+        // One column, and — nothing waiting on anything — one box in it.
+        assert_eq!(st[0].len(), 1);
+        assert_eq!(col(&st, 0).len(), 3);
     }
 
     #[test]
@@ -789,6 +906,101 @@ jobs:
                 RunNode::Job(2),
             ]
         );
+    }
+
+    /// The run that this layout was built from: three jobs wait on `guards`,
+    /// and the two beside it wait on — and are waited on by — nothing. The run
+    /// page draws that column as two boxes, not one, and puts the box the
+    /// chain runs through on top.
+    #[test]
+    fn a_column_is_cut_into_boxes_along_its_edges() {
+        let wf = r#"
+jobs:
+  guards:
+    name: guards + what changed
+  tests:
+    name: python suites (skills + ingestor)
+    needs: guards
+  gojobi:
+    name: gojobi (app)
+    needs: guards
+  bench:
+    name: bench (performance gate)
+    needs: guards
+  bench-trend:
+    name: bench (trend on main)
+  website:
+    name: website (static site)
+"#;
+        let g = WorkflowGraph::parse(wf).unwrap();
+        // In the order the API reports them — website started first.
+        let jobs = vec![
+            job(1, "website (static site)"),
+            job(2, "guards + what changed"),
+            job(3, "bench (trend on main)"),
+            job(4, "python suites (skills + ingestor)"),
+            job(5, "gojobi (app)"),
+            job(6, "bench (performance gate)"),
+        ];
+        let st = stages(&jobs, Some(&g));
+        assert_eq!(st.len(), 2, "{st:?}");
+
+        // Two boxes in the first column, the one with an arrow out of it
+        // first, each stacked in the order the file declares — not the order
+        // the jobs happened to start in.
+        assert_eq!(st[0].len(), 2);
+        assert!(st[0][0].feeds);
+        assert_eq!(st[0][0].nodes, vec![RunNode::Job(1)]);
+        assert!(!st[0][1].feeds);
+        assert_eq!(st[0][1].nodes, vec![RunNode::Job(2), RunNode::Job(0)]);
+
+        // All three of the second column wait on the same job and nothing
+        // waits on them, so they are one box, and nothing leads out of it.
+        assert_eq!(st[1].len(), 1);
+        assert!(!st[1][0].feeds);
+        assert_eq!(
+            st[1][0].nodes,
+            vec![RunNode::Job(3), RunNode::Job(4), RunNode::Job(5)]
+        );
+    }
+
+    /// Two jobs at the same depth that wait on *different* things are two
+    /// boxes, even though both have something waiting on them.
+    #[test]
+    fn same_column_different_edges_is_two_boxes() {
+        let wf = r#"
+jobs:
+  a:
+    name: a
+  b:
+    name: b
+  mid-a:
+    name: mid-a
+    needs: a
+  mid-b:
+    name: mid-b
+    needs: b
+  end:
+    name: end
+    needs: [mid-a, mid-b]
+"#;
+        let g = WorkflowGraph::parse(wf).unwrap();
+        let jobs = vec![
+            job(1, "a"),
+            job(2, "b"),
+            job(3, "mid-a"),
+            job(4, "mid-b"),
+            job(5, "end"),
+        ];
+        let st = stages(&jobs, Some(&g));
+        assert_eq!(st.len(), 3);
+        // Column 0: `a` feeds `mid-a`, `b` feeds `mid-b` — different
+        // dependants, so a box each.
+        assert_eq!(st[0].len(), 2);
+        assert!(st[0].iter().all(|b| b.feeds));
+        // Column 1: same dependant, different things waited for — still two.
+        assert_eq!(st[1].len(), 2);
+        assert_eq!(st[2].len(), 1);
     }
 
     #[test]
