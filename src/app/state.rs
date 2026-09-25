@@ -2228,26 +2228,13 @@ pub struct AppState {
     /// Entries are dropped the moment a run settles, so the strip appears and
     /// clears itself.
     pub run_progress: HashMap<String, Vec<RunDetail>>,
-    /// The jobs of each dashboard row's *latest* run, for the stage graph the
-    /// dashboard draws over the row under the cursor.
-    ///
-    /// `run_progress` covers anything in flight and is dropped the moment a
-    /// run settles — which is exactly when a graph is most worth looking at,
-    /// because it is the picture of what just happened. So a settled run's
-    /// jobs are fetched once, when the cursor comes to rest on its row, and
-    /// kept: one entry per repo, replaced when that repo's latest run changes.
-    pub dash_graphs: HashMap<String, RunDetail>,
-    /// The run a `dash_graphs` fetch is out for, so a cursor sitting on a row
-    /// asks once rather than once a poll.
-    pub dash_graph_pending: Option<u64>,
     /// The jobs of the newest run of the workflow under the cursor, for the
     /// stage graph the Workflows view draws beside its list.
     ///
     /// The Workflows view is where `jog` lands when it is started inside a
     /// checkout, so this — not the dashboard's — is the band most people see.
-    /// Same bargain as [`dash_graphs`](Self::dash_graphs): anything in flight
-    /// already has its jobs polled for the strip along the bottom, so this
-    /// only ever holds a run that has settled.
+    /// Anything in flight already has its jobs polled for the strip along the
+    /// bottom, so this only ever holds a run that has settled.
     pub workflow_graph_run: Option<RunDetail>,
     /// The run a `workflow_graph_run` fetch is out for.
     pub workflow_graph_pending: Option<u64>,
@@ -2472,8 +2459,6 @@ impl AppState {
             poll_ticks: 50,
             last_poll_tick: 0,
             run_progress: HashMap::new(),
-            dash_graphs: HashMap::new(),
-            dash_graph_pending: None,
             workflow_graph_run: None,
             workflow_graph_pending: None,
             push_watches: Vec::new(),
@@ -2522,24 +2507,28 @@ impl AppState {
         })
     }
 
-    /// The run the dashboard's graph band is drawn from: the cursor row's,
-    /// live when that row has something in flight and its last one otherwise.
+    /// The run the dashboard's graph band is drawn from — only ever one in
+    /// flight: the cursor row's when it has one, else the first running
+    /// anywhere on the dashboard.
     ///
-    /// In flight wins because that is the run the chain is *about* — the
-    /// arrow between two stages only marches while something is crossing it.
-    /// A quiet row falls back to the picture of what last happened on it,
-    /// which is what a dashboard is being asked the rest of the time.
+    /// Nothing for a dashboard that is just being browsed. A band that follows
+    /// the cursor through settled runs costs a jobs request per row you pass
+    /// over, and a picture of last week's deploy is not what the view is for.
+    /// What is worth the rows is a pipeline that is moving — the one you just
+    /// pushed — whichever row the cursor happens to be on.
     pub fn dash_graph_target(&self) -> Option<(&RepoCard, &RunDetail)> {
-        let card = self.repos.get(self.repo_cursor)?;
-        // The live run is taken even with no jobs at all. GitHub creates them
-        // a stage at a time, so "accepted, nothing started" is a real and
-        // common state — and the one where seeing the whole pipeline is worth
-        // most, because none of it has happened yet. The file fills it in.
-        let live = self.run_progress.get(&card.spec).and_then(|ds| ds.first());
-        // A *past* run with no jobs is a different thing: not a pipeline
-        // waiting to start, just an answer we never got. Nothing to draw.
-        let settled = self.dash_graphs.get(&card.spec).filter(|d| !d.jobs.is_empty());
-        Some((card, live.or(settled)?))
+        // Taken even with no jobs at all. GitHub creates them a stage at a
+        // time, so "accepted, nothing started" is a real and common state —
+        // and the one where seeing the whole pipeline is worth most, because
+        // none of it has happened yet. The file fills it in.
+        let here = self.repos.get(self.repo_cursor).and_then(|card| {
+            self.run_progress
+                .get(&card.spec)?
+                .iter()
+                .find(|d| !d.run.status.is_terminal())
+                .map(|d| (card, d))
+        });
+        here.or_else(|| self.active_progress().into_iter().next())
     }
 
     /// The newest run of the workflow under the cursor, as the Workflows view
@@ -2561,9 +2550,9 @@ impl AppState {
         }
     }
 
-    /// The run the Workflows view's graph band is drawn from — the same
-    /// bargain [`dash_graph_target`](Self::dash_graph_target) strikes, for the
-    /// workflow under the cursor rather than the repo under it.
+    /// The run the Workflows view's graph band is drawn from: the workflow
+    /// under the cursor, live when it has something in flight and its last
+    /// settled run otherwise.
     pub fn workflow_graph_target(&self) -> Option<&RunDetail> {
         let wf = self.selected_workflow()?;
         let mine = |r: &Run| run_is_of(wf, r);
