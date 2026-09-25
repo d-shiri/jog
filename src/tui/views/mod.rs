@@ -6210,9 +6210,7 @@ fn render_run_graph(f: &mut Frame, area: Rect, state: &AppState, band: &GraphBan
                 continue;
             }
             let rect = placed[ci][bi];
-            let top = next[0].y;
-            let bottom = next[next.len() - 1].bottom().saturating_sub(1);
-            let y = (rect.y + rect.height / 2).clamp(top, bottom);
+            let y = graph_arrow_y(rect, next);
             // The edge the run is crossing right now marches; every other one
             // is a still rule. One moving thing at a time is what makes it
             // mean "here".
@@ -6241,6 +6239,39 @@ fn render_run_graph(f: &mut Frame, area: Rect, state: &AppState, band: &GraphBan
             },
         );
     }
+}
+
+/// The row an arrow out of `from` sits on to reach the next column.
+///
+/// Its own box's middle, when that lands on a row some box of the next column
+/// is actually drawing — and otherwise the nearest row that does. Borders and
+/// the gaps between boxes are excluded at both ends, because an arrow head
+/// landing on a rounded corner reads as a chain that has come apart.
+///
+/// This used to be the middle clamped to the next column's outer edge, which
+/// was the same answer whenever the two boxes were about the same height. An
+/// opened matrix is not: a seven-row box beside a three-row one has a middle
+/// well below anything the short box draws, and the clamp put the head on its
+/// bottom border.
+fn graph_arrow_y(from: Rect, next: &[Rect]) -> u16 {
+    let want = from.y + from.height / 2;
+    let (lo, hi) = (from.y + 1, from.bottom().saturating_sub(2));
+    let rows = || {
+        next.iter()
+            .flat_map(|b| (b.y + 1)..b.bottom().saturating_sub(1))
+    };
+    rows()
+        // Inside a box at both ends: the arrow touches what it joins.
+        .filter(|y| (lo..=hi).contains(y))
+        .min_by_key(|y| y.abs_diff(want))
+        // Nothing overlaps — keep the tail on this box and let the head
+        // reach as near as it can.
+        .or_else(|| {
+            rows()
+                .min_by_key(|y| y.abs_diff(want))
+                .map(|y| y.clamp(lo, hi))
+        })
+        .unwrap_or(want)
 }
 
 /// The rule between two stages: still, or — while the run is crossing it — a
@@ -9666,6 +9697,46 @@ jobs:
             }
         }
         assert!(ever_fell_back, "the folded fallback was never exercised");
+        std::fs::remove_dir_all(chained_run_dir()).ok();
+    }
+
+    /// Opening a matrix makes one box much taller than its neighbours, and the
+    /// arrow out of it used to be aimed from its own middle and then clamped
+    /// to the next column's outer edge — which landed the head on that box's
+    /// bottom *border*, hanging off the corner. An arrow has to meet a wall at
+    /// both ends or the chain reads as come apart.
+    #[test]
+    fn an_arrow_out_of_an_open_matrix_meets_a_box_at_both_ends() {
+        let mut st = a_chained_run();
+        st.view = View::RunDetail;
+        st.toggle_graph_box("build");
+        let out = draw_detail(&st, 120, 28);
+
+        let mut checked = 0;
+        // Band rows only: a row of the job list underneath carries just the
+        // pane's own two walls, and its folded-matrix marker is a `▸` too.
+        for line in out.lines().filter(|l| l.matches('│').count() > 3) {
+            let chars: Vec<char> = line.chars().collect();
+            for (i, c) in chars.iter().enumerate() {
+                if *c != '▸' {
+                    continue;
+                }
+                assert_eq!(
+                    chars.get(i + 1),
+                    Some(&'│'),
+                    "arrow head lands on `{:?}`, not a box wall:\n{line}",
+                    chars.get(i + 1)
+                );
+                assert_eq!(
+                    chars.get(i - GRAPH_ARROW),
+                    Some(&'│'),
+                    "arrow tail leaves `{:?}`, not a box wall:\n{line}",
+                    chars.get(i - GRAPH_ARROW)
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 2, "expected the chain's arrows, found {checked}");
         std::fs::remove_dir_all(chained_run_dir()).ok();
     }
 
