@@ -1045,9 +1045,92 @@ impl BatchItem {
     }
 }
 
+/// What a batch does to each repo it runs over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchAction {
+    /// Stage everything and commit it with the one message.
+    Commit,
+    /// `git checkout -b <name>` — only in repos sitting on main or master,
+    /// so every new branch starts from the same place.
+    NewBranch,
+    /// Check out main (or master) and fast-forward it. Dirty repos are left alone.
+    BackToMain,
+    /// Push the branch if needed, then `gh pr create` with one title.
+    OpenPr,
+    /// Any shell command, `sh -c`, in each repo.
+    Run,
+}
+
+impl BatchAction {
+    /// What the input box asks for; `None` for an action that needs nothing
+    /// typed and starts as soon as it is picked.
+    pub fn prompt(self) -> Option<&'static str> {
+        match self {
+            Self::Commit => Some("message for every repo"),
+            Self::NewBranch => Some("branch name"),
+            Self::OpenPr => Some("PR title"),
+            Self::Run => Some("command"),
+            Self::BackToMain => None,
+        }
+    }
+
+    /// Whether finishing ends at the push question. Only a commit does: a new
+    /// branch is a local thing, and pushing one can set off CI that deploys it.
+    pub fn pushes(self) -> bool {
+        matches!(self, Self::Commit)
+    }
+
+    /// Heading for the run: "Commit 3 repos", "New branch in 3 repos".
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Commit => "Commit",
+            Self::NewBranch => "New branch in",
+            Self::BackToMain => "Back to main in",
+            Self::OpenPr => "Open PRs in",
+            Self::Run => "Run in",
+        }
+    }
+
+    /// What a repo is doing while it runs.
+    pub fn running(self) -> &'static str {
+        match self {
+            Self::Commit => "committing",
+            Self::NewBranch => "branching",
+            Self::BackToMain => "switching",
+            Self::OpenPr => "opening PR",
+            Self::Run => "running",
+        }
+    }
+
+    /// What a repo that finished has had done to it.
+    pub fn done(self) -> &'static str {
+        match self {
+            Self::Commit => "committed",
+            Self::NewBranch => "created",
+            Self::BackToMain => "on",
+            Self::OpenPr => "opened",
+            Self::Run => "done",
+        }
+    }
+
+    /// How a count of finished repos reads in a summary: "3 committed",
+    /// "3 back on main" — `done` alone would give "3 on".
+    pub fn tally_word(self) -> &'static str {
+        match self {
+            Self::Commit => "committed",
+            Self::NewBranch => "branched",
+            Self::BackToMain => "back on main",
+            Self::OpenPr => "PRs opened",
+            Self::Run => "done",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchPhase {
-    /// Typing the one message that every repo will get.
+    /// Choosing what to do to the marked repos.
+    Pick,
+    /// Typing the one message (or branch name) that every repo will get.
     Compose,
     Committing,
     /// A repo failed. Nothing else starts until the user says what to do.
@@ -1065,6 +1148,8 @@ pub enum BatchPhase {
 /// One at a time means a failure is on screen, alone, when it happens.
 #[derive(Debug, Clone)]
 pub struct BatchCommit {
+    pub action: BatchAction,
+    /// The commit message, or the branch name, depending on `action`.
     pub message: String,
     /// `Some` while the message is being typed; `None` once the run starts.
     pub input: Option<String>,
@@ -1095,6 +1180,7 @@ pub struct BatchTally {
 impl BatchCommit {
     pub fn new(items: Vec<BatchItem>, tick: u64) -> Self {
         Self {
+            action: BatchAction::Commit,
             message: String::new(),
             input: Some(String::new()),
             items,
@@ -1103,6 +1189,26 @@ impl BatchCommit {
             resume: BatchPhase::Committing,
             started_tick: tick,
             done_tick: None,
+        }
+    }
+
+    /// A batch that first asks what to do, rather than assuming a commit.
+    pub fn pick(items: Vec<BatchItem>, tick: u64) -> Self {
+        Self { input: None, phase: BatchPhase::Pick, ..Self::new(items, tick) }
+    }
+
+    /// Settle the action and open the input box for it.
+    ///
+    /// An action with nothing to type goes straight to running: picking it
+    /// from the menu was the confirmation.
+    pub fn choose(&mut self, action: BatchAction) {
+        self.action = action;
+        if action.prompt().is_some() {
+            self.input = Some(String::new());
+            self.phase = BatchPhase::Compose;
+        } else {
+            self.input = None;
+            self.phase = BatchPhase::Committing;
         }
     }
 
@@ -1146,6 +1252,7 @@ impl BatchCommit {
                 // Committing ends at the push question — but only if there is
                 // something to push. Asking about nothing is just a keystroke.
                 self.phase = if self.phase == BatchPhase::Committing
+                    && self.action.pushes()
                     && self.items.iter().any(|i| i.ready_to_push())
                 {
                     BatchPhase::AskPush
@@ -4001,6 +4108,30 @@ mod tests {
             let a = answer(&spec);
             b.record(&spec, a);
         }
+    }
+
+    #[test]
+    fn an_action_with_nothing_to_type_runs_on_pick_and_never_asks_to_push() {
+        let items = (0..2)
+            .map(|i| BatchItem::new(format!("acme/r{i}"), PathBuf::from(format!("/tmp/r{i}"))))
+            .collect();
+        let mut b = BatchCommit::pick(items, 0);
+        b.choose(BatchAction::BackToMain);
+        assert!(b.is_working() && b.input.is_none());
+        drive(&mut b, |_| Ok("main @ abc".into()));
+        assert_eq!(b.phase, BatchPhase::Done, "nothing to push after a checkout");
+
+        let items = vec![BatchItem::new("acme/r0".into(), PathBuf::from("/tmp/r0"))];
+        let mut b = BatchCommit::pick(items, 0);
+        b.choose(BatchAction::NewBranch);
+        b.input = None;
+        b.phase = BatchPhase::Committing;
+        drive(&mut b, |_| Ok("feat-x".into()));
+        assert_eq!(b.phase, BatchPhase::Done, "a new branch stays local");
+
+        let mut b = BatchCommit::pick(Vec::new(), 0);
+        b.choose(BatchAction::Run);
+        assert_eq!(b.phase, BatchPhase::Compose, "a command has to be typed first");
     }
 
     #[test]

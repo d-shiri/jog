@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use rayon::prelude::*;
 
 use crate::app::state::{
-    AppState, BatchCommit, BatchPhase, DetailItem, FailureDigest, Finder, FinderKind, GitOp, Hit,
+    AppState, BatchAction, BatchCommit, BatchPhase, DetailItem, FailureDigest, Finder, FinderKind, GitOp, Hit,
     PushPrompt, PushWatch, RepoCard, Theme, TriggerPrompt, View,
     classify_log_severity,
 };
@@ -1346,6 +1346,14 @@ async fn handle_key(
         handle_push_prompt(state, key, tx);
         return None;
     }
+    // The batch menu owns every key while it is up: its letters would
+    // otherwise be read as refresh, steps, and the rest.
+    if state.view == View::BatchCommit
+        && state.batch.as_ref().is_some_and(|b| b.phase == BatchPhase::Pick)
+    {
+        handle_batch_pick(state, key, km, tx);
+        return None;
+    }
     // Same for the one message a batch commit is about to apply everywhere.
     if state.view == View::BatchCommit
         && state.batch.as_ref().is_some_and(|b| b.input.is_some())
@@ -1726,6 +1734,8 @@ async fn handle_key(
                 toggle_repo_mark(state);
             } else if key_is(&key, km.batch_commit) {
                 start_batch_commit(state);
+            } else if key_is(&key, km.batch_menu) {
+                start_batch_menu(state);
             }
         }
         View::BatchCommit => {
@@ -2861,8 +2871,9 @@ fn toggle_repo_mark(state: &mut AppState) {
     }
 }
 
-/// Open the message box for a batch commit over every marked repo.
-fn start_batch_commit(state: &mut AppState) {
+/// The marked repos as batch items, in dashboard order — or `None`, with the
+/// reason on the status line, when a batch can't start over them.
+fn marked_batch_items(state: &mut AppState) -> Option<Vec<crate::app::state::BatchItem>> {
     let marked: Vec<(String, std::path::PathBuf)> = state
         .repos
         .iter()
@@ -2874,20 +2885,74 @@ fn start_batch_commit(state: &mut AppState) {
         state.set_status(format!(
             "nothing marked — {key} marks the repo under the cursor, then C commits them all"
         ));
-        return;
+        return None;
     }
     // Staging under a hook that is already reading the index would change the
     // commit out from under it.
     if let Some(busy) = marked.iter().find(|(spec, _)| state.op_running(spec)) {
         state.set_status(format!("{} is already mid-commit — wait for it", busy.0));
-        return;
+        return None;
     }
-    let items = marked
-        .into_iter()
-        .map(|(spec, path)| crate::app::state::BatchItem::new(spec, path))
-        .collect();
+    Some(
+        marked
+            .into_iter()
+            .map(|(spec, path)| crate::app::state::BatchItem::new(spec, path))
+            .collect(),
+    )
+}
+
+/// Open the message box for a batch commit over every marked repo.
+fn start_batch_commit(state: &mut AppState) {
+    let Some(items) = marked_batch_items(state) else {
+        return;
+    };
     state.batch = Some(BatchCommit::new(items, state.tick_count));
     state.switch_view(View::BatchCommit);
+}
+
+/// Open the menu of things a batch can do to every marked repo.
+fn start_batch_menu(state: &mut AppState) {
+    let Some(items) = marked_batch_items(state) else {
+        return;
+    };
+    state.batch = Some(BatchCommit::pick(items, state.tick_count));
+    state.switch_view(View::BatchCommit);
+}
+
+/// The menu's letters, in the order the menu lists them.
+pub(crate) const BATCH_MENU: [(char, BatchAction, &str); 5] = [
+    ('n', BatchAction::NewBranch, "new branch from main"),
+    ('m', BatchAction::BackToMain, "back to main and pull (skips dirty repos)"),
+    ('p', BatchAction::OpenPr, "open a PR from each branch (gh)"),
+    ('c', BatchAction::Commit, "commit everything"),
+    ('r', BatchAction::Run, "run a shell command in each"),
+];
+
+/// Pick what the batch does. Esc backs out with the marks kept.
+fn handle_batch_pick(
+    state: &mut AppState,
+    key: KeyEvent,
+    km: &Keymap,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    if key_is(&key, km.back) || is_back_fallback(&key) {
+        state.batch = None;
+        state.switch_view(View::Repos);
+        return;
+    }
+    let KeyCode::Char(c) = key.code else {
+        return;
+    };
+    let Some(&(_, action, _)) = BATCH_MENU.iter().find(|(k, _, _)| *k == c) else {
+        return;
+    };
+    let Some(batch) = state.batch.as_mut() else {
+        return;
+    };
+    batch.choose(action);
+    if batch.is_working() {
+        batch_step(state, tx);
+    }
 }
 
 /// Type the one message every repo in the batch will get.
@@ -2911,6 +2976,12 @@ fn handle_batch_input(state: &mut AppState, key: KeyEvent, tx: &mpsc::UnboundedS
             let msg = buf.trim().to_string();
             if msg.is_empty() {
                 state.set_status("type a message first — ↵ starts, Esc cancels".into());
+                return;
+            }
+            if batch.action == BatchAction::NewBranch
+                && let Err(e) = crate::git::check_branch_name(&msg)
+            {
+                state.set_status_err(e.to_string());
                 return;
             }
             batch.input = None;
@@ -2961,7 +3032,7 @@ fn batch_auto_return(state: &mut AppState) {
         return;
     }
     let t = batch.tally();
-    let mut parts = vec![format!("{} committed", t.committed)];
+    let mut parts = vec![format!("{} {}", t.committed, batch.action.tally_word())];
     if t.pushed > 0 {
         parts.push(format!("{} pushed", t.pushed));
     }
@@ -3003,8 +3074,76 @@ fn batch_step(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
     let (spec, path) = (item.spec.clone(), item.path.clone());
     let pushing = batch.phase == BatchPhase::Pushing;
     let msg = batch.message.clone();
+    let action = batch.action;
 
-    if pushing {
+    if !pushing && action == BatchAction::BackToMain {
+        spawn_streaming_op_for(state, tx, spec, path, "checkout", "post-checkout", move |dir, out| {
+            // A dirty tree would either refuse the checkout or carry the
+            // changes onto main; neither is what "back to main" means.
+            let st = crate::git::status(dir)?;
+            if !st.is_clean() {
+                return Ok(format!("{BATCH_NOTHING}uncommitted changes — left alone"));
+            }
+            let Some(main) = crate::git::main_branch(dir) else {
+                return Ok(format!("{BATCH_NOTHING}no main or master branch"));
+            };
+            if st.detached || st.branch != main {
+                crate::git::checkout(dir, main, out)?;
+            }
+            if crate::git::status(dir)?.has_upstream {
+                crate::git::pull_ff(dir, out)?;
+            }
+            Ok(format!("{main} @ {}", crate::git::head_sha(dir).unwrap_or_else(|_| "HEAD".into())))
+        });
+    } else if !pushing && action == BatchAction::OpenPr {
+        spawn_streaming_op_for(state, tx, spec, path, "pr", "pre-push", move |dir, out| {
+            let st = crate::git::status(dir)?;
+            if st.detached {
+                return Ok(format!("{BATCH_NOTHING}detached HEAD"));
+            }
+            if matches!(st.branch.as_str(), "main" | "master") {
+                return Ok(format!("{BATCH_NOTHING}on {}, no branch to open a PR from", st.branch));
+            }
+            // gh opens the PR against what is on the remote, so it goes up first.
+            if !st.has_upstream || st.ahead > 0 {
+                crate::git::push(dir, &st.branch, st.has_upstream, out)?;
+            }
+            match crate::git::open_pr(dir, &st.branch, &msg, out)? {
+                crate::git::PrOutcome::Opened(url) => Ok(url),
+                crate::git::PrOutcome::Exists(url) => {
+                    Ok(format!("{BATCH_NOTHING}PR already open {url}").trim_end().to_string())
+                }
+            }
+        });
+    } else if !pushing && action == BatchAction::Run {
+        spawn_streaming_op_for(state, tx, spec, path, "run", "", move |dir, out| {
+            crate::git::run_shell(dir, &msg, out)
+        });
+    } else if !pushing && action == BatchAction::NewBranch {
+        spawn_streaming_op_for(
+            state,
+            tx,
+            spec,
+            path,
+            "checkout",
+            "post-checkout",
+            move |dir, out| {
+                // Every branch starts from main: a repo parked on a feature
+                // branch would otherwise fork the new one off half-done work.
+                let st = crate::git::status(dir)?;
+                if st.detached {
+                    return Ok(format!("{BATCH_NOTHING}detached HEAD, not main"));
+                }
+                if !matches!(st.branch.as_str(), "main" | "master") {
+                    return Ok(format!("{BATCH_NOTHING}on {}, not main", st.branch));
+                }
+                if crate::git::branch_exists(dir, &msg) {
+                    return Ok(format!("{BATCH_NOTHING}{msg} already exists"));
+                }
+                crate::git::create_branch(dir, &msg, out)
+            },
+        );
+    } else if pushing {
         spawn_streaming_op_for(state, tx, spec, path, "push", "pre-push", move |dir, out| {
             // Read the branch here rather than trusting the dashboard's copy:
             // the commit that just landed changed the ahead count, and pushing
@@ -3649,6 +3788,7 @@ struct Keymap {
     snooze: (KeyCode, KeyModifiers),
     repo_mark: (KeyCode, KeyModifiers),
     batch_commit: (KeyCode, KeyModifiers),
+    batch_menu: (KeyCode, KeyModifiers),
     batch_retry: (KeyCode, KeyModifiers),
     batch_skip: (KeyCode, KeyModifiers),
     git_view: (KeyCode, KeyModifiers),
@@ -3760,6 +3900,7 @@ fn resolve_keymap(cfg: &KeymapConfig) -> Result<Keymap> {
         snooze:        parse_key(&cfg.snooze)?,
         repo_mark:     parse_key(&cfg.repo_mark)?,
         batch_commit:  parse_key(&cfg.batch_commit)?,
+        batch_menu:    parse_key(&cfg.batch_menu)?,
         batch_retry:   parse_key(&cfg.batch_retry)?,
         batch_skip:    parse_key(&cfg.batch_skip)?,
         git_view:      parse_key(&cfg.git_view)?,
@@ -6326,6 +6467,34 @@ mod tests {
         // view's own to dismiss.
         st.git_view.as_mut().unwrap().spec = "acme/web".into();
         assert!(!batch_owns_current_op(&st));
+    }
+
+    #[test]
+    fn the_batch_menu_asks_first_then_opens_the_box_for_what_was_picked() {
+        let mut st = dashboard();
+        st.repo_marks.insert("acme/api".into());
+        st.repo_marks.insert("acme/web".into());
+        start_batch_menu(&mut st);
+        assert_eq!(st.view, View::BatchCommit);
+        let b = st.batch.as_mut().unwrap();
+        assert_eq!(b.phase, BatchPhase::Pick);
+        // Nothing to type yet: the input box is what routes keys away from the menu.
+        assert!(b.input.is_none());
+        assert_eq!(b.items.len(), 2);
+
+        b.choose(BatchAction::NewBranch);
+        assert_eq!(b.phase, BatchPhase::Compose);
+        assert_eq!(b.action, BatchAction::NewBranch);
+        assert_eq!(b.input.as_deref(), Some(""));
+        assert!(!batch_is_live(&st), "nothing has run yet");
+    }
+
+    #[test]
+    fn the_batch_menu_with_nothing_marked_does_not_open() {
+        let mut st = dashboard();
+        start_batch_menu(&mut st);
+        assert!(st.batch.is_none());
+        assert_eq!(st.view, View::Repos);
     }
 
     #[test]

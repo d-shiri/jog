@@ -14,7 +14,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::animated_glyph;
 use super::motion::{Motion, mix};
 use crate::app::state::{
-    AppState, BatchPhase, ByteSpan, DetailItem, DiffLine, DiffRow, DiffSide, GitDiffView, GitOp,
+    AppState, BatchAction, BatchPhase, ByteSpan, DetailItem, DiffLine, DiffRow, DiffSide, GitDiffView, GitOp,
     Hit, ItemState, Pulse,
     StatusKind, Theme, View, ansi_line_to_spans,
 };
@@ -632,11 +632,19 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         }
         View::BatchCommit => {
             let n = state.batch.as_ref().map(|b| b.items.len()).unwrap_or(0);
+            let what = match state.batch.as_ref().map(|b| (b.phase, b.action)) {
+                Some((BatchPhase::Pick, _)) => "Batch",
+                Some((_, BatchAction::NewBranch)) => "Batch new branch",
+                Some((_, BatchAction::BackToMain)) => "Batch back to main",
+                Some((_, BatchAction::OpenPr)) => "Batch PRs",
+                Some((_, BatchAction::Run)) => "Batch run",
+                _ => "Batch commit",
+            };
             vec![
                 Span::styled("Repos", Style::default().fg(theme.text_muted)),
                 sep(),
                 Span::styled(
-                    format!("Batch commit ({n})"),
+                    format!("{what} ({n})"),
                     Style::default().fg(theme.primary).bold(),
                 ),
             ]
@@ -1273,6 +1281,7 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             // as a broken one.
             if !state.repo_marks.is_empty() {
                 hints.push((display_key(&km.batch_commit).into(), "commit marked"));
+                hints.push((display_key(&km.batch_menu).into(), "git actions"));
             }
             hints.push((display_key(&km.refresh).into(), "refresh"));
             hints.push((display_key(&km.finder).into(), "find"));
@@ -1285,8 +1294,23 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             hints
         }
         View::BatchCommit => match state.batch.as_ref().map(|b| b.phase) {
+            Some(BatchPhase::Pick) => {
+                let mut v: Vec<(String, &str)> = crate::tui::BATCH_MENU
+                    .iter()
+                    .map(|(k, a, _)| (k.to_string(), a.title().trim_end_matches(" in")))
+                    .collect();
+                v.push(("Esc".into(), "cancel"));
+                v
+            }
             Some(BatchPhase::Compose) => vec![
-                ("type".into(), "message for every repo"),
+                (
+                    "type".into(),
+                    state
+                        .batch
+                        .as_ref()
+                        .and_then(|b| b.action.prompt())
+                        .unwrap_or("message for every repo"),
+                ),
                 ("Bksp".into(), "delete"),
                 ("↵".into(), "start"),
                 ("Esc".into(), "cancel"),
@@ -3152,7 +3176,10 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
                 ("↵".into(), "switch to this repo"),
                 (k(&km.git_view), "review local changes"),
                 (k(&km.repo_mark), "mark / unmark this repo for a batch commit"),
-                (k(&km.batch_commit), "commit every marked repo with one message"),
+                (
+                    format!("{}/{}", k(&km.batch_commit), k(&km.batch_menu)),
+                    "commit the marked repos / more (branch, main, PRs, run)",
+                ),
                 (k(&km.open_browser), "open the repo's Actions page"),
             ],
         ),
@@ -4024,12 +4051,18 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
     // The queue never squeezes the bottom pane out: a hook you cannot read, or
     // a message box you have to type into blind because a dozen marked repos
     // filled the screen, are the two things this view exists to avoid.
-    let composing = batch.input.is_some();
+    let composing = batch.input.is_some() || batch.phase == BatchPhase::Pick;
     let lower = op.is_some() || composing;
+    let act = batch.action;
     // Borders, a row of top padding, and four lines of prompt. Fixed, because a
     // four-line prompt stretched down forty rows is its own kind of clutter.
-    const COMPOSE_H: u16 = 7;
-    let reserve = if composing { COMPOSE_H } else { 3 };
+    // The menu is a line per action, plus its Esc line, borders and padding.
+    let box_h: u16 = if batch.phase == BatchPhase::Pick {
+        crate::tui::BATCH_MENU.len() as u16 + 4
+    } else {
+        7
+    };
+    let reserve = if composing { box_h } else { 3 };
     let room = if lower {
         area.height.saturating_sub(reserve + 1).max(3)
     } else {
@@ -4052,7 +4085,7 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
             (true, true) => [
                 Constraint::Length(list_h),
                 Constraint::Length(1),
-                Constraint::Length(COMPOSE_H.min(area.height.saturating_sub(list_h + 1))),
+                Constraint::Length(box_h.min(area.height.saturating_sub(list_h + 1))),
                 Constraint::Min(0),
             ],
             _ => [
@@ -4066,8 +4099,12 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
     let (top, bottom) = (chunks[0], chunks[2]);
 
     let (title, border) = match batch.phase {
+        BatchPhase::Pick => (
+            format!(" {} marked repo{} ", batch.items.len(), plural(batch.items.len())),
+            theme.accent,
+        ),
         BatchPhase::Compose => (
-            format!(" Commit {} repo{} ", batch.items.len(), plural(batch.items.len())),
+            format!(" {} {} repo{} ", act.title(), batch.items.len(), plural(batch.items.len())),
             theme.accent,
         ),
         BatchPhase::Paused => (
@@ -4084,8 +4121,9 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
             let t = batch.tally();
             (
                 format!(
-                    " {} committed — {} pushes them all, Esc finishes ",
+                    " {} {} — {} pushes them all, Esc finishes ",
                     t.committed,
+                    act.done(),
                     display_key(&state.keymap.git_push),
                 ),
                 theme.warning,
@@ -4093,7 +4131,7 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
         }
         BatchPhase::Done => {
             let t = batch.tally();
-            let mut parts = vec![format!("{} committed", t.committed)];
+            let mut parts = vec![format!("{} {}", t.committed, act.tally_word())];
             if t.pushed > 0 {
                 parts.push(format!("{} pushed", t.pushed));
             }
@@ -4115,7 +4153,12 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
             format!(
                 " {} {} · {}/{} ",
                 animated_glyph(Status::Running, state.tick_count),
-                if batch.phase == BatchPhase::Pushing { "Pushing" } else { "Committing" },
+                if batch.phase == BatchPhase::Pushing {
+                    "Pushing".to_string()
+                } else {
+                    let r = act.running();
+                    r[..1].to_uppercase() + &r[1..]
+                },
                 batch.cursor + 1,
                 batch.items.len(),
             ),
@@ -4167,7 +4210,7 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
                     Style::default().fg(theme.warning).bold(),
                     format!(
                         "{}… {}s",
-                        if batch.phase == BatchPhase::Pushing { "pushing" } else { "committing" },
+                        if batch.phase == BatchPhase::Pushing { "pushing" } else { act.running() },
                         state.tick_count.saturating_sub(batch.started_tick) / 10,
                     ),
                     Style::default().fg(theme.text_bright),
@@ -4175,7 +4218,7 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
                 ItemState::Committed => (
                     "✓",
                     Style::default().fg(theme.success),
-                    format!("committed {}", item.sha.as_deref().unwrap_or("HEAD")),
+                    format!("{} {}", act.done(), item.sha.as_deref().unwrap_or("HEAD")),
                     Style::default().fg(theme.success_dim),
                 ),
                 ItemState::Pushed => (
@@ -4190,7 +4233,7 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
                     Some(sha) => (
                         "✓",
                         Style::default().fg(theme.success),
-                        format!("committed {sha} · {why}"),
+                        format!("{} {sha} · {why}", act.done()),
                         Style::default().fg(theme.success_dim),
                     ),
                     None => ("–", dim, why.clone(), dim),
@@ -4201,7 +4244,7 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
                     "✗",
                     Style::default().fg(theme.failure).bold(),
                     match item.sha.as_deref() {
-                        Some(sha) => format!("committed {sha}, then failed: {err}"),
+                        Some(sha) => format!("{} {sha}, then failed: {err}", act.done()),
                         None => err.clone(),
                     },
                     Style::default().fg(theme.failure),
@@ -4224,9 +4267,10 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
         let t = batch.tally();
         lines.push(Line::from(Span::styled(
             format!(
-                "… {} more · {} committed · {} failed · {} waiting",
+                "… {} more · {} {} · {} failed · {} waiting",
                 batch.items.len() - shown,
                 t.committed,
+                act.tally_word(),
                 t.failed,
                 t.untouched,
             ),
@@ -4234,6 +4278,90 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
         )));
     }
     f.render_widget(Paragraph::new(lines), inner);
+
+    // Picking: the menu sits where the input box will open.
+    if batch.phase == BatchPhase::Pick {
+        let blk = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.accent))
+            .padding(Padding::new(2, 2, 1, 0))
+            .title(Span::styled(" What to do to them? ", Style::default().fg(theme.accent).bold()));
+        let bi = blk.inner(bottom);
+        f.render_widget(blk, bottom);
+        let key = Style::default().fg(theme.accent).bold();
+        let text = Style::default().fg(theme.text_bright);
+        let mut lines: Vec<Line> = crate::tui::BATCH_MENU
+            .iter()
+            .map(|(k, _, what)| {
+                Line::from(vec![Span::styled(format!("{k}  "), key), Span::styled(*what, text)])
+            })
+            .collect();
+        lines.push(Line::from(Span::styled("Esc cancel", dim)));
+        f.render_widget(Paragraph::new(lines), bi);
+        return;
+    }
+
+    if let Some(buf) = batch.input.as_ref().filter(|_| act != BatchAction::Commit) {
+        // Which marked repos will be skipped, said before Enter rather than after.
+        let off_main: Vec<&str> = batch
+            .items
+            .iter()
+            .filter_map(|i| state.repos.iter().find(|c| c.spec == i.spec))
+            .filter(|c| {
+                c.git
+                    .as_ref()
+                    .is_some_and(|g| g.detached || !matches!(g.branch.as_str(), "main" | "master"))
+            })
+            .map(|c| c.spec.as_str())
+            .collect();
+        let blk = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.accent))
+            .padding(Padding::new(2, 2, 1, 0))
+            .title(Span::styled(
+                format!(
+                    " One {} for {} repo{} ",
+                    act.prompt().unwrap_or("input"),
+                    batch.items.len(),
+                    plural(batch.items.len()),
+                ),
+                Style::default().fg(theme.accent).bold(),
+            ));
+        let bi = blk.inner(bottom);
+        f.render_widget(blk, bottom);
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(buf.as_str(), Style::default().fg(theme.text_bright)),
+                Span::styled("█", Style::default().fg(theme.accent)),
+            ]),
+            Line::raw(""),
+        ];
+        let note = match act {
+            BatchAction::OpenPr => Some("pushes each branch, then `gh pr create` — repos on main are skipped"),
+            BatchAction::Run => Some("`sh -c` in each repo, one at a time — a failure pauses the rest"),
+            _ => None,
+        };
+        if let (Some(note), true) = (note, bi.height >= 4) {
+            lines.push(Line::from(Span::styled(note, dim)));
+        } else if bi.height >= 4 {
+            lines.push(if off_main.is_empty() {
+                Line::from(Span::styled(
+                    "`git checkout -b` in each repo — all are on main",
+                    dim,
+                ))
+            } else {
+                Line::from(Span::styled(
+                    format!("not on main, will be skipped: {}", off_main.join(", ")),
+                    Style::default().fg(theme.warning),
+                ))
+            });
+        }
+        lines.push(Line::from(Span::styled("↵ start · Esc cancel", dim)));
+        f.render_widget(Paragraph::new(lines), bi);
+        return;
+    }
 
     match (batch.input.as_ref(), op) {
         // Composing: the message box sits where the output will be, so the eye
@@ -10944,6 +11072,21 @@ jobs:
             assert!(out.contains(spec), "{spec} missing from:\n{out}");
         }
         assert!(out.contains("git add -A"), "got:\n{out}");
+    }
+
+    #[test]
+    fn the_batch_menu_shows_every_action_with_its_key() {
+        let mut st = batch_state(BatchPhase::Compose);
+        if let Some(b) = st.batch.as_mut() {
+            b.phase = BatchPhase::Pick;
+            b.input = None;
+        }
+        let out = draw_batch(&st, 110, 16);
+        assert!(out.contains("3 marked repos"), "got:\n{out}");
+        for (k, _, what) in crate::tui::BATCH_MENU {
+            assert!(out.contains(&format!("{k}  {what}")), "{what} missing from:\n{out}");
+        }
+        assert!(out.contains("Esc cancel"), "got:\n{out}");
     }
 
     #[test]

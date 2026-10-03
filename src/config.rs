@@ -265,6 +265,8 @@ pub struct KeymapConfig {
     // batch commit: mark repos on the dashboard, commit them with one message
     pub repo_mark: String,
     pub batch_commit: String,
+    // menu of git actions (new branch, commit) over the marked repos
+    pub batch_menu: String,
     pub batch_retry: String,
     pub batch_skip: String,
     // working tree (stage / commit / push) for a local checkout
@@ -320,6 +322,7 @@ impl Default for KeymapConfig {
             snooze: "Z".into(),
             repo_mark: "Space".into(),
             batch_commit: "C".into(),
+            batch_menu: "B".into(),
             batch_retry: "t".into(),
             batch_skip: "s".into(),
             git_view: "c".into(),

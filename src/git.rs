@@ -228,11 +228,24 @@ fn git_streaming(
     args: &[&str],
     on_line: &mut dyn FnMut(String, bool),
 ) -> Result<(bool, Vec<String>)> {
+    run_streaming("git", dir, args, on_line)
+}
+
+/// [`git_streaming`] for any program — `gh`, or `sh -c` for a batch's own
+/// command. Prompts are switched off for all of them: there is no terminal
+/// behind the TUI for anyone to answer one on.
+fn run_streaming(
+    program: &str,
+    dir: &Path,
+    args: &[&str],
+    on_line: &mut dyn FnMut(String, bool),
+) -> Result<(bool, Vec<String>)> {
     let (reader, writer) = std::io::pipe().context("create output pipe")?;
     let writer2 = writer.try_clone().context("clone output pipe")?;
-    let mut child = Command::new("git")
+    let mut child = Command::new(program)
         .args(args)
         .current_dir(dir)
+        .env("GH_PROMPT_DISABLED", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         // Hooks that colour their output would otherwise have to be stripped
@@ -242,7 +255,7 @@ fn git_streaming(
         .stdout(writer)
         .stderr(writer2)
         .spawn()
-        .with_context(|| format!("run git {}", args.join(" ")))?;
+        .with_context(|| format!("run {program} {}", args.join(" ")))?;
     // The parent's copies of the write end live in the `Command`, which is a
     // temporary and so is dropped at the end of this statement — that is what
     // closes them and lets `reader` see EOF when the child (and anything it
@@ -261,7 +274,7 @@ fn git_streaming(
 
     let status = child
         .wait()
-        .with_context(|| format!("wait for git {}", args.join(" ")))?;
+        .with_context(|| format!("wait for {program} {}", args.join(" ")))?;
     Ok((status.success(), collected))
 }
 
@@ -540,6 +553,110 @@ pub fn commit(
         .to_string())
 }
 
+/// Whether `name` is a legal new branch name, asked of git itself — the rules
+/// (no `..`, no trailing `.lock`, no leading `-`, …) are git's to define.
+pub fn check_branch_name(name: &str) -> Result<()> {
+    let out = Command::new("git")
+        .args(["check-ref-format", "--branch", name])
+        .output()
+        .context("run git check-ref-format")?;
+    if !out.status.success() {
+        return Err(anyhow!("not a valid branch name: {name}"));
+    }
+    Ok(())
+}
+
+/// Whether a local branch called `name` exists.
+pub fn branch_exists(dir: &Path, name: &str) -> bool {
+    git(dir, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{name}")]).is_ok()
+}
+
+/// `git checkout -b <name>` off the current HEAD.
+///
+/// Streams because `post-checkout` hooks are a thing, and their output is the
+/// only account of what they did.
+pub fn create_branch(
+    dir: &Path,
+    name: &str,
+    on_line: &mut dyn FnMut(String, bool),
+) -> Result<String> {
+    let (ok, lines) = git_streaming(dir, &["checkout", "-b", name], on_line)?;
+    if !ok {
+        return Err(command_failure(dir, "checkout", "post-checkout", &lines.join("\n")));
+    }
+    Ok(name.to_string())
+}
+
+/// The repo's mainline: `main`, else `master`, else nothing.
+pub fn main_branch(dir: &Path) -> Option<&'static str> {
+    ["main", "master"].into_iter().find(|b| branch_exists(dir, b))
+}
+
+/// `git checkout <name>` of a branch that exists.
+pub fn checkout(dir: &Path, name: &str, on_line: &mut dyn FnMut(String, bool)) -> Result<()> {
+    let (ok, lines) = git_streaming(dir, &["checkout", name], on_line)?;
+    if !ok {
+        return Err(command_failure(dir, "checkout", "post-checkout", &lines.join("\n")));
+    }
+    Ok(())
+}
+
+/// `git pull --ff-only`: a batch never makes merge commits. A branch that has
+/// diverged fails here and waits for a person.
+pub fn pull_ff(dir: &Path, on_line: &mut dyn FnMut(String, bool)) -> Result<()> {
+    let (ok, lines) = git_streaming(dir, &["pull", "--ff-only"], on_line)?;
+    if !ok {
+        return Err(command_failure(dir, "pull", "post-merge", &lines.join("\n")));
+    }
+    Ok(())
+}
+
+/// What `gh pr create` came back with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrOutcome {
+    Opened(String),
+    /// There already is one for this branch; its URL, when gh gave it.
+    Exists(String),
+}
+
+/// Open a PR from `branch` with `title` and an empty body, via `gh`.
+pub fn open_pr(
+    dir: &Path,
+    branch: &str,
+    title: &str,
+    on_line: &mut dyn FnMut(String, bool),
+) -> Result<PrOutcome> {
+    let args = ["pr", "create", "--head", branch, "--title", title, "--body", ""];
+    let (ok, lines) = run_streaming("gh", dir, &args, on_line)?;
+    let url = lines
+        .iter()
+        .rev()
+        .find(|l| l.trim_start().starts_with("https://"))
+        .map(|l| l.trim().to_string());
+    if ok {
+        return Ok(PrOutcome::Opened(url.unwrap_or_else(|| "opened".into())));
+    }
+    if lines.iter().any(|l| l.contains("already exists")) {
+        return Ok(PrOutcome::Exists(url.unwrap_or_default()));
+    }
+    Err(anyhow!("gh pr create: {}", last_line(&lines.join("\n"))))
+}
+
+/// Run `command` under `sh -c` in `dir`. Returns its last line of output.
+pub fn run_shell(dir: &Path, command: &str, on_line: &mut dyn FnMut(String, bool)) -> Result<String> {
+    let (ok, lines) = run_streaming("sh", dir, &["-c", command], on_line)?;
+    let text = lines.join("\n");
+    if !ok {
+        return Err(anyhow!("failed: {}", last_line(&text)));
+    }
+    Ok(lines
+        .iter()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+        .unwrap_or_else(|| "ok".into()))
+}
+
 /// Push the current branch, setting upstream when there isn't one.
 ///
 /// Streams for the same reason `commit` does — `pre-push` hooks are where the
@@ -789,6 +906,61 @@ mod tests {
             git(&dir, &args).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn a_new_branch_is_made_once_and_only_with_a_legal_name() {
+        let dir = scratch_repo("branch");
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        git(&dir, &["add", "-A"]).unwrap();
+        git(&dir, &["commit", "-qm", "init"]).unwrap();
+
+        assert!(check_branch_name("feat/new-thing").is_ok());
+        assert!(check_branch_name("bad..name").is_err());
+        assert!(check_branch_name("-x").is_err());
+
+        assert!(!branch_exists(&dir, "feat-x"));
+        create_branch(&dir, "feat-x", &mut |_, _| {}).unwrap();
+        assert!(branch_exists(&dir, "feat-x"));
+        assert_eq!(status(&dir).unwrap().branch, "feat-x");
+        // A second time is git's error, not a silent no-op.
+        git(&dir, &["checkout", "-q", "main"]).unwrap();
+        assert!(create_branch(&dir, "feat-x", &mut |_, _| {}).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn back_to_main_finds_the_mainline_and_moves_onto_it() {
+        let dir = scratch_repo("main");
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        git(&dir, &["add", "-A"]).unwrap();
+        git(&dir, &["commit", "-qm", "init"]).unwrap();
+        assert_eq!(main_branch(&dir), Some("main"));
+        create_branch(&dir, "feat-y", &mut |_, _| {}).unwrap();
+        checkout(&dir, "main", &mut |_, _| {}).unwrap();
+        assert_eq!(status(&dir).unwrap().branch, "main");
+        // No upstream to pull from is git's refusal, not a hang.
+        assert!(pull_ff(&dir, &mut |_, _| {}).is_err());
+        git(&dir, &["branch", "-m", "main", "master"]).unwrap();
+        assert_eq!(main_branch(&dir), Some("master"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_shell_command_reports_its_last_line_or_its_failure() {
+        let dir = scratch_repo("shell");
+        let mut seen = Vec::new();
+        let out = run_shell(&dir, "echo one; echo two", &mut |l, p| {
+            if !p {
+                seen.push(l)
+            }
+        })
+        .unwrap();
+        assert_eq!(out, "two");
+        assert_eq!(seen, ["one", "two"]);
+        let err = run_shell(&dir, "echo broke >&2; exit 3", &mut |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("broke"), "got {err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Install an executable hook that runs `script`.
