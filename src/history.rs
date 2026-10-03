@@ -168,21 +168,14 @@ impl History {
         self.save();
     }
 
-    pub fn last_dispatch_inputs(
-        &self,
-        workflow_file: &str,
-    ) -> Option<&HashMap<String, String>> {
+    pub fn last_dispatch_inputs(&self, workflow_file: &str) -> Option<&HashMap<String, String>> {
         self.dispatch_inputs.get(workflow_file)
     }
 
     /// (failed_count, terminal_count) per step name for the last `n` terminal runs
     /// of the given workflow. Steps are keyed by name; cancelled/skipped runs
     /// are excluded from the denominator since they don't reflect step health.
-    pub fn step_failure_stats(
-        &self,
-        workflow_file: &str,
-        n: usize,
-    ) -> HashMap<String, (u32, u32)> {
+    pub fn step_failure_stats(&self, workflow_file: &str, n: usize) -> HashMap<String, (u32, u32)> {
         let mut out: HashMap<String, (u32, u32)> = HashMap::new();
         for entry in self
             .entries
@@ -206,7 +199,9 @@ impl History {
 
     /// Most recent run (any status) for the given workflow.
     pub fn last_run(&self, workflow_file: &str) -> Option<&HistoryEntry> {
-        self.entries.iter().find(|e| e.workflow_file == workflow_file)
+        self.entries
+            .iter()
+            .find(|e| e.workflow_file == workflow_file)
     }
 
     /// Most recent successful run for the given workflow.
@@ -224,7 +219,13 @@ fn repo_history_path(owner: &str, repo: &str) -> Option<PathBuf> {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -248,8 +249,14 @@ mod tests {
             entries: Vec::new(),
             dispatch_inputs: HashMap::new(),
         };
-        h.record("ci.yml", &detail(1, Status::Success, 9, &[("build", Status::Success)]));
-        h.record_dispatch_inputs("ci.yml", &HashMap::from([("env".to_string(), "prod".to_string())]));
+        h.record(
+            "ci.yml",
+            &detail(1, Status::Success, 9, &[("build", Status::Success)]),
+        );
+        h.record_dispatch_inputs(
+            "ci.yml",
+            &HashMap::from([("env".to_string(), "prod".to_string())]),
+        );
 
         // Writing through a sibling and renaming is what makes the save atomic,
         // and it is observable: `rename(2)` needs write permission on the
@@ -274,7 +281,10 @@ mod tests {
             let mut perms = std::fs::metadata(&path).expect("written").permissions();
             perms.set_mode(0o444);
             std::fs::set_permissions(&path, perms).expect("make read-only");
-            h.record("ci.yml", &detail(2, Status::Failure, 10, &[("build", Status::Failure)]));
+            h.record(
+                "ci.yml",
+                &detail(2, Status::Failure, 10, &[("build", Status::Failure)]),
+            );
             let raw = std::fs::read_to_string(&path).expect("still readable");
             if bits_honoured {
                 assert_eq!(
@@ -299,7 +309,9 @@ mod tests {
         // that a half-written document collapses to.
         assert!(!back.entries.is_empty(), "history survived the save");
         assert_eq!(
-            back.dispatch_inputs.get("ci.yml").and_then(|m| m.get("env")),
+            back.dispatch_inputs
+                .get("ci.yml")
+                .and_then(|m| m.get("env")),
             Some(&"prod".to_string())
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -345,7 +357,10 @@ mod tests {
     #[test]
     fn files_from_before_dispatch_inputs_existed_still_parse() {
         let mut h = History::default();
-        h.record("a.yml", &detail(1, Status::Success, 1, &[("build", Status::Success)]));
+        h.record(
+            "a.yml",
+            &detail(1, Status::Success, 1, &[("build", Status::Success)]),
+        );
         // The old format was the bare entry array.
         let legacy = serde_json::to_string(&h.entries).unwrap();
         let parsed = HistoryFile::parse(&legacy);
@@ -356,11 +371,13 @@ mod tests {
     #[test]
     fn dispatch_inputs_survive_the_round_trip() {
         let mut h = History::default();
-        let inputs: HashMap<String, String> =
-            [("env".to_string(), "prod".to_string())].into_iter().collect();
+        let inputs: HashMap<String, String> = [("env".to_string(), "prod".to_string())]
+            .into_iter()
+            .collect();
         h.record_dispatch_inputs("deploy.yml", &inputs);
         assert_eq!(
-            h.last_dispatch_inputs("deploy.yml").and_then(|m| m.get("env")),
+            h.last_dispatch_inputs("deploy.yml")
+                .and_then(|m| m.get("env")),
             Some(&"prod".to_string())
         );
         // And through the file format.
@@ -370,7 +387,10 @@ mod tests {
         };
         let parsed = HistoryFile::parse(&serde_json::to_string(&file).unwrap());
         assert_eq!(
-            parsed.dispatch_inputs.get("deploy.yml").and_then(|m| m.get("env")),
+            parsed
+                .dispatch_inputs
+                .get("deploy.yml")
+                .and_then(|m| m.get("env")),
             Some(&"prod".to_string())
         );
     }
@@ -379,12 +399,27 @@ mod tests {
     fn step_failure_stats_only_count_terminal_runs() {
         let mut h = History::default();
         // Running run is ignored.
-        h.record("a.yml", &detail(1, Status::Running, 1, &[("test", Status::Running)]));
+        h.record(
+            "a.yml",
+            &detail(1, Status::Running, 1, &[("test", Status::Running)]),
+        );
         // Cancelled is excluded from denominator (intentional aborts ≠ flakiness).
-        h.record("a.yml", &detail(2, Status::Cancelled, 2, &[("test", Status::Cancelled)]));
-        h.record("a.yml", &detail(3, Status::Success, 3, &[("test", Status::Success)]));
-        h.record("a.yml", &detail(4, Status::Failure, 4, &[("test", Status::Failure)]));
-        h.record("a.yml", &detail(5, Status::Failure, 5, &[("test", Status::Failure)]));
+        h.record(
+            "a.yml",
+            &detail(2, Status::Cancelled, 2, &[("test", Status::Cancelled)]),
+        );
+        h.record(
+            "a.yml",
+            &detail(3, Status::Success, 3, &[("test", Status::Success)]),
+        );
+        h.record(
+            "a.yml",
+            &detail(4, Status::Failure, 4, &[("test", Status::Failure)]),
+        );
+        h.record(
+            "a.yml",
+            &detail(5, Status::Failure, 5, &[("test", Status::Failure)]),
+        );
         let stats = h.step_failure_stats("a.yml", 10);
         assert_eq!(stats.get("test").copied(), Some((2, 3)));
     }
@@ -401,8 +436,14 @@ mod tests {
     #[test]
     fn other_workflow_isolated() {
         let mut h = History::default();
-        h.record("a.yml", &detail(1, Status::Failure, 1, &[("test", Status::Failure)]));
-        h.record("b.yml", &detail(2, Status::Success, 2, &[("test", Status::Success)]));
+        h.record(
+            "a.yml",
+            &detail(1, Status::Failure, 1, &[("test", Status::Failure)]),
+        );
+        h.record(
+            "b.yml",
+            &detail(2, Status::Success, 2, &[("test", Status::Success)]),
+        );
         let a = h.step_failure_stats("a.yml", 10);
         let b = h.step_failure_stats("b.yml", 10);
         assert_eq!(a.get("test").copied(), Some((1, 1)));
@@ -412,10 +453,15 @@ mod tests {
     #[test]
     fn record_replaces_same_run_id() {
         let mut h = History::default();
-        h.record("a.yml", &detail(1, Status::Failure, 1, &[("t", Status::Failure)]));
-        h.record("a.yml", &detail(1, Status::Success, 1, &[("t", Status::Success)]));
+        h.record(
+            "a.yml",
+            &detail(1, Status::Failure, 1, &[("t", Status::Failure)]),
+        );
+        h.record(
+            "a.yml",
+            &detail(1, Status::Success, 1, &[("t", Status::Success)]),
+        );
         assert_eq!(h.entries.len(), 1);
         assert_eq!(h.entries[0].status, Status::Success);
     }
 }
-

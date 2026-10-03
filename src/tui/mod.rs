@@ -21,9 +21,8 @@ use tokio::sync::mpsc;
 use rayon::prelude::*;
 
 use crate::app::state::{
-    AppState, BatchAction, BatchCommit, BatchPhase, DetailItem, FailureDigest, Finder, FinderKind, GitOp, Hit,
-    PushPrompt, PushWatch, RepoCard, Theme, TriggerPrompt, View,
-    classify_log_severity,
+    AppState, BatchAction, BatchCommit, BatchPhase, DetailItem, FailureDigest, Finder, FinderKind,
+    GitOp, Hit, PushPrompt, PushWatch, RepoCard, Theme, TriggerPrompt, View, classify_log_severity,
 };
 use crate::config::KeymapConfig;
 use crate::config::{Config, NotifyMode};
@@ -170,9 +169,9 @@ pub async fn run(
             .workflows
             .iter()
             .position(|w| w.file_name == file || w.name.eq_ignore_ascii_case(file))
-        {
-            state.workflow_cursor = idx;
-        }
+    {
+        state.workflow_cursor = idx;
+    }
     state.view = opts.initial_view;
     if matches!(state.view, View::Workflows | View::Runs) {
         state.list_opened_tick = Some(state.tick_count);
@@ -406,12 +405,8 @@ fn install_panic_hook() {
 
 fn restore_terminal(t: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode().context("disable raw mode")?;
-    execute!(
-        t.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )
-    .context("leave alternate screen")?;
+    execute!(t.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)
+        .context("leave alternate screen")?;
     t.show_cursor().ok();
     Ok(())
 }
@@ -1335,7 +1330,10 @@ async fn handle_key(
     }
     // While typing a commit message, every key belongs to the editor.
     if state.view == View::GitStatus
-        && state.git_view.as_ref().is_some_and(|g| g.commit_input.is_some())
+        && state
+            .git_view
+            .as_ref()
+            .is_some_and(|g| g.commit_input.is_some())
     {
         handle_commit_input(state, key, tx);
         return None;
@@ -1349,21 +1347,28 @@ async fn handle_key(
     // The batch menu owns every key while it is up: its letters would
     // otherwise be read as refresh, steps, and the rest.
     if state.view == View::BatchCommit
-        && state.batch.as_ref().is_some_and(|b| b.phase == BatchPhase::Pick)
+        && state.batch.as_ref().is_some_and(|b| {
+            matches!(
+                b.phase,
+                BatchPhase::Pick | BatchPhase::ChooseWorkflow | BatchPhase::Confirm
+            )
+        })
     {
-        handle_batch_pick(state, key, km, tx);
+        handle_batch_pick(state, key, km, provider, tx);
         return None;
     }
     // Same for the one message a batch commit is about to apply everywhere.
-    if state.view == View::BatchCommit
-        && state.batch.as_ref().is_some_and(|b| b.input.is_some())
-    {
+    if state.view == View::BatchCommit && state.batch.as_ref().is_some_and(|b| b.input.is_some()) {
         handle_batch_input(state, key, tx);
         return None;
     }
     // In trigger-prompt edit mode, route ALL keys to the text editor.
     if state.view == View::TriggerPrompt
-        && state.trigger_prompt.as_ref().map(|p| p.editing).unwrap_or(false)
+        && state
+            .trigger_prompt
+            .as_ref()
+            .map(|p| p.editing)
+            .unwrap_or(false)
     {
         handle_trigger_prompt_edit(state, key);
         return None;
@@ -1374,10 +1379,7 @@ async fn handle_key(
         return None;
     }
     // Esc/Backspace clears an active log query before falling through to view-back.
-    if state.view == View::Logs
-        && is_back_fallback(&key)
-        && state.log_search_query.is_some()
-    {
+    if state.view == View::Logs && is_back_fallback(&key) && state.log_search_query.is_some() {
         state.log_search_query = None;
         state.log_search_matches.clear();
         state.log_search_match_idx = None;
@@ -1461,9 +1463,11 @@ async fn handle_key(
         // rewriting files. Asked of the *op*, not the phase: Esc stops the batch
         // but deliberately lets the repo in flight finish, and quitting during
         // that window would kill the very hook the stop promised to leave alone.
-        if state.batch.as_ref().is_some_and(|b| {
-            b.is_working() || b.items.iter().any(|i| state.op_running(&i.spec))
-        }) {
+        if state
+            .batch
+            .as_ref()
+            .is_some_and(|b| b.is_working() || b.items.iter().any(|i| state.op_running(&i.spec)))
+        {
             state.set_status("a commit is running — wait for it, or Esc then q".into());
             return None;
         }
@@ -1639,7 +1643,10 @@ async fn handle_key(
             open_pr_in_browser(state);
             return None;
         }
-        if let Some(url) = state.run_detail.as_ref().map(|d| d.run.url.clone())
+        if let Some(url) = state
+            .run_detail
+            .as_ref()
+            .map(|d| d.run.url.clone())
             .or_else(|| state.runs.get(state.run_cursor).map(|r| r.url.clone()))
         {
             let _ = open::that(&url);
@@ -1676,7 +1683,9 @@ async fn handle_key(
                 .map(|d| d.current_file().unwrap_or_else(|| d.file.clone())),
             View::Workflows => state.selected_workflow().map(|w| w.file_name.clone()),
             View::Runs | View::Watch => state
-                .run_detail.as_ref().map(|d| d.run.url.clone())
+                .run_detail
+                .as_ref()
+                .map(|d| d.run.url.clone())
                 .or_else(|| state.selected_run().map(|r| r.url.clone())),
             View::RunDetail => state.run_detail.as_ref().and_then(|detail| {
                 let items = state.detail_items();
@@ -1686,14 +1695,16 @@ async fn handle_key(
                         _ => None,
                     },
                     Some(DetailItem::Job(ji)) => detail.jobs.get(*ji).map(|j| j.name.clone()),
-                    Some(DetailItem::Step { job: ji, step: si }) => detail.jobs
+                    Some(DetailItem::Step { job: ji, step: si }) => detail
+                        .jobs
                         .get(*ji)
                         .and_then(|j| j.steps.get(*si))
                         .map(|s| s.name.clone()),
                     None => None,
                 }
             }),
-            View::Logs => state.log_rendered
+            View::Logs => state
+                .log_rendered
                 .get(state.log_line_cursor)
                 .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect()),
             View::Diff => state.run_detail.as_ref().map(|d| d.run.url.clone()),
@@ -1789,7 +1800,11 @@ async fn handle_key(
             {
                 return None;
             }
-            let len = state.git_view.as_ref().map(|g| g.entries().len()).unwrap_or(0);
+            let len = state
+                .git_view
+                .as_ref()
+                .map(|g| g.entries().len())
+                .unwrap_or(0);
             if key_is(&key, km.down) || key.code == KeyCode::Down {
                 if let Some(g) = state.git_view.as_mut() {
                     move_cursor(&mut g.cursor, len, 1);
@@ -1828,8 +1843,7 @@ async fn handle_key(
                     // `switch_to_selected_repo` reads the dashboard cursor, and
                     // `c` may have been pressed nowhere near it; aim it at the
                     // repo actually on screen first.
-                    if let Some(i) =
-                        spec.and_then(|s| state.repos.iter().position(|c| c.spec == s))
+                    if let Some(i) = spec.and_then(|s| state.repos.iter().position(|c| c.spec == s))
                     {
                         state.repo_cursor = i;
                     }
@@ -1900,12 +1914,13 @@ async fn handle_key(
             } else if key_is(&key, km.trigger) {
                 trigger_workflow_at_cursor(state, provider, tx);
             } else if key_is(&key, km.watch)
-                && let Some(w) = state.selected_workflow().cloned() {
-                    state.switch_view(View::Watch);
-                    state.workflow_for_runs = Some(w.file_name.clone());
-                    state.runs.clear();
-                    spawn_fetch_runs(provider.clone(), w.file_name, tx.clone(), state);
-                }
+                && let Some(w) = state.selected_workflow().cloned()
+            {
+                state.switch_view(View::Watch);
+                state.workflow_for_runs = Some(w.file_name.clone());
+                state.runs.clear();
+                spawn_fetch_runs(provider.clone(), w.file_name, tx.clone(), state);
+            }
         }
         View::Runs => {
             if key_is(&key, km.down) || key.code == KeyCode::Down {
@@ -1923,9 +1938,14 @@ async fn handle_key(
                 state.switch_view(View::Watch);
             } else if key_is(&key, km.trigger) {
                 if let Some(file) = state.workflow_for_runs.clone()
-                    && let Some(w) = state.workflows.iter().find(|w| w.file_name == file).cloned() {
-                        trigger_workflow(state, &w, provider, tx);
-                    }
+                    && let Some(w) = state
+                        .workflows
+                        .iter()
+                        .find(|w| w.file_name == file)
+                        .cloned()
+                {
+                    trigger_workflow(state, &w, provider, tx);
+                }
             } else if key_is(&key, km.cancel_run) {
                 if let Some(r) = state.selected_run().cloned() {
                     let p = provider.clone();
@@ -1951,17 +1971,18 @@ async fn handle_key(
                     });
                 }
             } else if key_is(&key, km.rerun_failed)
-                && let Some(r) = state.selected_run().cloned() {
-                    let p = provider.clone();
-                    let tx2 = tx.clone();
-                    tokio::spawn(async move {
-                        let msg = match p.rerun_failed(r.id).await {
-                            Ok(_) => format!("rerunning failed jobs for {}", r.id),
-                            Err(e) => format!("rerun-failed failed: {e}"),
-                        };
-                        let _ = tx2.send(AppEvent::Status(msg));
-                    });
-                }
+                && let Some(r) = state.selected_run().cloned()
+            {
+                let p = provider.clone();
+                let tx2 = tx.clone();
+                tokio::spawn(async move {
+                    let msg = match p.rerun_failed(r.id).await {
+                        Ok(_) => format!("rerunning failed jobs for {}", r.id),
+                        Err(e) => format!("rerun-failed failed: {e}"),
+                    };
+                    let _ = tx2.send(AppEvent::Status(msg));
+                });
+            }
         }
         View::RunDetail => {
             if key_is(&key, km.down) || key.code == KeyCode::Down {
@@ -1972,7 +1993,10 @@ async fn handle_key(
                 move_cursor(&mut state.detail_cursor, max, -1);
             } else if key_is(&key, km.diff) {
                 state.switch_view(View::Diff);
-            } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter || key_is(&key, km.open_logs) {
+            } else if key_is(&key, km.confirm)
+                || key.code == KeyCode::Enter
+                || key_is(&key, km.open_logs)
+            {
                 let item = state.detail_items().get(state.detail_cursor).copied();
                 // A matrix box has no log of its own — Enter on it folds the
                 // legs away, or brings them back.
@@ -1990,17 +2014,16 @@ async fn handle_key(
                                 // A failed job's logs open at the step that
                                 // broke, not at line one of a checkout step
                                 // nobody is here to read.
-                                state.log_pending_section = job
-                                    .steps
-                                    .iter()
-                                    .find(|s| s.status == Status::Failure)
-                                    .map(|s| {
-                                        (
-                                            s.name.clone(),
-                                            s.started_at.map(hms),
-                                            s.completed_at.map(hms),
-                                        )
-                                    });
+                                state.log_pending_section =
+                                    job.steps.iter().find(|s| s.status == Status::Failure).map(
+                                        |s| {
+                                            (
+                                                s.name.clone(),
+                                                s.started_at.map(hms),
+                                                s.completed_at.map(hms),
+                                            )
+                                        },
+                                    );
                                 state.log_job_idx = Some(ji);
                                 state.switch_view(View::Logs);
                                 state.log_lines = vec!["loading...".into()];
@@ -2040,7 +2063,10 @@ async fn handle_key(
                 state.log_line_cursor = state.log_line_cursor.saturating_sub(1);
                 state.keep_cursor_visible();
             } else if key_is(&key, km.page_down) || key.code == KeyCode::PageDown {
-                state.log_line_cursor = state.log_line_cursor.saturating_add(viewport).min(max_cursor);
+                state.log_line_cursor = state
+                    .log_line_cursor
+                    .saturating_add(viewport)
+                    .min(max_cursor);
                 state.keep_cursor_visible();
             } else if key_is(&key, km.page_up) || key.code == KeyCode::PageUp {
                 state.log_line_cursor = state.log_line_cursor.saturating_sub(viewport);
@@ -2091,13 +2117,24 @@ async fn handle_key(
                     jump_log_match(state, 1);
                 } else if !state.log_step_line_starts.is_empty() {
                     let n = state.log_step_line_starts.len();
-                    let next = if let Some(cur) = state.log_section_idx { (cur + 1).min(n - 1) } else { 0 };
-                    let extracted = extract_step_by_line_range(&state.log_raw, next, &state.log_step_line_starts);
+                    let next = if let Some(cur) = state.log_section_idx {
+                        (cur + 1).min(n - 1)
+                    } else {
+                        0
+                    };
+                    let extracted = extract_step_by_line_range(
+                        &state.log_raw,
+                        next,
+                        &state.log_step_line_starts,
+                    );
                     set_log_section(state, extracted, Some(next));
                 } else {
                     let n = state.log_sections.len();
                     if n > 0 {
-                        let next = state.log_section_idx.map(|i| (i + 1).min(n - 1)).unwrap_or(0);
+                        let next = state
+                            .log_section_idx
+                            .map(|i| (i + 1).min(n - 1))
+                            .unwrap_or(0);
                         let extracted = extract_log_section(&state.log_raw, next);
                         set_log_section(state, extracted, Some(next));
                     }
@@ -2114,7 +2151,11 @@ async fn handle_key(
                         }
                         Some(current) => {
                             let prev = current - 1;
-                            let extracted = extract_step_by_line_range(&state.log_raw, prev, &state.log_step_line_starts);
+                            let extracted = extract_step_by_line_range(
+                                &state.log_raw,
+                                prev,
+                                &state.log_step_line_starts,
+                            );
                             set_log_section(state, extracted, Some(prev));
                         }
                     }
@@ -2155,20 +2196,30 @@ async fn handle_key(
             } else if key_is(&key, km.tp_yes) {
                 if let Some(p) = state.trigger_prompt.as_mut()
                     && let Some(f) = p.current_field_mut()
-                        && f.options.as_deref().is_some_and(|o| o.iter().any(|x| x == "yes")) {
-                            f.value = "yes".to_string();
-                        }
+                    && f.options
+                        .as_deref()
+                        .is_some_and(|o| o.iter().any(|x| x == "yes"))
+                {
+                    f.value = "yes".to_string();
+                }
             } else if key_is(&key, km.tp_no) {
                 if let Some(p) = state.trigger_prompt.as_mut()
                     && let Some(f) = p.current_field_mut()
-                        && f.options.as_deref().is_some_and(|o| o.iter().any(|x| x == "no")) {
-                            f.value = "no".to_string();
-                        }
-            } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter || key_is(&key, km.tp_edit) {
+                    && f.options
+                        .as_deref()
+                        .is_some_and(|o| o.iter().any(|x| x == "no"))
+                {
+                    f.value = "no".to_string();
+                }
+            } else if key_is(&key, km.confirm)
+                || key.code == KeyCode::Enter
+                || key_is(&key, km.tp_edit)
+            {
                 if let Some(p) = state.trigger_prompt.as_mut()
-                    && p.current_field().is_some() {
-                        p.editing = true;
-                    }
+                    && p.current_field().is_some()
+                {
+                    p.editing = true;
+                }
             } else if key_is(&key, km.tp_submit) {
                 submit_trigger_prompt(state, provider, tx);
             }
@@ -2183,7 +2234,6 @@ async fn handle_key(
             let max = state.last_diff_max_scroll.get();
             scroll_keys(&mut state.diff_scroll, max, &key, km);
         }
-
     }
     None
 }
@@ -2339,10 +2389,7 @@ fn toggle_log_focus(state: &mut AppState) {
     }
     // Anchor on the source line under the cursor so the viewport doesn't jump
     // to an unrelated part of the log when the filter flips.
-    let anchor = state
-        .log_rendered_src
-        .get(state.log_line_cursor)
-        .copied();
+    let anchor = state.log_rendered_src.get(state.log_line_cursor).copied();
     state.log_scroll = 0;
     state.log_line_cursor = 0;
     state.recompute_log_rendered();
@@ -2471,8 +2518,12 @@ fn jump_log_match(state: &mut AppState, dir: i32) {
 /// Put the current search hit on screen. Uses the rendered-row map rather than
 /// re-deriving offsets, so it accounts for wrapping the same way error jumps do.
 fn scroll_to_current_match(state: &mut AppState) {
-    let Some(idx) = state.log_search_match_idx else { return };
-    let Some(&src_line) = state.log_search_matches.get(idx) else { return };
+    let Some(idx) = state.log_search_match_idx else {
+        return;
+    };
+    let Some(&src_line) = state.log_search_matches.get(idx) else {
+        return;
+    };
     // Matches are collected over every source line, but groups start collapsed —
     // so a hit inside a folded group has no rendered row and the jump would
     // silently do nothing. Unfold it first, exactly as error jumps do.
@@ -2519,12 +2570,7 @@ fn open_finder(state: &mut AppState) {
                 .runs
                 .iter()
                 .enumerate()
-                .map(|(i, r)| {
-                    (
-                        i,
-                        format!("{}  {}  #{}", r.head_branch, r.commit_msg, r.id),
-                    )
-                })
+                .map(|(i, r)| (i, format!("{}  {}  #{}", r.head_branch, r.commit_msg, r.id)))
                 .collect();
             Some(Finder::new(FinderKind::Runs, items))
         }
@@ -2544,7 +2590,10 @@ fn open_finder(state: &mut AppState) {
                         },
                         DetailItem::Job(ji) => detail.jobs[*ji].name.clone(),
                         DetailItem::Step { job, step } => {
-                            format!("{}  {}", detail.jobs[*job].steps[*step].name, detail.jobs[*job].name)
+                            format!(
+                                "{}  {}",
+                                detail.jobs[*job].steps[*step].name, detail.jobs[*job].name
+                            )
                         }
                     };
                     (i, label)
@@ -2771,11 +2820,7 @@ fn begin_commit(state: &mut AppState) {
 }
 
 /// Type the commit message. Enter commits, Esc abandons the draft.
-fn handle_commit_input(
-    state: &mut AppState,
-    key: KeyEvent,
-    tx: &mpsc::UnboundedSender<AppEvent>,
-) {
+fn handle_commit_input(state: &mut AppState, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
     let Some(gv) = state.git_view.as_mut() else {
         return;
     };
@@ -2920,12 +2965,21 @@ fn start_batch_menu(state: &mut AppState) {
 }
 
 /// The menu's letters, in the order the menu lists them.
-pub(crate) const BATCH_MENU: [(char, BatchAction, &str); 5] = [
+pub(crate) const BATCH_MENU: [(char, BatchAction, &str); 6] = [
     ('n', BatchAction::NewBranch, "new branch from main"),
-    ('m', BatchAction::BackToMain, "back to main and pull (skips dirty repos)"),
+    (
+        'm',
+        BatchAction::BackToMain,
+        "back to main and pull (skips dirty repos)",
+    ),
     ('p', BatchAction::OpenPr, "open a PR from each branch (gh)"),
     ('c', BatchAction::Commit, "commit everything"),
     ('r', BatchAction::Run, "run a shell command in each"),
+    (
+        'd',
+        BatchAction::Deploy,
+        "deploy: run a workflow on each repo's current branch",
+    ),
 ];
 
 /// Pick what the batch does. Esc backs out with the marks kept.
@@ -2933,9 +2987,44 @@ fn handle_batch_pick(
     state: &mut AppState,
     key: KeyEvent,
     km: &Keymap,
+    provider: &Arc<GitHubProvider>,
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
-    if key_is(&key, km.back) || is_back_fallback(&key) {
+    let back = key_is(&key, km.back) || is_back_fallback(&key);
+    let enter = key_is(&key, km.confirm) || key.code == KeyCode::Enter;
+    match state.batch.as_ref().map(|b| b.phase) {
+        Some(BatchPhase::ChooseWorkflow) => {
+            let Some(plan) = state.batch.as_mut().and_then(|b| b.deploy.as_mut()) else {
+                return;
+            };
+            let n = plan.choices.len();
+            if back {
+                if let Some(b) = state.batch.as_mut() {
+                    b.deploy = None;
+                    b.phase = BatchPhase::Pick;
+                }
+            } else if key_is(&key, km.down) || key.code == KeyCode::Down {
+                move_cursor(&mut plan.cursor, n, 1);
+            } else if key_is(&key, km.up) || key.code == KeyCode::Up {
+                move_cursor(&mut plan.cursor, n, -1);
+            } else if enter {
+                choose_deploy_workflow(state);
+            }
+            return;
+        }
+        Some(BatchPhase::Confirm) => {
+            if back {
+                state.batch = None;
+                state.switch_view(View::Repos);
+            } else if enter && let Some(b) = state.batch.as_mut() {
+                b.phase = BatchPhase::Committing;
+                batch_step(state, tx);
+            }
+            return;
+        }
+        _ => {}
+    }
+    if back {
         state.batch = None;
         state.switch_view(View::Repos);
         return;
@@ -2946,6 +3035,10 @@ fn handle_batch_pick(
     let Some(&(_, action, _)) = BATCH_MENU.iter().find(|(k, _, _)| *k == c) else {
         return;
     };
+    if action == BatchAction::Deploy {
+        start_deploy(state, provider);
+        return;
+    }
     let Some(batch) = state.batch.as_mut() else {
         return;
     };
@@ -2953,6 +3046,111 @@ fn handle_batch_pick(
     if batch.is_working() {
         batch_step(state, tx);
     }
+}
+
+/// Collect the workflows the marked repos can dispatch and open the list.
+///
+/// Read from each checkout's `.github/workflows`, not the API: it is a
+/// filesystem read, and it is the same source `t` uses for the open repo.
+fn start_deploy(state: &mut AppState, provider: &Arc<GitHubProvider>) {
+    let Some(batch) = state.batch.as_ref() else {
+        return;
+    };
+    let mut choices: Vec<crate::app::state::DeployChoice> = Vec::new();
+    for item in &batch.items {
+        let found = crate::provider::discovery::discover_workflows(&item.path).unwrap_or_default();
+        for w in found.into_iter().filter(|w| w.triggerable) {
+            let inputs = w.inputs.iter().map(|i| i.name.clone()).collect();
+            match choices.iter_mut().find(|c| c.file == w.file_name) {
+                Some(c) => {
+                    c.repos.insert(item.spec.clone(), inputs);
+                }
+                None => choices.push(crate::app::state::DeployChoice {
+                    file: w.file_name.clone(),
+                    // "🚧 Deploy to Stage" and "💻 Deploy to Stage" are one choice.
+                    name: w
+                        .name
+                        .trim_start_matches(|c: char| !c.is_alphanumeric())
+                        .to_string(),
+                    repos: HashMap::from([(item.spec.clone(), inputs)]),
+                    workflow: w,
+                }),
+            }
+        }
+    }
+    if choices.is_empty() {
+        state.set_status("none of the marked repos has a workflow that can be dispatched".into());
+        return;
+    }
+    // The ones every marked repo has come first: that is what a batch is for.
+    choices.sort_by(|a, b| b.repos.len().cmp(&a.repos.len()).then(a.name.cmp(&b.name)));
+    let base = provider.clone();
+    let dispatch: crate::app::state::Dispatch = Arc::new(move |remote, file, reference, inputs| {
+        let repo = RepoSpec::parse(remote).map_err(|e| format!("{e:#}"))?;
+        let p = base.for_repo(repo);
+        // Called on the blocking pool, which can wait on the runtime.
+        tokio::runtime::Handle::current()
+            .block_on(p.trigger(file, reference, inputs))
+            .map_err(|e| format!("{e:#}"))
+    });
+    if let Some(b) = state.batch.as_mut() {
+        b.action = BatchAction::Deploy;
+        b.deploy = Some(crate::app::state::DeployPlan {
+            choices,
+            dispatch: Some(dispatch),
+            ..Default::default()
+        });
+        b.phase = BatchPhase::ChooseWorkflow;
+    }
+}
+
+/// Settle where each repo's run goes, then ask for inputs or go to confirm.
+fn choose_deploy_workflow(state: &mut AppState) {
+    let Some(batch) = state.batch.as_mut() else {
+        return;
+    };
+    let Some(plan) = batch.deploy.as_mut() else {
+        return;
+    };
+    let Some(choice) = plan.chosen().cloned() else {
+        return;
+    };
+    plan.targets = batch
+        .items
+        .iter()
+        .map(|item| {
+            let card = state.repos.iter().find(|c| c.spec == item.spec);
+            let target = if !choice.repos.contains_key(&item.spec) {
+                Err(format!("has no {}", choice.file))
+            } else if let Some(remote) = card.and_then(|c| c.remote.clone()) {
+                match card.and_then(|c| c.git.as_ref()) {
+                    Some(g) if g.detached => Err("detached HEAD".to_string()),
+                    Some(g) => Ok(crate::app::state::DeployTarget {
+                        remote,
+                        branch: g.branch.clone(),
+                    }),
+                    None => Err("branch not known yet".to_string()),
+                }
+            } else {
+                Err("no GitHub remote".to_string())
+            };
+            (item.spec.clone(), target)
+        })
+        .collect();
+    if choice.workflow.inputs.is_empty() {
+        batch.phase = BatchPhase::Confirm;
+        return;
+    }
+    // The same form `t` opens, filled from last time; its submit hands the
+    // values back to the batch instead of dispatching.
+    batch.phase = BatchPhase::AwaitInputs;
+    let recall = state.history.last_dispatch_inputs(&choice.file);
+    state.trigger_prompt = Some(TriggerPrompt::from_workflow(
+        &choice.workflow,
+        View::BatchCommit,
+        recall,
+    ));
+    state.switch_view(View::TriggerPrompt);
 }
 
 /// Type the one message every repo in the batch will get.
@@ -3077,24 +3275,35 @@ fn batch_step(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
     let action = batch.action;
 
     if !pushing && action == BatchAction::BackToMain {
-        spawn_streaming_op_for(state, tx, spec, path, "checkout", "post-checkout", move |dir, out| {
-            // A dirty tree would either refuse the checkout or carry the
-            // changes onto main; neither is what "back to main" means.
-            let st = crate::git::status(dir)?;
-            if !st.is_clean() {
-                return Ok(format!("{BATCH_NOTHING}uncommitted changes — left alone"));
-            }
-            let Some(main) = crate::git::main_branch(dir) else {
-                return Ok(format!("{BATCH_NOTHING}no main or master branch"));
-            };
-            if st.detached || st.branch != main {
-                crate::git::checkout(dir, main, out)?;
-            }
-            if crate::git::status(dir)?.has_upstream {
-                crate::git::pull_ff(dir, out)?;
-            }
-            Ok(format!("{main} @ {}", crate::git::head_sha(dir).unwrap_or_else(|_| "HEAD".into())))
-        });
+        spawn_streaming_op_for(
+            state,
+            tx,
+            spec,
+            path,
+            "checkout",
+            "post-checkout",
+            move |dir, out| {
+                // A dirty tree would either refuse the checkout or carry the
+                // changes onto main; neither is what "back to main" means.
+                let st = crate::git::status(dir)?;
+                if !st.is_clean() {
+                    return Ok(format!("{BATCH_NOTHING}uncommitted changes — left alone"));
+                }
+                let Some(main) = crate::git::main_branch(dir) else {
+                    return Ok(format!("{BATCH_NOTHING}no main or master branch"));
+                };
+                if st.detached || st.branch != main {
+                    crate::git::checkout(dir, main, out)?;
+                }
+                if crate::git::status(dir)?.has_upstream {
+                    crate::git::pull_ff(dir, out)?;
+                }
+                Ok(format!(
+                    "{main} @ {}",
+                    crate::git::head_sha(dir).unwrap_or_else(|_| "HEAD".into())
+                ))
+            },
+        );
     } else if !pushing && action == BatchAction::OpenPr {
         spawn_streaming_op_for(state, tx, spec, path, "pr", "pre-push", move |dir, out| {
             let st = crate::git::status(dir)?;
@@ -3102,7 +3311,10 @@ fn batch_step(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
                 return Ok(format!("{BATCH_NOTHING}detached HEAD"));
             }
             if matches!(st.branch.as_str(), "main" | "master") {
-                return Ok(format!("{BATCH_NOTHING}on {}, no branch to open a PR from", st.branch));
+                return Ok(format!(
+                    "{BATCH_NOTHING}on {}, no branch to open a PR from",
+                    st.branch
+                ));
             }
             // gh opens the PR against what is on the remote, so it goes up first.
             if !st.has_upstream || st.ahead > 0 {
@@ -3111,10 +3323,77 @@ fn batch_step(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
             match crate::git::open_pr(dir, &st.branch, &msg, out)? {
                 crate::git::PrOutcome::Opened(url) => Ok(url),
                 crate::git::PrOutcome::Exists(url) => {
-                    Ok(format!("{BATCH_NOTHING}PR already open {url}").trim_end().to_string())
+                    Ok(format!("{BATCH_NOTHING}PR already open {url}")
+                        .trim_end()
+                        .to_string())
                 }
             }
         });
+    } else if !pushing && action == BatchAction::Deploy {
+        let plan = batch.deploy.clone().unwrap_or_default();
+        spawn_streaming_op_for(
+            state,
+            tx,
+            spec.clone(),
+            path,
+            "deploy",
+            "",
+            move |dir, out| {
+                let (Some(choice), Some(dispatch)) = (plan.chosen(), plan.dispatch.as_ref()) else {
+                    return Ok(format!("{BATCH_NOTHING}no workflow chosen"));
+                };
+                let target = match plan.targets.get(&spec) {
+                    Some(Ok(t)) => t,
+                    Some(Err(why)) => return Ok(format!("{BATCH_NOTHING}{why}")),
+                    None => return Ok(format!("{BATCH_NOTHING}not planned")),
+                };
+                // The plan came from the dashboard's copy of the branch. Re-read it:
+                // a checkout since then must not send the confirmed deploy elsewhere,
+                // and GitHub runs the remote's commits, not unpushed local ones.
+                let st = crate::git::status(dir)?;
+                if st.detached || st.branch != target.branch {
+                    anyhow::bail!(
+                        "branch moved since confirm: now on {}",
+                        if st.detached {
+                            "detached HEAD"
+                        } else {
+                            st.branch.as_str()
+                        }
+                    );
+                }
+                if !st.has_upstream {
+                    return Ok(format!(
+                        "{BATCH_NOTHING}{} is not on the remote — push it first",
+                        st.branch
+                    ));
+                }
+                if st.ahead > 0 {
+                    return Ok(format!(
+                        "{BATCH_NOTHING}{} unpushed commit(s) — push first",
+                        st.ahead
+                    ));
+                }
+                // Only the inputs this repo's copy of the workflow declares: GitHub
+                // rejects a dispatch carrying one it doesn't know.
+                let wanted = choice.repos.get(&spec).cloned().unwrap_or_default();
+                let inputs = plan
+                    .inputs
+                    .iter()
+                    .filter(|(k, _)| wanted.contains(k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                out(
+                    format!(
+                        "dispatching {} on {} @ {}",
+                        choice.file, target.remote, target.branch
+                    ),
+                    false,
+                );
+                dispatch(&target.remote, &choice.file, &target.branch, inputs)
+                    .map_err(|e| anyhow!(e))?;
+                Ok(target.branch.clone())
+            },
+        );
     } else if !pushing && action == BatchAction::Run {
         spawn_streaming_op_for(state, tx, spec, path, "run", "", move |dir, out| {
             crate::git::run_shell(dir, &msg, out)
@@ -3144,19 +3423,27 @@ fn batch_step(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
             },
         );
     } else if pushing {
-        spawn_streaming_op_for(state, tx, spec, path, "push", "pre-push", move |dir, out| {
-            // Read the branch here rather than trusting the dashboard's copy:
-            // the commit that just landed changed the ahead count, and pushing
-            // the wrong branch is not a recoverable mistake.
-            let st = crate::git::status(dir)?;
-            if st.detached {
-                return Ok(format!("{BATCH_NOTHING}detached HEAD"));
-            }
-            if st.has_upstream && st.ahead == 0 {
-                return Ok(format!("{BATCH_NOTHING}already up to date"));
-            }
-            crate::git::push(dir, &st.branch, st.has_upstream, out)
-        });
+        spawn_streaming_op_for(
+            state,
+            tx,
+            spec,
+            path,
+            "push",
+            "pre-push",
+            move |dir, out| {
+                // Read the branch here rather than trusting the dashboard's copy:
+                // the commit that just landed changed the ahead count, and pushing
+                // the wrong branch is not a recoverable mistake.
+                let st = crate::git::status(dir)?;
+                if st.detached {
+                    return Ok(format!("{BATCH_NOTHING}detached HEAD"));
+                }
+                if st.has_upstream && st.ahead == 0 {
+                    return Ok(format!("{BATCH_NOTHING}already up to date"));
+                }
+                crate::git::push(dir, &st.branch, st.has_upstream, out)
+            },
+        );
     } else {
         spawn_streaming_op_for(
             state,
@@ -3237,7 +3524,11 @@ fn open_git_view_for_paused(state: &mut AppState, tx: &mpsc::UnboundedSender<App
         .iter()
         .find(|c| c.spec == spec)
         .is_some_and(|c| c.has_ci());
-    state.git_view = Some(crate::app::state::GitView::new(spec.clone(), path.clone(), has_ci));
+    state.git_view = Some(crate::app::state::GitView::new(
+        spec.clone(),
+        path.clone(),
+        has_ci,
+    ));
     state.switch_view(View::GitStatus);
     spawn_git_status(spec, path, tx.clone(), state);
 }
@@ -3510,8 +3801,7 @@ fn poll_push_watches(
     state.push_watches.retain(|w| {
         let age = now.saturating_sub(w.started_tick);
         let attached = w.run.is_some();
-        let expired =
-            age >= PUSH_WATCH_MAX_TICKS || (!attached && age >= PUSH_WATCH_GIVE_UP_TICKS);
+        let expired = age >= PUSH_WATCH_MAX_TICKS || (!attached && age >= PUSH_WATCH_GIVE_UP_TICKS);
         if expired {
             gave_up.push((w.spec.clone(), attached));
         }
@@ -3585,7 +3875,11 @@ fn settle_push_watch(state: &mut AppState, spec: &str, runs: &[Run], config: &Co
         let _ = notify_run_finished(state, &run, spec, config);
         let msg = format!(
             "{spec}: {} {}",
-            if run.status.is_failure() { "✗" } else { "✓" },
+            if run.status.is_failure() {
+                "✗"
+            } else {
+                "✓"
+            },
             run.display_title,
         );
         if run.status.is_failure() {
@@ -3618,9 +3912,9 @@ fn first_failed_item(state: &AppState) -> Option<usize> {
                 if detail.jobs[*job].steps[*step].status == Status::Failure)
         })
         .or_else(|| {
-            items.iter().position(|it| {
-                matches!(it, DetailItem::Job(ji) if detail.jobs[*ji].status.is_failure())
-            })
+            items.iter().position(
+                |it| matches!(it, DetailItem::Job(ji) if detail.jobs[*ji].status.is_failure()),
+            )
         })
         // Nothing red on screen, which means the red is inside a matrix box
         // the user folded shut. Land on the box; Enter opens it.
@@ -3816,12 +4110,13 @@ fn parse_key(s: &str) -> Result<(KeyCode, KeyModifiers)> {
     let s = s.trim();
     let (mods, key_str) = if let Some((prefix, k)) = s.rsplit_once('+') {
         let mods = prefix.split('+').try_fold(KeyModifiers::NONE, |acc, m| {
-            Ok(acc | match m.to_lowercase().as_str() {
-                "ctrl" => KeyModifiers::CONTROL,
-                "shift" => KeyModifiers::SHIFT,
-                "alt" => KeyModifiers::ALT,
-                other => return Err(anyhow!("unknown modifier `{other}` in key `{s}`")),
-            })
+            Ok(acc
+                | match m.to_lowercase().as_str() {
+                    "ctrl" => KeyModifiers::CONTROL,
+                    "shift" => KeyModifiers::SHIFT,
+                    "alt" => KeyModifiers::ALT,
+                    other => return Err(anyhow!("unknown modifier `{other}` in key `{s}`")),
+                })
         })?;
         (mods, k)
     } else {
@@ -3875,53 +4170,53 @@ fn key_is(event: &KeyEvent, (code, mods): (KeyCode, KeyModifiers)) -> bool {
 
 fn resolve_keymap(cfg: &KeymapConfig) -> Result<Keymap> {
     Ok(Keymap {
-        quit:          parse_key(&cfg.quit)?,
-        back:          parse_key(&cfg.back)?,
-        help:          parse_key(&cfg.help)?,
-        refresh:       parse_key(&cfg.refresh)?,
-        down:          parse_key(&cfg.down)?,
-        up:            parse_key(&cfg.up)?,
-        confirm:       parse_key(&cfg.confirm)?,
-        open_logs:     parse_key(&cfg.open_logs)?,
-        page_down:     parse_key(&cfg.page_down)?,
-        page_up:       parse_key(&cfg.page_up)?,
-        scroll_top:    parse_key(&cfg.scroll_top)?,
+        quit: parse_key(&cfg.quit)?,
+        back: parse_key(&cfg.back)?,
+        help: parse_key(&cfg.help)?,
+        refresh: parse_key(&cfg.refresh)?,
+        down: parse_key(&cfg.down)?,
+        up: parse_key(&cfg.up)?,
+        confirm: parse_key(&cfg.confirm)?,
+        open_logs: parse_key(&cfg.open_logs)?,
+        page_down: parse_key(&cfg.page_down)?,
+        page_up: parse_key(&cfg.page_up)?,
+        scroll_top: parse_key(&cfg.scroll_top)?,
         scroll_bottom: parse_key(&cfg.scroll_bottom)?,
-        next_step:     parse_key(&cfg.next_step)?,
-        prev_step:     parse_key(&cfg.prev_step)?,
-        all_steps:     parse_key(&cfg.all_steps)?,
-        search:        parse_key(&cfg.search)?,
-        log_focus:     parse_key(&cfg.log_focus)?,
-        next_error:    parse_key(&cfg.next_error)?,
-        prev_error:    parse_key(&cfg.prev_error)?,
-        finder:        parse_key(&cfg.finder)?,
-        repos_view:    parse_key(&cfg.repos_view)?,
-        services:      parse_key(&cfg.services)?,
-        snooze:        parse_key(&cfg.snooze)?,
-        repo_mark:     parse_key(&cfg.repo_mark)?,
-        batch_commit:  parse_key(&cfg.batch_commit)?,
-        batch_menu:    parse_key(&cfg.batch_menu)?,
-        batch_retry:   parse_key(&cfg.batch_retry)?,
-        batch_skip:    parse_key(&cfg.batch_skip)?,
-        git_view:      parse_key(&cfg.git_view)?,
-        git_stage:     parse_key(&cfg.git_stage)?,
+        next_step: parse_key(&cfg.next_step)?,
+        prev_step: parse_key(&cfg.prev_step)?,
+        all_steps: parse_key(&cfg.all_steps)?,
+        search: parse_key(&cfg.search)?,
+        log_focus: parse_key(&cfg.log_focus)?,
+        next_error: parse_key(&cfg.next_error)?,
+        prev_error: parse_key(&cfg.prev_error)?,
+        finder: parse_key(&cfg.finder)?,
+        repos_view: parse_key(&cfg.repos_view)?,
+        services: parse_key(&cfg.services)?,
+        snooze: parse_key(&cfg.snooze)?,
+        repo_mark: parse_key(&cfg.repo_mark)?,
+        batch_commit: parse_key(&cfg.batch_commit)?,
+        batch_menu: parse_key(&cfg.batch_menu)?,
+        batch_retry: parse_key(&cfg.batch_retry)?,
+        batch_skip: parse_key(&cfg.batch_skip)?,
+        git_view: parse_key(&cfg.git_view)?,
+        git_stage: parse_key(&cfg.git_stage)?,
         git_stage_all: parse_key(&cfg.git_stage_all)?,
-        git_commit:    parse_key(&cfg.git_commit)?,
-        git_push:      parse_key(&cfg.git_push)?,
-        git_diff:      parse_key(&cfg.git_diff)?,
-        trigger:       parse_key(&cfg.trigger)?,
-        watch:         parse_key(&cfg.watch)?,
-        open_browser:  parse_key(&cfg.open_browser)?,
-        cancel_run:    parse_key(&cfg.cancel_run)?,
-        rerun:         parse_key(&cfg.rerun)?,
-        rerun_failed:  parse_key(&cfg.rerun_failed)?,
-        diff:          parse_key(&cfg.diff)?,
-        yank:          parse_key(&cfg.yank)?,
-        tp_edit:       parse_key(&cfg.tp_edit)?,
-        tp_submit:     parse_key(&cfg.tp_submit)?,
-        tp_yes:        parse_key(&cfg.tp_yes)?,
-        tp_no:         parse_key(&cfg.tp_no)?,
-        tp_cycle:      parse_key(&cfg.tp_cycle)?,
+        git_commit: parse_key(&cfg.git_commit)?,
+        git_push: parse_key(&cfg.git_push)?,
+        git_diff: parse_key(&cfg.git_diff)?,
+        trigger: parse_key(&cfg.trigger)?,
+        watch: parse_key(&cfg.watch)?,
+        open_browser: parse_key(&cfg.open_browser)?,
+        cancel_run: parse_key(&cfg.cancel_run)?,
+        rerun: parse_key(&cfg.rerun)?,
+        rerun_failed: parse_key(&cfg.rerun_failed)?,
+        diff: parse_key(&cfg.diff)?,
+        yank: parse_key(&cfg.yank)?,
+        tp_edit: parse_key(&cfg.tp_edit)?,
+        tp_submit: parse_key(&cfg.tp_submit)?,
+        tp_yes: parse_key(&cfg.tp_yes)?,
+        tp_no: parse_key(&cfg.tp_no)?,
+        tp_cycle: parse_key(&cfg.tp_cycle)?,
     })
 }
 
@@ -3966,7 +4261,6 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-
 fn compute_step_line_starts(raw: &[String], steps: &[Step]) -> (Vec<usize>, Vec<String>) {
     if steps.is_empty() || raw.is_empty() {
         return (Vec::new(), Vec::new());
@@ -3986,7 +4280,8 @@ fn compute_step_line_starts(raw: &[String], steps: &[Step]) -> (Vec<usize>, Vec<
             if is_group {
                 if depth == 0 {
                     let gname = strip_ansi(
-                        content.strip_prefix("##[group]")
+                        content
+                            .strip_prefix("##[group]")
                             .or_else(|| content.strip_prefix("##[section]"))
                             .unwrap_or(""),
                     );
@@ -4006,9 +4301,9 @@ fn compute_step_line_starts(raw: &[String], steps: &[Step]) -> (Vec<usize>, Vec<
     let mut group_cursor = 0usize;
 
     for (si, step) in steps.iter().enumerate() {
-        let step_hms = step.started_at.map(|dt|
-            format!("{:02}:{:02}:{:02}", dt.hour(), dt.minute(), dt.second())
-        );
+        let step_hms = step
+            .started_at
+            .map(|dt| format!("{:02}:{:02}:{:02}", dt.hour(), dt.minute(), dt.second()));
 
         if si == 0 {
             // First step (Set up job) always starts at line 0 — it owns the preamble before
@@ -4032,7 +4327,8 @@ fn compute_step_line_starts(raw: &[String], steps: &[Step]) -> (Vec<usize>, Vec<
         // timestamp >= this step's start.  "Run " groups are the canonical step-entry
         // markers emitted by the runner for every uses:/run: step.
         let found = step_hms.as_deref().and_then(|hms| {
-            group_positions.iter()
+            group_positions
+                .iter()
                 .enumerate()
                 .skip(group_cursor)
                 .find(|(_, (_, t, n))| t.as_str() >= hms && n.starts_with("Run "))
@@ -4041,7 +4337,8 @@ fn compute_step_line_starts(raw: &[String], steps: &[Step]) -> (Vec<usize>, Vec<
         // Fallback: any group with timestamp >= step start (handles steps without "Run " headers).
         let found = found.or_else(|| {
             step_hms.as_deref().and_then(|hms| {
-                group_positions.iter()
+                group_positions
+                    .iter()
                     .enumerate()
                     .skip(group_cursor)
                     .find(|(_, (_, t, _))| t.as_str() >= hms)
@@ -4091,9 +4388,13 @@ fn compute_step_line_starts(raw: &[String], steps: &[Step]) -> (Vec<usize>, Vec<
     resolve_skipped_starts(&mut starts, raw.len());
     honour_end_of_step_markers(raw, &mut starts);
 
-    let any_matched = starts.iter().any(|&l| l > 0)
-        || steps.first().and_then(|s| s.started_at).is_some();
-    if any_matched { (starts, names) } else { (Vec::new(), Vec::new()) }
+    let any_matched =
+        starts.iter().any(|&l| l > 0) || steps.first().and_then(|s| s.started_at).is_some();
+    if any_matched {
+        (starts, names)
+    } else {
+        (Vec::new(), Vec::new())
+    }
 }
 
 /// Placeholder for a skipped step, replaced by the following step's start so
@@ -4181,8 +4482,16 @@ fn find_raw_line_for_time(raw: &[String], hms: &str, from: usize) -> usize {
     raw.len()
 }
 
-fn extract_step_by_line_range(raw: &[String], step_idx: usize, line_starts: &[usize]) -> Vec<String> {
-    let start = line_starts.get(step_idx).copied().unwrap_or(0).min(raw.len());
+fn extract_step_by_line_range(
+    raw: &[String],
+    step_idx: usize,
+    line_starts: &[usize],
+) -> Vec<String> {
+    let start = line_starts
+        .get(step_idx)
+        .copied()
+        .unwrap_or(0)
+        .min(raw.len());
     let end = line_starts
         .get(step_idx + 1)
         .copied()
@@ -4204,9 +4513,10 @@ fn parse_log_sections(raw: &[String]) -> Vec<String> {
         if is_group {
             if depth == 0 {
                 result.push(strip_ansi(
-                    content.strip_prefix("##[group]")
+                    content
+                        .strip_prefix("##[group]")
                         .or_else(|| content.strip_prefix("##[section]"))
-                        .unwrap_or("")
+                        .unwrap_or(""),
                 ));
             }
             depth += 1;
@@ -4277,9 +4587,12 @@ fn find_section_by_time(raw: &[String], start_hms: &str) -> Option<usize> {
         if is_group {
             if depth == 0 {
                 if let Some(t) = line.get(..8)
-                    && t.as_bytes().get(2) == Some(&b':') && t.as_bytes().get(5) == Some(&b':') && t >= start_hms {
-                        return Some(section_count);
-                    }
+                    && t.as_bytes().get(2) == Some(&b':')
+                    && t.as_bytes().get(5) == Some(&b':')
+                    && t >= start_hms
+                {
+                    return Some(section_count);
+                }
                 section_count += 1;
             }
             depth += 1;
@@ -4527,11 +4840,7 @@ fn record_quota(state: &mut AppState, q: Quota) -> bool {
 /// here touches the GitHub budget or its rate-limit holds. One read per poll
 /// serves every view — production being down matters just as much from
 /// inside a log as from the dashboard.
-fn spawn_kuma_probe(
-    state: &mut AppState,
-    tx: &mpsc::UnboundedSender<AppEvent>,
-    force: bool,
-) {
+fn spawn_kuma_probe(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>, force: bool) {
     let Some(k) = &state.kuma else { return };
     if state.kuma_pending {
         return;
@@ -4664,8 +4973,14 @@ fn sync_active_progress(
     let details: Vec<RunDetail> = runs
         .iter()
         .map(|run| match previous.iter().find(|d| d.run.id == run.id) {
-            Some(d) => RunDetail { run: run.clone(), jobs: d.jobs.clone() },
-            None => RunDetail { run: run.clone(), jobs: Vec::new() },
+            Some(d) => RunDetail {
+                run: run.clone(),
+                jobs: d.jobs.clone(),
+            },
+            None => RunDetail {
+                run: run.clone(),
+                jobs: Vec::new(),
+            },
         })
         .collect();
     state.run_progress.insert(spec.clone(), details);
@@ -4678,10 +4993,7 @@ fn sync_active_progress(
             // A failure here is silent on purpose — the strip keeps the run it
             // already has, and a toast per poll would bury every other message.
             if let Ok(jobs) = p.run_jobs(run.id).await {
-                let _ = tx.send(AppEvent::RepoProgressLoaded(
-                    label,
-                    RunDetail { run, jobs },
-                ));
+                let _ = tx.send(AppEvent::RepoProgressLoaded(label, RunDetail { run, jobs }));
             }
         });
     }
@@ -4694,7 +5006,13 @@ fn sync_repo_progress(
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
     let target = state.repos.iter().find(|c| c.spec == spec).map(|c| {
-        (c.active_runs().take(MAX_TRACKED_RUNS).cloned().collect::<Vec<_>>(), c.remote.clone())
+        (
+            c.active_runs()
+                .take(MAX_TRACKED_RUNS)
+                .cloned()
+                .collect::<Vec<_>>(),
+            c.remote.clone(),
+        )
     });
     let Some((runs, remote)) = target else { return };
     if runs.is_empty() {
@@ -4712,8 +5030,14 @@ fn sync_repo_progress(
     let details = runs
         .iter()
         .map(|run| match previous.iter().find(|d| d.run.id == run.id) {
-            Some(d) => RunDetail { run: run.clone(), jobs: d.jobs.clone() },
-            None => RunDetail { run: run.clone(), jobs: Vec::new() },
+            Some(d) => RunDetail {
+                run: run.clone(),
+                jobs: d.jobs.clone(),
+            },
+            None => RunDetail {
+                run: run.clone(),
+                jobs: Vec::new(),
+            },
         })
         .collect();
     state.run_progress.insert(spec.to_string(), details);
@@ -5084,16 +5408,15 @@ impl LineBatch {
             return;
         }
         let lines = std::mem::take(&mut self.buf);
-        let _ = self.tx.send(AppEvent::GitOpOutput(self.spec.clone(), lines));
+        let _ = self
+            .tx
+            .send(AppEvent::GitOpOutput(self.spec.clone(), lines));
         self.last_flush = Some(std::time::Instant::now());
     }
 }
 
 /// Open the working-tree view for the dashboard row under the cursor.
-fn open_git_view(
-    state: &mut AppState,
-    tx: &mpsc::UnboundedSender<AppEvent>,
-) {
+fn open_git_view(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
     let Some(card) = state.repos.get(state.repo_cursor) else {
         return;
     };
@@ -5105,7 +5428,11 @@ fn open_git_view(
         return;
     };
     let (spec, has_ci) = (card.spec.clone(), card.has_ci());
-    state.git_view = Some(crate::app::state::GitView::new(spec.clone(), path.clone(), has_ci));
+    state.git_view = Some(crate::app::state::GitView::new(
+        spec.clone(),
+        path.clone(),
+        has_ci,
+    ));
     state.switch_view(View::GitStatus);
     spawn_git_status(spec, path, tx.clone(), state);
 }
@@ -5120,8 +5447,8 @@ fn open_git_view(
 fn open_git_view_for_active(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
     let from = state.view;
     let card = state.repos.iter().find(|c| c.spec == state.repo_label);
-    let Some((spec, path, has_ci)) = card
-        .and_then(|c| Some((c.spec.clone(), c.path.clone()?, c.has_ci())))
+    let Some((spec, path, has_ci)) =
+        card.and_then(|c| Some((c.spec.clone(), c.path.clone()?, c.has_ci())))
     else {
         state.set_status(format!(
             "{} has no local checkout — run jog inside one to stage and commit",
@@ -5382,10 +5709,7 @@ fn spawn_dash_tail(
     spawn_tail_fetch(Arc::new(provider.for_repo(rspec)), id, name, tx.clone());
 }
 
-fn spawn_repo_status_fetch(
-    provider: Arc<GitHubProvider>,
-    tx: mpsc::UnboundedSender<AppEvent>,
-) {
+fn spawn_repo_status_fetch(provider: Arc<GitHubProvider>, tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         if let Ok(runs) = provider.list_repo_runs(50).await {
             let _ = tx.send(AppEvent::RepoStatuses(runs));
@@ -5412,9 +5736,10 @@ fn maybe_fetch_workflow_preview(
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
     if let Some(w) = state.selected_workflow().cloned()
-        && state.workflow_preview_file.as_deref() != Some(w.file_name.as_str()) {
-            spawn_fetch_workflow_preview(provider.clone(), w.file_name, tx.clone(), state);
-        }
+        && state.workflow_preview_file.as_deref() != Some(w.file_name.as_str())
+    {
+        spawn_fetch_workflow_preview(provider.clone(), w.file_name, tx.clone(), state);
+    }
 }
 
 fn spawn_fetch_workflow_preview(
@@ -5438,9 +5763,10 @@ fn maybe_fetch_preview(
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
     if let Some(r) = state.selected_run().cloned()
-        && state.runs_preview_id != Some(r.id) {
-            spawn_fetch_run_preview(provider.clone(), r.id, tx.clone(), state);
-        }
+        && state.runs_preview_id != Some(r.id)
+    {
+        spawn_fetch_run_preview(provider.clone(), r.id, tx.clone(), state);
+    }
 }
 
 fn spawn_fetch_run_preview(
@@ -5454,8 +5780,12 @@ fn spawn_fetch_run_preview(
     state.pending += 1;
     tokio::spawn(async move {
         match provider.get_run(run_id).await {
-            Ok(detail) => { let _ = tx.send(AppEvent::RunPreviewLoaded(run_id, detail)); }
-            Err(e) => { let _ = tx.send(AppEvent::TaskError(format!("preview: {e}"))); }
+            Ok(detail) => {
+                let _ = tx.send(AppEvent::RunPreviewLoaded(run_id, detail));
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::TaskError(format!("preview: {e}")));
+            }
         }
     });
 }
@@ -5697,10 +6027,24 @@ fn submit_trigger_prompt(
     // What was typed is what will be wanted next time — the prompt opens
     // prefilled with it from here on.
     state.history.record_dispatch_inputs(&file, &inputs);
+    // A deploy batch asked for these: they go to its confirm screen, not out.
+    if let Some(b) = state.batch.as_mut()
+        && b.phase == BatchPhase::AwaitInputs
+        && let Some(plan) = b.deploy.as_mut()
+    {
+        plan.inputs = inputs;
+        b.phase = BatchPhase::Confirm;
+        return;
+    }
     dispatch_trigger(state, &file, &name, inputs, provider, tx);
 }
 
 fn cancel_trigger_prompt(state: &mut AppState) {
+    if let Some(b) = state.batch.as_mut()
+        && b.phase == BatchPhase::AwaitInputs
+    {
+        b.phase = BatchPhase::ChooseWorkflow;
+    }
     let return_view = state
         .trigger_prompt
         .as_ref()
@@ -5727,7 +6071,11 @@ pub fn status_glyph(s: Status) -> &'static str {
 fn play_sound(path: &str) {
     let path = path.to_string();
     std::thread::spawn(move || {
-        if std::process::Command::new("paplay").arg(&path).spawn().is_err() {
+        if std::process::Command::new("paplay")
+            .arg(&path)
+            .spawn()
+            .is_err()
+        {
             let _ = std::process::Command::new("pw-play").arg(&path).spawn();
         }
     });
@@ -5839,12 +6187,7 @@ fn announce_if_finished(state: &mut AppState, run: &Run, repo_label: &str, confi
 /// so there is no second door: announcing a run without going through the dedupe
 /// is not something a call site can do by accident. It takes `&mut AppState` for
 /// that reason alone. Returns whether this call was the one that announced.
-fn notify_run_finished(
-    state: &mut AppState,
-    run: &Run,
-    repo_label: &str,
-    config: &Config,
-) -> bool {
+fn notify_run_finished(state: &mut AppState, run: &Run, repo_label: &str, config: &Config) -> bool {
     if !state.announced_runs.insert(run.id) {
         return false;
     }
@@ -5871,11 +6214,15 @@ fn toggle_snooze(state: &mut AppState) {
     match left_min {
         None => {
             state.snooze_until = Some(now + chrono::Duration::minutes(30));
-            state.set_status(format!("notifications snoozed for 30m — {key} again for 60m"));
+            state.set_status(format!(
+                "notifications snoozed for 30m — {key} again for 60m"
+            ));
         }
         Some(m) if m < 31 => {
             state.snooze_until = Some(now + chrono::Duration::minutes(60));
-            state.set_status(format!("notifications snoozed for 60m — {key} again to unmute"));
+            state.set_status(format!(
+                "notifications snoozed for 60m — {key} again to unmute"
+            ));
         }
         Some(_) => {
             state.snooze_until = None;
@@ -5900,13 +6247,14 @@ fn notify_now(run: &Run, repo_label: &str, config: &Config) {
     if config.ui.notify_desktop {
         let summary = format!(
             "{} {}",
-            if run.status.is_failure() { "✗" } else { "✓" },
+            if run.status.is_failure() {
+                "✗"
+            } else {
+                "✓"
+            },
             run.display_title
         );
-        let body = format!(
-            "{repo_label} · {} · {:?}",
-            run.head_branch, run.status
-        );
+        let body = format!("{repo_label} · {} · {:?}", run.head_branch, run.status);
         desktop_notify(summary, body, run.url.clone(), run.status.is_failure());
     }
 }
@@ -6039,7 +6387,11 @@ mod tests {
     }
 
     fn quota(used: u32) -> Quota {
-        Quota { limit: 100, used, reset: chrono::Utc::now() + chrono::Duration::minutes(20) }
+        Quota {
+            limit: 100,
+            used,
+            reset: chrono::Utc::now() + chrono::Duration::minutes(20),
+        }
     }
 
     #[test]
@@ -6125,7 +6477,10 @@ mod tests {
             c.loaded = true;
         }
         st.tick_count = 1000;
-        assert!(!animations_active(&st), "everything settled, nothing moving");
+        assert!(
+            !animations_active(&st),
+            "everything settled, nothing moving"
+        );
         // One run in flight is one spinner spinning.
         st.repos[0].runs[0].status = Status::Running;
         assert!(animations_active(&st));
@@ -6144,7 +6499,10 @@ mod tests {
     #[test]
     fn the_quota_alarm_sounds_once_per_budget_not_once_per_poll() {
         let mut st = dashboard();
-        assert!(!record_quota(&mut st, quota(89)), "under the line is not news");
+        assert!(
+            !record_quota(&mut st, quota(89)),
+            "under the line is not news"
+        );
         assert!(record_quota(&mut st, quota(90)), "crossing it is");
         // Polls keep landing every few seconds. An alarm that fires on each one
         // is an alarm you silence, and then it is not an alarm.
@@ -6222,7 +6580,10 @@ mod tests {
         handle_help_key(&mut st, press(KeyCode::Backspace), &km);
         assert!(st.help_typing, "still editing an empty field");
         handle_help_key(&mut st, press(KeyCode::Backspace), &km);
-        assert!(!st.help_typing, "backspacing past the start gives the keys back");
+        assert!(
+            !st.help_typing,
+            "backspacing past the start gives the keys back"
+        );
         assert!(st.show_help, "and does not take the card with it");
     }
 
@@ -6255,7 +6616,10 @@ mod tests {
         // The last commit landing walks the queue and finds it empty — that
         // moment must raise the dialog, yes preselected, like any commit.
         batch_step(&mut st, &tx);
-        let p = st.push_prompt.as_ref().expect("the batch asks with the dialog");
+        let p = st
+            .push_prompt
+            .as_ref()
+            .expect("the batch asks with the dialog");
         assert_eq!(p.batch_count, Some(2));
         assert!(p.yes);
 
@@ -6298,13 +6662,21 @@ mod tests {
     fn a_clean_batch_shows_its_receipt_and_then_goes_back_to_the_dashboard() {
         let mut st = pushed_batch();
         assert_eq!(st.batch.as_ref().unwrap().phase, BatchPhase::Done);
-        let done = st.batch.as_ref().unwrap().done_tick.expect("finishing marks the tick");
+        let done = st
+            .batch
+            .as_ref()
+            .unwrap()
+            .done_tick
+            .expect("finishing marks the tick");
 
         // The summary is there to be read: it does not blink out on the frame
         // it appeared on.
         st.tick_count = done + BATCH_DONE_DWELL_TICKS - 1;
         batch_auto_return(&mut st);
-        assert!(st.batch.is_some(), "the receipt stays up long enough to read");
+        assert!(
+            st.batch.is_some(),
+            "the receipt stays up long enough to read"
+        );
         assert_eq!(st.view, View::BatchCommit);
 
         st.tick_count = done + BATCH_DONE_DWELL_TICKS;
@@ -6359,7 +6731,10 @@ mod tests {
     fn a_landed_commit_asks_about_pushing_with_yes_already_chosen() {
         let mut st = open_working_tree("## main...origin/main\0");
         offer_push(&mut st, "acme/api");
-        let p = st.push_prompt.as_ref().expect("a commit raises the question");
+        let p = st
+            .push_prompt
+            .as_ref()
+            .expect("a commit raises the question");
         assert_eq!(p.branch, "main");
         // The whole point of the box: Enter alone finishes the job, without a
         // second key you have to remember on the way out of the commit.
@@ -6413,7 +6788,9 @@ mod tests {
         handle_push_prompt(&mut st, press(KeyCode::Char('c')), &tx);
         assert!(st.push_prompt.is_some());
         assert!(
-            st.git_view.as_ref().is_some_and(|g| g.commit_input.is_none()),
+            st.git_view
+                .as_ref()
+                .is_some_and(|g| g.commit_input.is_none()),
             "a key aimed at the screen behind the box must not reach it"
         );
     }
@@ -6430,9 +6807,14 @@ mod tests {
 
         st.repo_cursor = 2;
         toggle_repo_mark(&mut st);
-        assert!(st.repo_marks.is_empty(), "a remote-only row has nothing to commit");
         assert!(
-            st.status_msg.as_deref().is_some_and(|m| m.contains("no local checkout")),
+            st.repo_marks.is_empty(),
+            "a remote-only row has nothing to commit"
+        );
+        assert!(
+            st.status_msg
+                .as_deref()
+                .is_some_and(|m| m.contains("no local checkout")),
             "got {:?}",
             st.status_msg
         );
@@ -6489,6 +6871,77 @@ mod tests {
         assert!(!batch_is_live(&st), "nothing has run yet");
     }
 
+    // tokio: the provider is built on the runtime.
+    #[tokio::test]
+    async fn a_batch_deploy_matches_workflows_by_file_and_confirms_before_it_runs() {
+        let root = std::env::temp_dir().join(format!("jog-deploy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut st = dashboard();
+        // Same file, different emoji — the way backend and cms name theirs.
+        for (spec, name) in [
+            ("acme/api", "🚧 Deploy to Stage"),
+            ("acme/web", "💻 Deploy to Stage"),
+        ] {
+            let dir = root.join(spec).join(".github/workflows");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("deploy_to_stage.yml"),
+                format!(
+                    "name: {name}\non:\n  workflow_dispatch:\n    inputs:\n      confirm:\n        \
+                     required: true\n        default: \"no\"\njobs: {{}}\n"
+                ),
+            )
+            .unwrap();
+            let card = st.repos.iter_mut().find(|c| c.spec == spec).unwrap();
+            card.path = Some(root.join(spec));
+            card.remote = Some(spec.into());
+            st.repo_marks.insert(spec.into());
+        }
+        // One repo detached: it is listed as skipped, not deployed.
+        st.repos[1].git = Some(crate::git::parse_status("## HEAD (no branch)\0"));
+        let provider = Arc::new(
+            GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "test-token".into()).unwrap(),
+        );
+        start_batch_menu(&mut st);
+        start_deploy(&mut st, &provider);
+        let b = st.batch.as_ref().unwrap();
+        assert_eq!(b.phase, BatchPhase::ChooseWorkflow);
+        let plan = b.deploy.as_ref().unwrap();
+        assert_eq!(
+            plan.choices.len(),
+            1,
+            "one file, one choice: {:?}",
+            plan.choices
+        );
+        assert_eq!(plan.choices[0].name, "Deploy to Stage");
+        assert_eq!(plan.choices[0].repos.len(), 2);
+
+        // It has inputs: the trigger form opens, and its submit comes back here.
+        choose_deploy_workflow(&mut st);
+        assert_eq!(st.view, View::TriggerPrompt);
+        assert_eq!(st.batch.as_ref().unwrap().phase, BatchPhase::AwaitInputs);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        submit_trigger_prompt(&mut st, &provider, &tx);
+        assert_eq!(st.view, View::BatchCommit);
+        let b = st.batch.as_ref().unwrap();
+        assert_eq!(
+            b.phase,
+            BatchPhase::Confirm,
+            "inputs go to the confirm screen, not out"
+        );
+        let plan = b.deploy.as_ref().unwrap();
+        assert_eq!(plan.inputs.get("confirm").map(String::as_str), Some("no"));
+        assert_eq!(
+            plan.targets["acme/api"],
+            Ok(crate::app::state::DeployTarget {
+                remote: "acme/api".into(),
+                branch: "main".into()
+            })
+        );
+        assert!(plan.targets["acme/web"].is_err(), "detached is skipped");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn the_batch_menu_with_nothing_marked_does_not_open() {
         let mut st = dashboard();
@@ -6519,9 +6972,14 @@ mod tests {
             .insert("acme/web".into(), GitOp::new("commit", None, 0));
 
         start_batch_commit(&mut st);
-        assert!(st.batch.is_none(), "staging under a running hook corrupts the commit");
         assert!(
-            st.status_msg.as_deref().is_some_and(|m| m.contains("acme/web")),
+            st.batch.is_none(),
+            "staging under a running hook corrupts the commit"
+        );
+        assert!(
+            st.status_msg
+                .as_deref()
+                .is_some_and(|m| m.contains("acme/web")),
             "got {:?} — the refusal has to name the repo",
             st.status_msg
         );
@@ -6558,10 +7016,7 @@ mod tests {
     #[test]
     fn workspace_rows_carry_path_and_remote() {
         let dir = std::env::temp_dir().join("jog-ws-rows");
-        let cards = workspace_repos(
-            &[dir.join("alpha"), dir.join("beta")],
-            &Config::default(),
-        );
+        let cards = workspace_repos(&[dir.join("alpha"), dir.join("beta")], &Config::default());
         assert_eq!(cards.len(), 2);
         // No git repo actually exists at these paths, so no remote is resolved
         // and the row falls back to the directory name.
@@ -6597,13 +7052,14 @@ mod tests {
     fn dashboard_counts_staged_and_unstaged_apart() {
         let mut card = RepoCard::local("/tmp/x".into(), None);
         assert!(card.git.is_none());
-        card.git = Some(crate::git::parse_status("## main\0M  a.rs\0 M b.rs\0MM c.rs\0?? d.rs\0"));
+        card.git = Some(crate::git::parse_status(
+            "## main\0M  a.rs\0 M b.rs\0MM c.rs\0?? d.rs\0",
+        ));
         let g = card.git.as_ref().unwrap();
         assert!(!g.is_clean());
         assert_eq!(g.staged_count(), 2);
         assert_eq!(g.unstaged_count(), 3);
     }
-
 
     fn logs_state_with(lines: &[&str]) -> AppState {
         let mut st = empty_state();
@@ -6664,7 +7120,10 @@ mod tests {
         st.log_focus = true;
         st.log_lines = vec!["fine".into(), "##[error]b".into()];
         st.init_log_groups();
-        assert!(st.log_focus, "focus should survive a step that still has errors");
+        assert!(
+            st.log_focus,
+            "focus should survive a step that still has errors"
+        );
     }
 
     #[test]
@@ -6694,7 +7153,10 @@ mod tests {
     #[test]
     fn non_char_bindings_compare_modifiers_strictly() {
         let binding = parse_key("Enter").unwrap();
-        assert!(key_is(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), binding));
+        assert!(key_is(
+            &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            binding
+        ));
         assert!(!key_is(
             &KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
             binding
@@ -6749,7 +7211,10 @@ mod tests {
         // The active repo carries the working tree; a repo we have no checkout
         // of still carries none.
         assert_eq!(cards[0].spec, "o/a");
-        assert_eq!(cards[0].path.as_deref(), Some(std::path::Path::new("/tmp/a")));
+        assert_eq!(
+            cards[0].path.as_deref(),
+            Some(std::path::Path::new("/tmp/a"))
+        );
         assert_eq!(cards[1].spec, "o/b");
         assert!(cards[1].path.is_none());
     }
@@ -6775,7 +7240,11 @@ mod tests {
         let mut st = single_repo(View::Workflows);
         st.repos[0].path = None;
         open_git_view_for_active(&mut st, &mpsc::unbounded_channel().0);
-        assert_eq!(st.view, View::Workflows, "nothing to show, so nowhere to go");
+        assert_eq!(
+            st.view,
+            View::Workflows,
+            "nothing to show, so nowhere to go"
+        );
         assert!(st.git_view.is_none());
         let msg = st.status_msg.clone().unwrap_or_default();
         assert!(msg.contains("no local checkout"), "got {msg:?}");
@@ -6869,7 +7338,10 @@ mod tests {
 
         offer_push(&mut st, "acme/api");
         announce_prompt(&mut st, &cfg);
-        assert!(st.prompt_sounded, "the question that just appeared is announced");
+        assert!(
+            st.prompt_sounded,
+            "the question that just appeared is announced"
+        );
 
         // The dialog stays up for as many frames as it takes to answer, and
         // ←/→ walks the buttons. Neither is a new question.
@@ -6938,8 +7410,7 @@ mod tests {
         st.tick_count += PUSH_WATCH_GIVE_UP_TICKS;
         let (tx, _rx) = mpsc::unbounded_channel();
         let provider = Arc::new(
-            GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "test-token".into())
-                .unwrap(),
+            GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "test-token".into()).unwrap(),
         );
         poll_push_watches(&mut st, &provider, &tx);
         assert!(st.push_watches.is_empty());
@@ -6949,8 +7420,7 @@ mod tests {
     async fn one_key_re_asks_for_whatever_the_screen_is_showing() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let provider = Arc::new(
-            GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "test-token".into())
-                .unwrap(),
+            GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "test-token".into()).unwrap(),
         );
         let mut st = dashboard();
         st.view = View::Runs;
@@ -6970,7 +7440,9 @@ mod tests {
         refresh_current(&mut st, &provider, &tx);
         assert_eq!(st.pending, 0, "a rate-limit hold was spent through");
         assert!(
-            st.status_msg.as_deref().is_some_and(|m| m.contains("rate limited")),
+            st.status_msg
+                .as_deref()
+                .is_some_and(|m| m.contains("rate limited")),
             "got {:?}",
             st.status_msg
         );
@@ -7230,7 +7702,10 @@ mod tests {
         // that says what failed.
         assert!(text.contains("test result: FAILED"), "got:\n{text}");
         assert!(text.contains("assertion"), "got:\n{text}");
-        assert!(text.contains("Process completed with exit code"), "got:\n{text}");
+        assert!(
+            text.contains("Process completed with exit code"),
+            "got:\n{text}"
+        );
         // And not the next step's business.
         assert!(!text.contains("Post job cleanup"), "got:\n{text}");
     }
@@ -7272,7 +7747,10 @@ mod tests {
     fn steps_after_the_marker_still_get_their_lines() {
         let (raw, steps) = failing_test_job();
         let (starts, names) = compute_step_line_starts(&raw, &steps);
-        let post = names.iter().position(|n| n.starts_with("Post Run")).unwrap();
+        let post = names
+            .iter()
+            .position(|n| n.starts_with("Post Run"))
+            .unwrap();
         let text = extract_step_by_line_range(&raw, post, &starts).join("\n");
         // Pushing boundaries past the end-of-step marker must not swallow what
         // legitimately comes after it.
@@ -7365,8 +7843,15 @@ mod tests {
         st.run_cursor = 3; // run #7
 
         // The poll re-fetches while anything is in flight. Same list back.
-        apply_runs_loaded(&mut st, (0..5).map(|i| run_with(10 - i, Status::Running)).collect());
-        assert_eq!(st.selected_run().map(|r| r.id), Some(7), "cursor followed the run");
+        apply_runs_loaded(
+            &mut st,
+            (0..5).map(|i| run_with(10 - i, Status::Running)).collect(),
+        );
+        assert_eq!(
+            st.selected_run().map(|r| r.id),
+            Some(7),
+            "cursor followed the run"
+        );
 
         // A newer run arrives at the head: the selection shifts down a row to
         // stay on the same run, rather than staying put and pointing at another.
@@ -7388,10 +7873,10 @@ mod tests {
         let mut st = runs_view(&[10, 9, 8]);
         st.view = View::Watch;
         st.run_cursor = 2;
-        apply_runs_loaded(&mut st, vec![
-            run_with(11, Status::Running),
-            run_with(10, Status::Running),
-        ]);
+        apply_runs_loaded(
+            &mut st,
+            vec![run_with(11, Status::Running), run_with(10, Status::Running)],
+        );
         assert_eq!(st.run_cursor, 0);
     }
 
@@ -7442,8 +7927,7 @@ mod tests {
         st.tick_count += PUSH_WATCH_MAX_TICKS;
         let (tx, _rx) = mpsc::unbounded_channel();
         let provider = Arc::new(
-            GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "test-token".into())
-                .unwrap(),
+            GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "test-token".into()).unwrap(),
         );
         poll_push_watches(&mut st, &provider, &tx);
         assert!(st.push_watches.is_empty(), "the hard ceiling ends it");
@@ -7469,7 +7953,10 @@ mod tests {
         // The push watch arrives with the same run a moment later. It still ends
         // its watch — but it must not announce a second time.
         settle_push_watch(&mut st, "acme/api", std::slice::from_ref(&finished), &cfg);
-        assert!(st.push_watches.is_empty(), "the watch is still finished off");
+        assert!(
+            st.push_watches.is_empty(),
+            "the watch is still finished off"
+        );
         assert!(
             !notify_run_finished(&mut st, &finished, "acme/api", &cfg),
             "the run was already announced — a second sound and popup is the bug"
@@ -7485,7 +7972,10 @@ mod tests {
         let cfg = quiet_config();
         start_push_watch(&mut st, "acme/api");
         settle_push_watch(&mut st, "acme/api", &[run_with(7, Status::Success)], &cfg);
-        assert!(st.announced_runs.contains(&7), "the push's own run is announced");
+        assert!(
+            st.announced_runs.contains(&7),
+            "the push's own run is announced"
+        );
         assert!(st.push_watches.is_empty());
     }
 }

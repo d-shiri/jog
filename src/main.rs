@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 mod app;
 mod cli;
-mod git;
 mod config;
+mod git;
 mod history;
 mod kuma;
 mod provider;
@@ -196,10 +196,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn resolve_workflow(
-    workflows: &[crate::provider::Workflow],
-    query: &str,
-) -> Result<String> {
+fn resolve_workflow(workflows: &[crate::provider::Workflow], query: &str) -> Result<String> {
     resolve_workflow_full(workflows, query).map(|w| w.file_name.clone())
 }
 

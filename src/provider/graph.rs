@@ -109,7 +109,11 @@ pub enum RunNode {
     /// Only [`stages`] emits these. [`shape`] is what the run page's job list
     /// is built from, and a list of steps for a job that does not exist would
     /// be a list of nothing.
-    Pending { key: String, label: String, matrix: bool },
+    Pending {
+        key: String,
+        label: String,
+        matrix: bool,
+    },
 }
 
 impl WorkflowGraph {
@@ -125,10 +129,7 @@ impl WorkflowGraph {
         for (ord, (key, body)) in jobs.iter().enumerate() {
             let Some(key) = key.as_str() else { continue };
             let name = body.get("name").and_then(|v| v.as_str());
-            let matrix = body
-                .get("strategy")
-                .and_then(|s| s.get("matrix"))
-                .is_some();
+            let matrix = body.get("strategy").and_then(|s| s.get("matrix")).is_some();
             specs.push(JobSpec {
                 key: key.to_string(),
                 matrix,
@@ -331,7 +332,10 @@ fn score(spec: &JobSpec, name: &str) -> Option<usize> {
     }
     // `build (ubuntu-latest, 3.11)` — a matrix job that kept the default name.
     if spec.matrix
-        && let Some(head) = name.strip_suffix(')').and_then(|n| n.rsplit_once(" (")).map(|(h, _)| h)
+        && let Some(head) = name
+            .strip_suffix(')')
+            .and_then(|n| n.rsplit_once(" ("))
+            .map(|(h, _)| h)
         && glob_match(&spec.pattern, head)
     {
         return Some(lit);
@@ -372,7 +376,12 @@ fn relink(specs: &mut [JobSpec]) {
         .collect();
     let edges: Vec<Vec<usize>> = specs
         .iter()
-        .map(|s| s.needs.iter().filter_map(|n| index.get(n.as_str()).copied()).collect())
+        .map(|s| {
+            s.needs
+                .iter()
+                .filter_map(|n| index.get(n.as_str()).copied())
+                .collect()
+        })
         .collect();
     // How many columns each job takes: one, unless it stands for a whole
     // reusable workflow that has been read.
@@ -527,7 +536,11 @@ pub fn stages(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<Vec<NodeGroup>
                 // Behind everything that actually ran when they share a slot:
                 // what happened outranks what is merely going to.
                 first: usize::MAX,
-                node: RunNode::Pending { key: u.key, label: u.label, matrix: u.matrix },
+                node: RunNode::Pending {
+                    key: u.key,
+                    label: u.label,
+                    matrix: u.matrix,
+                },
             });
         }
         // `laid_out` hands its part over already in this order, so the sort is
@@ -650,7 +663,10 @@ fn laid_out(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<Placed> {
                     .map(|(j, _)| j)
                     .collect();
                 legs.sort_by(|&a, &b| jobs[a].name.cmp(&jobs[b].name));
-                RunNode::Matrix { key: key.clone(), legs }
+                RunNode::Matrix {
+                    key: key.clone(),
+                    legs,
+                }
             }
         };
         nodes.push(Placed {
@@ -844,7 +860,10 @@ jobs:
     fn a_one_leg_matrix_stays_a_plain_job() {
         let g = WorkflowGraph::parse(WF).unwrap();
         let jobs = vec![job(1, "which commit"), job(2, "build gojobi")];
-        assert_eq!(shape(&jobs, Some(&g)), vec![RunNode::Job(0), RunNode::Job(1)]);
+        assert_eq!(
+            shape(&jobs, Some(&g)),
+            vec![RunNode::Job(0), RunNode::Job(1)]
+        );
     }
 
     #[test]
@@ -927,8 +946,8 @@ jobs:
             "jobs:\n  back:\n    uses: ./.github/workflows/a.yml\n",
         )
         .unwrap();
-        let mut g = WorkflowGraph::parse(&std::fs::read_to_string(dir.join("a.yml")).unwrap())
-            .unwrap();
+        let mut g =
+            WorkflowGraph::parse(&std::fs::read_to_string(dir.join("a.yml")).unwrap()).unwrap();
         g.resolve_calls(&root, 3);
         assert!(g.place("go / back / go").is_some());
         std::fs::remove_dir_all(&root).ok();
@@ -968,7 +987,10 @@ jobs:
         assert_eq!(col(&st, 0), vec![RunNode::Job(0)]);
         assert_eq!(
             col(&st, 1),
-            vec![RunNode::Matrix { key: "build".into(), legs: vec![2, 1] }]
+            vec![RunNode::Matrix {
+                key: "build".into(),
+                legs: vec![2, 1]
+            }]
         );
         assert_eq!(col(&st, 2), vec![RunNode::Job(3), RunNode::Job(4)]);
     }
@@ -1010,7 +1032,10 @@ jobs:
         let cold = stages(&[], Some(&g));
         assert!(cold.len() > 1, "a pipeline, not a box: {cold:?}");
         assert!(
-            cold.iter().flatten().flat_map(|b| b.nodes.iter()).all(|n| matches!(n, RunNode::Pending { .. })),
+            cold.iter()
+                .flatten()
+                .flat_map(|b| b.nodes.iter())
+                .all(|n| matches!(n, RunNode::Pending { .. })),
             "nothing has run yet: {cold:?}"
         );
 
@@ -1020,7 +1045,11 @@ jobs:
         assert_eq!(warm.len(), cold.len(), "the chain changed shape: {warm:?}");
         assert_eq!(col(&warm, 0), vec![RunNode::Job(0)]);
         assert!(
-            warm.iter().skip(1).flatten().flat_map(|b| b.nodes.iter()).all(|n| matches!(n, RunNode::Pending { .. })),
+            warm.iter()
+                .skip(1)
+                .flatten()
+                .flat_map(|b| b.nodes.iter())
+                .all(|n| matches!(n, RunNode::Pending { .. })),
             "later stages should still be pending: {warm:?}"
         );
     }
@@ -1066,11 +1095,7 @@ jobs:
         assert_eq!(g.spec_for("deploy / v1 → stage").unwrap().key, "deploy");
         // The legs still find the job they came from.
         assert_eq!(g.spec_for("unit").unwrap().key, "build");
-        let jobs = vec![
-            job(1, "unit"),
-            job(2, "e2e"),
-            job(3, "deploy / v1 → stage"),
-        ];
+        let jobs = vec![job(1, "unit"), job(2, "e2e"), job(3, "deploy / v1 → stage")];
         assert_eq!(
             shape(&jobs, Some(&g)),
             vec![

@@ -14,9 +14,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::animated_glyph;
 use super::motion::{Motion, mix};
 use crate::app::state::{
-    AppState, BatchAction, BatchPhase, ByteSpan, DetailItem, DiffLine, DiffRow, DiffSide, GitDiffView, GitOp,
-    Hit, ItemState, Pulse,
-    StatusKind, Theme, View, ansi_line_to_spans,
+    AppState, BatchAction, BatchPhase, ByteSpan, DetailItem, DiffLine, DiffRow, DiffSide,
+    GitDiffView, GitOp, Hit, ItemState, Pulse, StatusKind, Theme, View, ansi_line_to_spans,
 };
 use crate::history::HistoryEntry;
 use crate::provider::github::{ApiFault, CRITICAL_PERCENT};
@@ -87,7 +86,13 @@ const REVEAL_TICKS: f64 = 3.0;
 /// clock having been started (a test, a direct `show_services`), and a settled
 /// card is the honest answer there rather than a frozen first frame.
 fn reveal_at(state: &AppState, i: usize) -> f64 {
-    staggered_reveal(state.services_opened_tick, state.tick_count, i, REVEAL_STEP, REVEAL_TICKS)
+    staggered_reveal(
+        state.services_opened_tick,
+        state.tick_count,
+        i,
+        REVEAL_STEP,
+        REVEAL_TICKS,
+    )
 }
 
 /// How far row `i` of a card opened at `opened` is into its entrance,
@@ -243,7 +248,11 @@ fn chip_colors(base: Color) -> (Color, Color) {
         // a plain channel average picks the wrong ink on amber.
         Color::Rgb(r, g, b) => {
             let luma = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
-            if luma > 150.0 { Color::Black } else { Color::White }
+            if luma > 150.0 {
+                Color::Black
+            } else {
+                Color::White
+            }
         }
         // 256-colour terminals never got the darkening (an indexed colour has
         // no arithmetic), so the fill is still the pastel: dark ink on it.
@@ -353,7 +362,11 @@ fn render_services_overlay(f: &mut Frame, area: Rect, state: &AppState) {
                 if i > 0 {
                     out.push(Line::from(""));
                 }
-                let label = if section.is_empty() { "untagged" } else { section };
+                let label = if section.is_empty() {
+                    "untagged"
+                } else {
+                    section
+                };
                 let mut spans = vec![Span::raw(" ")];
                 spans.extend(env_chip(label, reveal_at(state, row), theme));
                 out.push(Line::from(spans));
@@ -562,7 +575,10 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
                 Style::default().fg(theme.text_muted),
             ));
             c.push(sep());
-            c.push(Span::styled("Changes", Style::default().fg(theme.primary).bold()));
+            c.push(Span::styled(
+                "Changes",
+                Style::default().fg(theme.primary).bold(),
+            ));
             c
         }
         View::GitDiff => {
@@ -592,24 +608,35 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
             ]);
             c
         }
-        View::Workflows => vec![
-            Span::styled("Workflows", Style::default().fg(theme.primary).bold()),
-        ],
+        View::Workflows => vec![Span::styled(
+            "Workflows",
+            Style::default().fg(theme.primary).bold(),
+        )],
         View::Runs => vec![
             Span::styled("Workflows", Style::default().fg(theme.text_muted)),
             sep(),
             Span::styled(
-                state.workflow_for_runs.as_deref().unwrap_or("?").to_string(),
+                state
+                    .workflow_for_runs
+                    .as_deref()
+                    .unwrap_or("?")
+                    .to_string(),
                 Style::default().fg(theme.primary).bold(),
             ),
         ],
         View::RunDetail => {
             let wf = state.workflow_for_runs.as_deref().unwrap_or("?");
-            let rid = state.run_detail.as_ref()
+            let rid = state
+                .run_detail
+                .as_ref()
                 .map(|d| format!("#{}", d.run.id))
-                .unwrap_or_else(|| state.runs.get(state.run_cursor)
-                    .map(|r| format!("#{}", r.id))
-                    .unwrap_or_else(|| "?".into()));
+                .unwrap_or_else(|| {
+                    state
+                        .runs
+                        .get(state.run_cursor)
+                        .map(|r| format!("#{}", r.id))
+                        .unwrap_or_else(|| "?".into())
+                });
             vec![
                 Span::styled("Workflows", Style::default().fg(theme.text_muted)),
                 sep(),
@@ -619,9 +646,14 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
             ]
         }
         View::Logs => {
-            let step = state.current_step_idx()
+            let step = state
+                .current_step_idx()
                 .and_then(|i| state.log_step_names.get(i))
-                .or_else(|| state.log_section_idx.and_then(|i| state.log_sections.get(i)))
+                .or_else(|| {
+                    state
+                        .log_section_idx
+                        .and_then(|i| state.log_sections.get(i))
+                })
                 .map(|s| s.as_str())
                 .unwrap_or("all steps");
             vec![
@@ -638,6 +670,7 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
                 Some((_, BatchAction::BackToMain)) => "Batch back to main",
                 Some((_, BatchAction::OpenPr)) => "Batch PRs",
                 Some((_, BatchAction::Run)) => "Batch run",
+                Some((_, BatchAction::Deploy)) => "Batch deploy",
                 _ => "Batch commit",
             };
             vec![
@@ -649,9 +682,18 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
                 ),
             ]
         }
-        View::Watch         => vec![Span::styled("Watch",   Style::default().fg(theme.primary).bold())],
-        View::Diff          => vec![Span::styled("Diff",    Style::default().fg(theme.primary).bold())],
-        View::TriggerPrompt => vec![Span::styled("Trigger", Style::default().fg(theme.primary).bold())],
+        View::Watch => vec![Span::styled(
+            "Watch",
+            Style::default().fg(theme.primary).bold(),
+        )],
+        View::Diff => vec![Span::styled(
+            "Diff",
+            Style::default().fg(theme.primary).bold(),
+        )],
+        View::TriggerPrompt => vec![Span::styled(
+            "Trigger",
+            Style::default().fg(theme.primary).bold(),
+        )],
     };
 
     let dot = Style::default().fg(theme.border_dim);
@@ -911,7 +953,12 @@ fn now_playing(state: &AppState) -> Vec<Span<'static>> {
     };
     // The owner is the same for nearly every row and is already in the path; the
     // name is the part that says which one.
-    let name = card.spec.rsplit('/').next().unwrap_or(&card.spec).to_string();
+    let name = card
+        .spec
+        .rsplit('/')
+        .next()
+        .unwrap_or(&card.spec)
+        .to_string();
     let mut out = vec![
         Span::styled(
             format!("{} ", animated_glyph(Status::Running, state.tick_count)),
@@ -1005,12 +1052,22 @@ fn workspace_tallies(state: &AppState) -> Vec<Span<'static>> {
         Span::styled(text, style)
     };
     out.push(count(t.ok, format!("✓{}", t.ok), theme.success, false));
-    out.push(count(t.fail, format!("  ✗{}", t.fail), theme.failure, false));
+    out.push(count(
+        t.fail,
+        format!("  ✗{}", t.fail),
+        theme.failure,
+        false,
+    ));
     if t.busy > 0 {
         out.push(count(t.busy, format!("  ⏵{}", t.busy), theme.warning, true));
     }
     if t.broken > 0 {
-        out.push(count(t.broken, format!("  !{}", t.broken), theme.failure, true));
+        out.push(count(
+            t.broken,
+            format!("  !{}", t.broken),
+            theme.failure,
+            true,
+        ));
     }
     out.push(Span::styled("   ", Style::default()));
     out
@@ -1164,7 +1221,10 @@ fn poll_clock(state: &AppState) -> String {
         let total = state.fetch_hwm.get().max(inflight);
         state.fetch_hwm.set(total);
         let spin = SPINNER[(state.tick_count / 3 % 4) as usize];
-        let secs = state.tick_count.saturating_sub(state.fetch_started_tick.get()) / 10;
+        let secs = state
+            .tick_count
+            .saturating_sub(state.fetch_started_tick.get())
+            / 10;
         if secs >= 3 {
             let field = if total > 1 {
                 format!("{}/{total}", total - inflight)
@@ -1208,7 +1268,11 @@ fn changes_label(state: &AppState) -> &'static str {
 fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     let km = &state.keymap;
-    let editing = state.trigger_prompt.as_ref().map(|p| p.editing).unwrap_or(false);
+    let editing = state
+        .trigger_prompt
+        .as_ref()
+        .map(|p| p.editing)
+        .unwrap_or(false);
 
     // The push question owns the keyboard the same way, and its keys are not
     // the working tree's.
@@ -1217,7 +1281,10 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             Span::raw(" "),
             Span::styled("↵", Style::default().fg(theme.text_bright).bold()),
             Span::raw(" "),
-            Span::styled("take the highlighted answer", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                "take the highlighted answer",
+                Style::default().fg(theme.text_muted),
+            ),
             Span::raw("  "),
             Span::styled("y/n", Style::default().fg(theme.text_bright).bold()),
             Span::raw(" "),
@@ -1273,7 +1340,11 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                 (display_key(&km.git_view).into(), "changes"),
                 (
                     display_key(&km.repo_mark).into(),
-                    if state.repo_marks.is_empty() { "mark" } else { "mark/unmark" },
+                    if state.repo_marks.is_empty() {
+                        "mark"
+                    } else {
+                        "mark/unmark"
+                    },
                 ),
             ];
             // Only advertised once marking it would do something — the key is
@@ -1294,6 +1365,15 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             hints
         }
         View::BatchCommit => match state.batch.as_ref().map(|b| b.phase) {
+            Some(BatchPhase::ChooseWorkflow) => vec![
+                (
+                    format!("{}/{}", display_key(&km.down), display_key(&km.up)),
+                    "move",
+                ),
+                ("↵".into(), "choose"),
+                ("Esc".into(), "back"),
+            ],
+            Some(BatchPhase::Confirm) => vec![("↵".into(), "deploy"), ("Esc".into(), "cancel")],
             Some(BatchPhase::Pick) => {
                 let mut v: Vec<(String, &str)> = crate::tui::BATCH_MENU
                     .iter()
@@ -1319,9 +1399,16 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                 (display_key(&km.batch_retry).into(), "retry"),
                 (display_key(&km.batch_skip).into(), "skip"),
                 (display_key(&km.git_view).into(), "open repo"),
-                (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "scroll"),
                 (
-                    format!("{}/{}", display_key(&km.next_error), display_key(&km.prev_error)),
+                    format!("{}/{}", display_key(&km.down), display_key(&km.up)),
+                    "scroll",
+                ),
+                (
+                    format!(
+                        "{}/{}",
+                        display_key(&km.next_error),
+                        display_key(&km.prev_error)
+                    ),
                     "next/prev error",
                 ),
                 (display_key(&km.back).into(), "stop"),
@@ -1337,16 +1424,28 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                 let leaving = state.batch.as_ref().is_some_and(|b| b.returns_on_its_own());
                 vec![(
                     display_key(&km.back).into(),
-                    if leaving { "back to repos now" } else { "back to repos" },
+                    if leaving {
+                        "back to repos now"
+                    } else {
+                        "back to repos"
+                    },
                 )]
             }
             _ => vec![
-                (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "scroll"),
+                (
+                    format!("{}/{}", display_key(&km.down), display_key(&km.up)),
+                    "scroll",
+                ),
                 (display_key(&km.yank).into(), "yank output"),
                 (display_key(&km.back).into(), "stop after this repo"),
             ],
         },
-        View::GitStatus if state.git_view.as_ref().is_some_and(|g| g.commit_input.is_some()) => {
+        View::GitStatus
+            if state
+                .git_view
+                .as_ref()
+                .is_some_and(|g| g.commit_input.is_some()) =>
+        {
             vec![
                 ("type".into(), "message"),
                 ("Bksp".into(), "delete"),
@@ -1360,12 +1459,14 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         // than saying the same six things two rows lower.
         View::GitStatus if state.current_op().is_some() => {
             let running = state.current_op().is_some_and(|o| !o.finished);
-            let mut hints = vec![
-                (
-                    format!("{}/{}", display_key(&km.scroll_top), display_key(&km.scroll_bottom)),
-                    "top/tail",
+            let mut hints = vec![(
+                format!(
+                    "{}/{}",
+                    display_key(&km.scroll_top),
+                    display_key(&km.scroll_bottom)
                 ),
-            ];
+                "top/tail",
+            )];
             // Refused while a git command is in flight, so not offered either.
             if !running {
                 hints.push((display_key(&km.git_push).into(), "push"));
@@ -1375,7 +1476,10 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         }
         View::GitStatus => {
             let mut hints = vec![
-                (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "move"),
+                (
+                    format!("{}/{}", display_key(&km.down), display_key(&km.up)),
+                    "move",
+                ),
                 (display_key(&km.git_stage).into(), "stage/unstage"),
                 (display_key(&km.git_stage_all).into(), "stage all"),
                 (display_key(&km.git_commit).into(), "commit"),
@@ -1385,7 +1489,11 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                 hints.push((display_key(&km.trigger).into(), "run CI"));
                 // The same key, but the honest label: it opens the PR that
                 // exists, or the page that creates the one that doesn't.
-                let label = if state.git_view.as_ref().is_some_and(|g| g.open_pr().is_some()) {
+                let label = if state
+                    .git_view
+                    .as_ref()
+                    .is_some_and(|g| g.open_pr().is_some())
+                {
                     "open PR"
                 } else {
                     "new PR"
@@ -1397,10 +1505,24 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             hints
         }
         View::GitDiff => vec![
-            (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "scroll"),
-            (format!("{}/{}", display_key(&km.page_down), display_key(&km.page_up)), "page"),
             (
-                format!("{}/{}", display_key(&km.next_step), display_key(&km.prev_step)),
+                format!("{}/{}", display_key(&km.down), display_key(&km.up)),
+                "scroll",
+            ),
+            (
+                format!(
+                    "{}/{}",
+                    display_key(&km.page_down),
+                    display_key(&km.page_up)
+                ),
+                "page",
+            ),
+            (
+                format!(
+                    "{}/{}",
+                    display_key(&km.next_step),
+                    display_key(&km.prev_step)
+                ),
                 "next/prev file",
             ),
             (display_key(&km.git_stage).into(), "stage/unstage"),
@@ -1452,7 +1574,10 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                 Some(DetailItem::Group(_))
             );
             let mut hints = vec![
-                (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "step"),
+                (
+                    format!("{}/{}", display_key(&km.down), display_key(&km.up)),
+                    "step",
+                ),
                 if on_box {
                     ("↵".to_string(), "fold")
                 } else {
@@ -1469,20 +1594,49 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             hints
         }
         View::Logs => {
-            let np_label = if state.log_search_query.is_some() { "match" } else { "step" };
+            let np_label = if state.log_search_query.is_some() {
+                "match"
+            } else {
+                "step"
+            };
             let mut hints = vec![
-                (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "move"),
-                (format!("{}/{}", display_key(&km.page_down), display_key(&km.page_up)), "page"),
-                (format!("{}/{}", display_key(&km.next_step), display_key(&km.prev_step)), np_label),
+                (
+                    format!("{}/{}", display_key(&km.down), display_key(&km.up)),
+                    "move",
+                ),
+                (
+                    format!(
+                        "{}/{}",
+                        display_key(&km.page_down),
+                        display_key(&km.page_up)
+                    ),
+                    "page",
+                ),
+                (
+                    format!(
+                        "{}/{}",
+                        display_key(&km.next_step),
+                        display_key(&km.prev_step)
+                    ),
+                    np_label,
+                ),
                 (display_key(&km.all_steps).into(), "all"),
                 (display_key(&km.search).into(), "search"),
                 (
-                    format!("{}/{}", display_key(&km.next_error), display_key(&km.prev_error)),
+                    format!(
+                        "{}/{}",
+                        display_key(&km.next_error),
+                        display_key(&km.prev_error)
+                    ),
                     "error",
                 ),
                 (
                     display_key(&km.log_focus).into(),
-                    if state.log_focus { "focus ✓" } else { "focus" },
+                    if state.log_focus {
+                        "focus ✓"
+                    } else {
+                        "focus"
+                    },
                 ),
             ];
             if state.log_focus && !state.log_fold_rows.is_empty() {
@@ -1494,7 +1648,7 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             hints.push((display_key(&km.back).into(), "back"));
             hints.push((display_key(&km.quit).into(), "quit"));
             hints
-        },
+        }
         View::Watch => {
             let mut hints = Vec::new();
             // Offered only when there is something below the fold — a key that
@@ -1532,7 +1686,10 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             ("Enter/Esc".into(), "done"),
         ],
         View::TriggerPrompt => vec![
-            (format!("{}/{}", display_key(&km.down), display_key(&km.up)), "move"),
+            (
+                format!("{}/{}", display_key(&km.down), display_key(&km.up)),
+                "move",
+            ),
             (display_key(&km.tp_cycle).into(), "cycle"),
             (format!("↵/{}", display_key(&km.tp_edit)), "edit"),
             (display_key(&km.tp_submit).into(), "trigger"),
@@ -1563,7 +1720,9 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         }
         let (key_style, desc_style) = if i == last && beacon > 0.0 {
             (
-                Style::default().fg(mix(theme.text_bright, theme.accent, beacon)).bold(),
+                Style::default()
+                    .fg(mix(theme.text_bright, theme.accent, beacon))
+                    .bold(),
                 Style::default().fg(mix(theme.text_muted, theme.accent, beacon)),
             )
         } else {
@@ -1649,8 +1808,11 @@ fn render_empty(f: &mut Frame, area: Rect, theme: &Theme, glyph: &str, what: &st
     if area.height < 3 || area.width < 20 {
         // No room to be graceful; the sentence still beats nothing.
         f.render_widget(
-            Paragraph::new(Span::styled(what.to_string(), Style::default().fg(theme.text_faint)))
-                .wrap(Wrap { trim: false }),
+            Paragraph::new(Span::styled(
+                what.to_string(),
+                Style::default().fg(theme.text_faint),
+            ))
+            .wrap(Wrap { trim: false }),
             area,
         );
         return;
@@ -1692,7 +1854,11 @@ fn render_empty(f: &mut Frame, area: Rect, theme: &Theme, glyph: &str, what: &st
 /// Only GitHub today. `remote` is set from an origin the GitHub provider could
 /// parse, so its presence is the whole test; a second forge would add its glyph
 /// here and nothing else would move.
-fn forge_span(card: &crate::app::state::RepoCard, state: &AppState, theme: &Theme) -> Span<'static> {
+fn forge_span(
+    card: &crate::app::state::RepoCard,
+    state: &AppState,
+    theme: &Theme,
+) -> Span<'static> {
     if state.forge_icon.is_empty() {
         return Span::raw("");
     }
@@ -1803,7 +1969,12 @@ fn register_table_hits(
         let Some(h) = hit_for(r) else { continue };
         let y = inner.y + header_rows + ((r - offset) as u16) * row_h;
         hits.push((
-            Rect { x: inner.x, y, width: inner.width, height: row_h },
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: row_h,
+            },
             h,
         ));
     }
@@ -1815,17 +1986,16 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
     // On a wide terminal, anything mid-flight earns a live pane down the right
     // edge: the dashboard stays the view, and the log of the run you most
     // recently set moving scrolls beside it — the wall-monitor arrangement.
-    let (area, live_pane) = if area.width >= super::DASH_SPLIT_MIN_WIDTH
-        && state.dash_tail_target().is_some()
-    {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(56)])
-            .split(area);
-        (chunks[0], Some(chunks[1]))
-    } else {
-        (area, None)
-    };
+    let (area, live_pane) =
+        if area.width >= super::DASH_SPLIT_MIN_WIDTH && state.dash_tail_target().is_some() {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0), Constraint::Length(56)])
+                .split(area);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (area, None)
+        };
     if let Some(pa) = live_pane {
         render_dash_live(f, pa, state);
     }
@@ -2035,7 +2205,10 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
         if svcs.is_empty() {
             return Cell::from("");
         }
-        let down = svcs.iter().filter(|s| s.state == ServiceState::Down).count();
+        let down = svcs
+            .iter()
+            .filter(|s| s.state == ServiceState::Down)
+            .count();
         if down > 0 {
             let label = if svcs.len() == 1 {
                 // The day's uptime says whether this is a blip or a siege.
@@ -2046,7 +2219,10 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
             } else {
                 format!("✗ {down}/{} down", svcs.len())
             };
-            return Cell::from(Span::styled(label, Style::default().fg(theme.failure).bold()));
+            return Cell::from(Span::styled(
+                label,
+                Style::default().fg(theme.failure).bold(),
+            ));
         }
         if svcs.iter().all(|s| s.state != ServiceState::Up) {
             return Cell::from(Span::styled(
@@ -2111,7 +2287,11 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                 // A band rather than a dashed rule doing all the work: the
                 // heading is the one row that is not a repo, and a change of
                 // ground says that before the eye has read anything.
-                .style(Style::default().bg(mix(theme.row_idle, theme.overlay, 0.6))),
+                .style(Style::default().bg(mix(
+                    theme.row_idle,
+                    theme.overlay,
+                    0.6,
+                ))),
             );
         }
         row_of.push(rows.len());
@@ -2154,8 +2334,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                     Style::default().fg(theme.failure),
                 )));
                 cells.extend(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")));
-                rows.push(Row::new(cells)
-                .style(row_dress(
+                rows.push(Row::new(cells).style(row_dress(
                     row_bg_for_status(Status::Failure, theme),
                     rows.len(),
                     i == state.repo_cursor,
@@ -2182,8 +2361,7 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                     Style::default().fg(theme.text_faint).italic(),
                 )));
                 cells.extend(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")));
-                rows.push(Row::new(cells)
-                .style(row_dress(
+                rows.push(Row::new(cells).style(row_dress(
                     theme.row_idle,
                     rows.len(),
                     i == state.repo_cursor,
@@ -2203,10 +2381,13 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
                 if show_live {
                     cells.push(live_cell(card));
                 }
-                cells.push(Cell::from(Line::from(skeleton(14, state.tick_count, theme))));
+                cells.push(Cell::from(Line::from(skeleton(
+                    14,
+                    state.tick_count,
+                    theme,
+                ))));
                 cells.extend(cols.tail(Cell::from(""), Cell::from(""), Cell::from("")));
-                rows.push(Row::new(cells)
-                .style(row_dress(
+                rows.push(Row::new(cells).style(row_dress(
                     theme.row_idle,
                     rows.len(),
                     i == state.repo_cursor,
@@ -2269,7 +2450,10 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
             if show_live {
                 cells.push(live_cell(card));
             }
-            cells.push(Cell::from(Span::styled(workflow, Style::default().fg(theme.text))));
+            cells.push(Cell::from(Span::styled(
+                workflow,
+                Style::default().fg(theme.text),
+            )));
             cells.extend(cols.tail(
                 ran_on_cell(card, &branch),
                 // Right-aligned: "4d ago" over "130d ago" with ragged units is
@@ -2282,12 +2466,12 @@ fn render_repos(f: &mut Frame, area: Rect, state: &AppState) {
     }
 
     let mut widths = vec![
-        Constraint::Length(1),   // batch mark
-        Constraint::Length(1),   // status glyph
-        Constraint::Fill(40),    // repo
-        Constraint::Fill(26),    // local branch + upstream drift
-        Constraint::Length(9),   // working-tree changes
-        Constraint::Fill(35),    // latest workflow
+        Constraint::Length(1), // batch mark
+        Constraint::Length(1), // status glyph
+        Constraint::Fill(40),  // repo
+        Constraint::Fill(26),  // local branch + upstream drift
+        Constraint::Length(9), // working-tree changes
+        Constraint::Fill(35),  // latest workflow
     ];
     if show_live {
         widths.insert(5, Constraint::Length(12)); // service health
@@ -2379,7 +2563,9 @@ fn live_step_lines(job: &Job, rows: usize, tick: u64, theme: &Theme) -> Vec<Line
         .iter()
         .map(|s| {
             let secs = s.started_at.map(|st| {
-                (s.completed_at.unwrap_or_else(Utc::now) - st).num_seconds().max(0)
+                (s.completed_at.unwrap_or_else(Utc::now) - st)
+                    .num_seconds()
+                    .max(0)
             });
             let dur = secs.map(format_elapsed).unwrap_or_default();
             Line::from(vec![
@@ -2397,7 +2583,11 @@ fn live_step_lines(job: &Job, rows: usize, tick: u64, theme: &Theme) -> Vec<Line
                     },
                 ),
                 Span::styled(
-                    if dur.is_empty() { String::new() } else { format!("  {dur}") },
+                    if dur.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {dur}")
+                    },
                     Style::default().fg(theme.text_muted),
                 ),
             ])
@@ -2453,9 +2643,14 @@ fn render_dash_live(f: &mut Frame, area: Rect, state: &AppState) {
         Some(t) if t.job_id == job.id && !t.lines.is_empty() => {
             // The tail follows the newest lines by definition; history is what
             // entering the run is for.
-            lines.extend(t.lines.iter().rev().take(tail_rows).rev().map(|l| {
-                Line::from(ansi_line_to_spans(l, Style::default().fg(theme.text)))
-            }));
+            lines.extend(
+                t.lines
+                    .iter()
+                    .rev()
+                    .take(tail_rows)
+                    .rev()
+                    .map(|l| Line::from(ansi_line_to_spans(l, Style::default().fg(theme.text)))),
+            );
         }
         // No log body: show the steps instead, which are live where the log
         // cannot be until the job has finished.
@@ -2584,11 +2779,18 @@ impl Grouping {
     fn of(repos: &[crate::app::state::RepoCard]) -> Self {
         let owners: Vec<String> = repos
             .iter()
-            .map(|c| c.spec.split_once('/').map(|(o, _)| o.to_string()).unwrap_or_default())
+            .map(|c| {
+                c.spec
+                    .split_once('/')
+                    .map(|(o, _)| o.to_string())
+                    .unwrap_or_default()
+            })
             .collect();
         let distinct: std::collections::HashSet<&String> = owners.iter().collect();
         let worth_it = distinct.len() > 1 && owners.iter().all(|o| !o.is_empty());
-        Self { owners: if worth_it { owners } else { Vec::new() } }
+        Self {
+            owners: if worth_it { owners } else { Vec::new() },
+        }
     }
 
     fn on(&self) -> bool {
@@ -2608,7 +2810,10 @@ impl Grouping {
     /// The repo's name with the owner dropped, when a heading already carries it.
     fn short_name(&self, spec: &str) -> String {
         match self.on() {
-            true => spec.split_once('/').map(|(_, r)| r.to_string()).unwrap_or_else(|| spec.into()),
+            true => spec
+                .split_once('/')
+                .map(|(_, r)| r.to_string())
+                .unwrap_or_else(|| spec.into()),
             false => spec.to_string(),
         }
     }
@@ -2634,12 +2839,42 @@ struct Columns {
 impl Columns {
     fn for_width(w: u16) -> Self {
         match w {
-            0..=79 => Self { ran_on: false, updated: false, recent: false, spark_w: 0 },
-            80..=99 => Self { ran_on: false, updated: true, recent: false, spark_w: 0 },
-            100..=119 => Self { ran_on: false, updated: true, recent: true, spark_w: 5 },
-            120..=149 => Self { ran_on: true, updated: true, recent: true, spark_w: 5 },
-            150..=169 => Self { ran_on: true, updated: true, recent: true, spark_w: 8 },
-            _ => Self { ran_on: true, updated: true, recent: true, spark_w: 12 },
+            0..=79 => Self {
+                ran_on: false,
+                updated: false,
+                recent: false,
+                spark_w: 0,
+            },
+            80..=99 => Self {
+                ran_on: false,
+                updated: true,
+                recent: false,
+                spark_w: 0,
+            },
+            100..=119 => Self {
+                ran_on: false,
+                updated: true,
+                recent: true,
+                spark_w: 5,
+            },
+            120..=149 => Self {
+                ran_on: true,
+                updated: true,
+                recent: true,
+                spark_w: 5,
+            },
+            150..=169 => Self {
+                ran_on: true,
+                updated: true,
+                recent: true,
+                spark_w: 8,
+            },
+            _ => Self {
+                ran_on: true,
+                updated: true,
+                recent: true,
+                spark_w: 12,
+            },
         }
     }
 
@@ -2706,7 +2941,9 @@ fn run_sparkline(runs: &[&Run], width: usize, theme: &Theme) -> Vec<Span<'static
             let h = if flat {
                 3
             } else {
-                (((secs(r) - shortest) / spread) * 7.0).round().clamp(0.0, 7.0) as usize
+                (((secs(r) - shortest) / spread) * 7.0)
+                    .round()
+                    .clamp(0.0, 7.0) as usize
             };
             let style = Style::default().fg(mix(color, theme.row_idle, fade * age));
             Span::styled(BARS[h], style)
@@ -2750,7 +2987,11 @@ fn skeleton(width: usize, tick: u64, theme: &Theme) -> Vec<Span<'static>> {
             let lit = i == head || i + 1 == head;
             Span::styled(
                 if lit { "━" } else { "─" },
-                Style::default().fg(if lit { theme.text_faint } else { theme.text_ghost }),
+                Style::default().fg(if lit {
+                    theme.text_faint
+                } else {
+                    theme.text_ghost
+                }),
             )
         })
         .collect()
@@ -2786,7 +3027,11 @@ fn progress_bar(ratio: Option<f64>, width: usize, tick: u64, theme: &Theme) -> V
             let sweep = Motion::new(tick).sweep(width, 8);
             for i in 0..width {
                 let (ch, color) = if i < filled {
-                    if i == sweep { ("━", head) } else { ("━", fill) }
+                    if i == sweep {
+                        ("━", head)
+                    } else {
+                        ("━", fill)
+                    }
                 } else if i == filled {
                     ("╺", fill)
                 } else {
@@ -2903,7 +3148,11 @@ fn render_activity_strip(
                 // Jobs exist but none is running: between two of them, or a
                 // matrix leg is still being scheduled.
                 None => {
-                    let done = detail.jobs.iter().filter(|j| j.status.is_terminal()).count();
+                    let done = detail
+                        .jobs
+                        .iter()
+                        .filter(|j| j.status.is_terminal())
+                        .count();
                     (
                         Some(done as f64 / detail.jobs.len() as f64),
                         format!("{done}/{} jobs", detail.jobs.len()),
@@ -2926,7 +3175,11 @@ fn render_activity_strip(
             StripRow {
                 glyph,
                 repeat,
-                repo: if show_repo { card.spec.clone() } else { String::new() },
+                repo: if show_repo {
+                    card.spec.clone()
+                } else {
+                    String::new()
+                },
                 workflow: run.display_title.clone(),
                 branch: run.head_branch.clone(),
                 job,
@@ -2948,15 +3201,17 @@ fn render_activity_strip(
     // but it left each row's branch, job and step at a different x — and this
     // strip is read down its columns, not across its rows. Long names now cost
     // their own column width instead of everyone else's alignment.
-    let longest = |pick: &dyn Fn(&StripRow) -> usize| {
-        cells.iter().map(pick).max().unwrap_or(0)
-    };
+    let longest = |pick: &dyn Fn(&StripRow) -> usize| cells.iter().map(pick).max().unwrap_or(0);
     // Where a column stops growing, and where it refuses to shrink further:
     // repo, workflow, branch, job, step.
     const CAP: [usize; 5] = [28, 30, 18, 22, 48];
     const FLOOR: [usize; 5] = [10, 8, 6, 6, 12];
     let mut cols = [
-        if show_repo { longest(&|c| disp_width(&c.repo)) } else { 0 },
+        if show_repo {
+            longest(&|c| disp_width(&c.repo))
+        } else {
+            0
+        },
         longest(&|c| disp_width(&c.workflow)),
         longest(&|c| disp_width(&c.branch)),
         longest(&|c| disp_width(&c.job)),
@@ -2979,8 +3234,13 @@ fn render_activity_strip(
     let w_eta = longest(&|c| disp_width(&c.eta)).min(14);
     let show_eta = w_eta > 0 && inner >= 80;
     let (w_eta, eta_spacing) = if show_eta { (w_eta, SPACING) } else { (0, 0) };
-    let fixed =
-        1 + bar_w + w_count + w_elapsed + w_eta + eta_spacing + SPACING * if show_repo { 8 } else { 7 };
+    let fixed = 1
+        + bar_w
+        + w_count
+        + w_elapsed
+        + w_eta
+        + eta_spacing
+        + SPACING * if show_repo { 8 } else { 7 };
     let avail = inner.saturating_sub(fixed);
     shrink_to_fit(&mut cols, &FLOOR, avail);
     // Slack goes to the step, so the elapsed clock keeps the right edge and the
@@ -3075,13 +3335,15 @@ fn render_activity_strip(
     widths.push(Constraint::Length(w_elapsed as u16));
 
     f.render_widget(
-        Table::new(rows, widths).column_spacing(SPACING as u16).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(border))
-                .title(Line::from(title)),
-        ),
+        Table::new(rows, widths)
+            .column_spacing(SPACING as u16)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(border))
+                    .title(Line::from(title)),
+            ),
         area,
     );
 }
@@ -3146,7 +3408,9 @@ fn shrink_to_fit(cols: &mut [usize], floors: &[usize], avail: usize) {
 ///
 /// Section titles match `View` names so the overlay can highlight wherever the
 /// user currently is.
-fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(String, &'static str)>)> {
+fn help_sections(
+    km: &crate::config::KeymapConfig,
+) -> Vec<(&'static str, Vec<(String, &'static str)>)> {
     let k = |s: &str| display_key(s).to_string();
     let pair = |a: &str, b: &str| format!("{}/{}", display_key(a), display_key(b));
 
@@ -3165,7 +3429,10 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
                 (k(&km.snooze), "snooze notifications — 30m, 60m, off"),
                 (k(&km.open_browser), "open in browser"),
                 (k(&km.yank), "copy the selection to the clipboard"),
-                ("click".into(), "select a row — again to open; wheel scrolls"),
+                (
+                    "click".into(),
+                    "select a row — again to open; wheel scrolls",
+                ),
                 (k(&km.help), "this help"),
                 (k(&km.quit), "quit"),
             ],
@@ -3175,7 +3442,10 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
             vec![
                 ("↵".into(), "switch to this repo"),
                 (k(&km.git_view), "review local changes"),
-                (k(&km.repo_mark), "mark / unmark this repo for a batch commit"),
+                (
+                    k(&km.repo_mark),
+                    "mark / unmark this repo for a batch commit",
+                ),
                 (
                     format!("{}/{}", k(&km.batch_commit), k(&km.batch_menu)),
                     "commit the marked repos / more (branch, main, PRs, run)",
@@ -3187,13 +3457,22 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
             "Batch commit",
             vec![
                 ("↵".into(), "stage everything, commit each in turn"),
-                (k(&km.batch_retry), "retry the repo that failed",),
+                (k(&km.batch_retry), "retry the repo that failed"),
                 (k(&km.batch_skip), "skip it and carry on"),
-                (k(&km.git_view), "open the failed repo's working tree to fix it"),
+                (
+                    k(&km.git_view),
+                    "open the failed repo's working tree to fix it",
+                ),
                 (pair(&km.down, &km.up), "scroll the hook output"),
-                (pair(&km.next_error, &km.prev_error), "next / previous error"),
+                (
+                    pair(&km.next_error, &km.prev_error),
+                    "next / previous error",
+                ),
                 (k(&km.git_push), "push everything the batch committed"),
-                (k(&km.back), "stop — repos already committed keep their commits"),
+                (
+                    k(&km.back),
+                    "stop — repos already committed keep their commits",
+                ),
             ],
         ),
         (
@@ -3204,13 +3483,22 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
                 (k(&km.git_commit), "commit (opens a message prompt)"),
                 (k(&km.git_push), "push — sets upstream on first push"),
                 (k(&km.trigger), "open this repo's workflows to run CI"),
-                (k(&km.open_browser), "open the branch's PR — or the page that creates one"),
-                (format!("{}/↵", k(&km.git_diff)), "diff every changed file, from this one"),
+                (
+                    k(&km.open_browser),
+                    "open the branch's PR — or the page that creates one",
+                ),
+                (
+                    format!("{}/↵", k(&km.git_diff)),
+                    "diff every changed file, from this one",
+                ),
                 (
                     pair(&km.down, &km.up),
                     "scroll the hook output, while a commit/push is showing it",
                 ),
-                (pair(&km.next_error, &km.prev_error), "next / previous error in that output"),
+                (
+                    pair(&km.next_error, &km.prev_error),
+                    "next / previous error in that output",
+                ),
                 (k(&km.yank), "yank the whole hook output"),
                 (k(&km.back), "dismiss the output of a failed commit/push"),
             ],
@@ -3218,11 +3506,17 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
         (
             "Diff — file changes",
             vec![
-                ("layout".into(), "side by side — unified when the terminal is narrow"),
+                (
+                    "layout".into(),
+                    "side by side — unified when the terminal is narrow",
+                ),
                 (pair(&km.down, &km.up), "scroll"),
                 (pair(&km.page_down, &km.page_up), "page"),
                 (pair(&km.scroll_top, &km.scroll_bottom), "top / bottom"),
-                (pair(&km.next_step, &km.prev_step), "next / previous changed file"),
+                (
+                    pair(&km.next_step, &km.prev_step),
+                    "next / previous changed file",
+                ),
                 (k(&km.git_stage), "stage / unstage this file"),
                 (k(&km.back), "back to the file list"),
             ],
@@ -3264,7 +3558,10 @@ fn help_sections(km: &crate::config::KeymapConfig) -> Vec<(&'static str, Vec<(St
                 (pair(&km.next_step, &km.prev_step), "next / previous step"),
                 (k(&km.all_steps), "show all steps"),
                 (k(&km.search), "search (then n/p cycle matches)"),
-                (pair(&km.next_error, &km.prev_error), "next / previous error"),
+                (
+                    pair(&km.next_error, &km.prev_error),
+                    "next / previous error",
+                ),
                 (k(&km.log_focus), "focus mode — fold everything but errors"),
                 ("↵".into(), "expand a fold, or collapse a group"),
             ],
@@ -3421,7 +3718,11 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     let dialog_w = area.width.saturating_sub(4).clamp(area.width.min(46), 104);
     let inner_w = dialog_w.saturating_sub(2);
     let two_cols = inner_w >= 88;
-    let col_w = if two_cols { (inner_w - GAP) / 2 } else { inner_w };
+    let col_w = if two_cols {
+        (inner_w - GAP) / 2
+    } else {
+        inner_w
+    };
     // 1 margin + key cap (key_w + 2) + 2 gap, then the description.
     let desc_w = (col_w as usize).saturating_sub(key_w + 5).max(16);
 
@@ -3451,7 +3752,11 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
             // `surface_alt` — a cap the colour of its card is no cap at all.
             let cap_style = Style::default()
                 .bg(theme.overlay)
-                .fg(if is_current { theme.accent } else { theme.text_bright })
+                .fg(if is_current {
+                    theme.accent
+                } else {
+                    theme.text_bright
+                })
                 .bold();
             let base = Style::default().fg(theme.text);
             let hit = Style::default().fg(theme.accent).bold();
@@ -3524,7 +3829,12 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     let dialog_h = (content_h + 4).min(area.height.saturating_sub(2)).max(8);
     let x = area.x + area.width.saturating_sub(dialog_w) / 2;
     let y = area.y + area.height.saturating_sub(dialog_h) / 2;
-    let popup = Rect { x, y, width: dialog_w, height: dialog_h };
+    let popup = Rect {
+        x,
+        y,
+        width: dialog_w,
+        height: dialog_h,
+    };
 
     let inner_h = dialog_h.saturating_sub(4);
     let max_scroll = content_h.saturating_sub(inner_h);
@@ -3571,9 +3881,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(" ├", Style::default().fg(theme.accent)),
         ]))
         .title_alignment(ratatui::layout::Alignment::Center)
-        .title_bottom(
-            Line::from(Span::styled(footer, footer_style)).centered(),
-        )
+        .title_bottom(Line::from(Span::styled(footer, footer_style)).centered())
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.accent))
@@ -3671,7 +3979,9 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
     let op = state.current_op();
     let op_height = op.map(|op| {
         let wanted = op.lines.len() as u16 + 3; // header + borders
-        wanted.clamp(6, (inner.height / 2).max(6)).min(inner.height.saturating_sub(4))
+        wanted
+            .clamp(6, (inner.height / 2).max(6))
+            .min(inner.height.saturating_sub(4))
     });
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -3691,11 +4001,7 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
 
     // ── Summary line ───────────────────────────────────────────────────
     let staged = gv.staged_count();
-    let unstaged = gv
-        .status
-        .as_ref()
-        .map(|s| s.unstaged_count())
-        .unwrap_or(0);
+    let unstaged = gv.status.as_ref().map(|s| s.unstaged_count()).unwrap_or(0);
     let summary = if gv.status.is_none() {
         Line::from(Span::styled(
             "reading working tree…",
@@ -3804,7 +4110,10 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
             };
             Row::new(vec![
                 Cell::from(Span::styled(mark, mark_style)),
-                Cell::from(Span::styled(e.code(), Style::default().fg(theme.text_muted))),
+                Cell::from(Span::styled(
+                    e.code(),
+                    Style::default().fg(theme.text_muted),
+                )),
                 Cell::from(Span::styled(e.label(), label_style)),
                 Cell::from(Span::styled(e.path.clone(), path_style)),
             ])
@@ -3818,17 +4127,20 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(1),   // staged marker
-            Constraint::Length(2),   // XY code
-            Constraint::Length(10),  // label
-            Constraint::Fill(1),     // path
+            Constraint::Length(1),  // staged marker
+            Constraint::Length(2),  // XY code
+            Constraint::Length(10), // label
+            Constraint::Fill(1),    // path
         ],
     )
     .header(
         Row::new(vec![
             Cell::from(""),
             Cell::from(""),
-            Cell::from(Span::styled("Change", Style::default().fg(theme.text_muted))),
+            Cell::from(Span::styled(
+                "Change",
+                Style::default().fg(theme.text_muted),
+            )),
             Cell::from(Span::styled("File", Style::default().fg(theme.text_muted))),
         ])
         .height(1)
@@ -3846,15 +4158,9 @@ fn render_git_status(f: &mut Frame, area: Rect, state: &AppState) {
     let mut ts = TableState::default();
     ts.select(Some(gv.cursor));
     f.render_stateful_widget(table, chunks[1], &mut ts);
-    register_table_hits(
-        state,
-        chunks[1],
-        2,
-        1,
-        gv.entries().len(),
-        gv.cursor,
-        |r| Some(Hit::GitEntry(r)),
-    );
+    register_table_hits(state, chunks[1], 2, 1, gv.entries().len(), gv.cursor, |r| {
+        Some(Hit::GitEntry(r))
+    });
 }
 
 /// One dashboard row's note that this repo has a commit or push in it.
@@ -4031,6 +4337,17 @@ fn render_op_output(f: &mut Frame, area: Rect, op: &GitOp, state: &AppState) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// The phases where the bottom pane is a menu or a list to choose from.
+fn batch_choosing(phase: BatchPhase) -> bool {
+    matches!(
+        phase,
+        BatchPhase::Pick
+            | BatchPhase::ChooseWorkflow
+            | BatchPhase::AwaitInputs
+            | BatchPhase::Confirm
+    )
+}
+
 /// One commit message going out across several repos, one repo at a time.
 ///
 /// Separate from the per-repo Changes view on purpose: this is a queue you are
@@ -4046,21 +4363,23 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
     // The op pane only earns its space while there is something to show in it.
     let op = batch
         .current()
-        .filter(|_| batch.phase != BatchPhase::Compose)
+        .filter(|_| !batch_choosing(batch.phase) && batch.phase != BatchPhase::Compose)
         .and_then(|i| state.git_ops.get(&i.spec));
     // The queue never squeezes the bottom pane out: a hook you cannot read, or
     // a message box you have to type into blind because a dozen marked repos
     // filled the screen, are the two things this view exists to avoid.
-    let composing = batch.input.is_some() || batch.phase == BatchPhase::Pick;
+    let composing = batch.input.is_some() || batch_choosing(batch.phase);
     let lower = op.is_some() || composing;
     let act = batch.action;
     // Borders, a row of top padding, and four lines of prompt. Fixed, because a
     // four-line prompt stretched down forty rows is its own kind of clutter.
     // The menu is a line per action, plus its Esc line, borders and padding.
-    let box_h: u16 = if batch.phase == BatchPhase::Pick {
-        crate::tui::BATCH_MENU.len() as u16 + 4
-    } else {
-        7
+    let plan = batch.deploy.as_ref();
+    let box_h: u16 = match batch.phase {
+        BatchPhase::Pick => crate::tui::BATCH_MENU.len() as u16 + 4,
+        BatchPhase::ChooseWorkflow => plan.map_or(0, |p| p.choices.len()) as u16 + 4,
+        BatchPhase::Confirm => batch.items.len() as u16 + 6,
+        _ => 7,
     };
     let reserve = if composing { box_h } else { 3 };
     let room = if lower {
@@ -4099,12 +4418,29 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
     let (top, bottom) = (chunks[0], chunks[2]);
 
     let (title, border) = match batch.phase {
-        BatchPhase::Pick => (
-            format!(" {} marked repo{} ", batch.items.len(), plural(batch.items.len())),
+        BatchPhase::Pick | BatchPhase::ChooseWorkflow | BatchPhase::AwaitInputs => (
+            format!(
+                " {} marked repo{} ",
+                batch.items.len(),
+                plural(batch.items.len())
+            ),
             theme.accent,
         ),
+        BatchPhase::Confirm => (
+            format!(
+                " Deploy {} — check before it goes ",
+                plan.and_then(|p| p.chosen())
+                    .map_or("", |c| c.name.as_str())
+            ),
+            theme.warning,
+        ),
         BatchPhase::Compose => (
-            format!(" {} {} repo{} ", act.title(), batch.items.len(), plural(batch.items.len())),
+            format!(
+                " {} {} repo{} ",
+                act.title(),
+                batch.items.len(),
+                plural(batch.items.len())
+            ),
             theme.accent,
         ),
         BatchPhase::Paused => (
@@ -4146,7 +4482,11 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
             }
             (
                 format!(" Done · {} ", parts.join(" · ")),
-                if t.failed > 0 { theme.failure } else { theme.success },
+                if t.failed > 0 {
+                    theme.failure
+                } else {
+                    theme.success
+                },
             )
         }
         _ => (
@@ -4210,7 +4550,11 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
                     Style::default().fg(theme.warning).bold(),
                     format!(
                         "{}… {}s",
-                        if batch.phase == BatchPhase::Pushing { "pushing" } else { act.running() },
+                        if batch.phase == BatchPhase::Pushing {
+                            "pushing"
+                        } else {
+                            act.running()
+                        },
                         state.tick_count.saturating_sub(batch.started_tick) / 10,
                     ),
                     Style::default().fg(theme.text_bright),
@@ -4250,7 +4594,8 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
                     Style::default().fg(theme.failure),
                 ),
             };
-            let name_style = if running || (batch.phase == BatchPhase::Paused && i == batch.cursor) {
+            let name_style = if running || (batch.phase == BatchPhase::Paused && i == batch.cursor)
+            {
                 Style::default().fg(theme.text_bright).bold()
             } else {
                 Style::default().fg(theme.text)
@@ -4258,7 +4603,10 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
             Line::from(vec![
                 Span::styled(format!("{glyph}  "), gstyle),
                 Span::styled(format!("{:<24}", truncate(&item.spec, 24)), name_style),
-                Span::styled(truncate(&note, inner.width.saturating_sub(30) as usize), nstyle),
+                Span::styled(
+                    truncate(&note, inner.width.saturating_sub(30) as usize),
+                    nstyle,
+                ),
             ])
         })
         .collect();
@@ -4279,6 +4627,104 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
     }
     f.render_widget(Paragraph::new(lines), inner);
 
+    if batch.phase == BatchPhase::ChooseWorkflow
+        && let Some(plan) = plan
+    {
+        let blk = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.accent))
+            .padding(Padding::new(2, 2, 1, 0))
+            .title(Span::styled(
+                " Which workflow? ",
+                Style::default().fg(theme.accent).bold(),
+            ));
+        let bi = blk.inner(bottom);
+        f.render_widget(blk, bottom);
+        let n = batch.items.len();
+        let mut lines: Vec<Line> = plan
+            .choices
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let here = i == plan.cursor;
+                let name = if here {
+                    Style::default().fg(theme.text_bright).bold()
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                Line::from(vec![
+                    Span::styled(
+                        if here { "▶ " } else { "  " },
+                        Style::default().fg(theme.accent),
+                    ),
+                    Span::styled(format!("{:<28}", truncate(&c.name, 28)), name),
+                    Span::styled(
+                        format!("{}/{n} repos  ", c.repos.len()),
+                        Style::default().fg(theme.warning),
+                    ),
+                    Span::styled(c.file.clone(), dim),
+                ])
+            })
+            .collect();
+        lines.push(Line::from(Span::styled("↵ choose · Esc back", dim)));
+        f.render_widget(Paragraph::new(lines), bi);
+        return;
+    }
+
+    if batch.phase == BatchPhase::Confirm
+        && let Some(plan) = plan
+    {
+        let blk = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.warning))
+            .padding(Padding::new(2, 2, 1, 0))
+            .title(Span::styled(
+                format!(" {} ", plan.chosen().map_or("", |c| c.file.as_str())),
+                Style::default().fg(theme.warning).bold(),
+            ));
+        let bi = blk.inner(bottom);
+        f.render_widget(blk, bottom);
+        let mut lines: Vec<Line> = batch
+            .items
+            .iter()
+            .map(|i| match plan.targets.get(&i.spec) {
+                Some(Ok(t)) => Line::from(vec![
+                    Span::styled("▸ ", Style::default().fg(theme.warning)),
+                    Span::styled(
+                        format!("{:<24}", truncate(&i.spec, 24)),
+                        Style::default().fg(theme.text_bright).bold(),
+                    ),
+                    Span::styled(
+                        format!("@ {}", t.branch),
+                        Style::default().fg(theme.warning),
+                    ),
+                ]),
+                Some(Err(why)) => Line::from(Span::styled(
+                    format!("– {:<24}skipped: {why}", truncate(&i.spec, 24)),
+                    dim,
+                )),
+                None => Line::from(Span::styled(format!("– {}", i.spec), dim)),
+            })
+            .collect();
+        if !plan.inputs.is_empty() {
+            let mut kv: Vec<String> = plan
+                .inputs
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            kv.sort();
+            lines.push(Line::from(Span::styled(
+                format!("inputs: {}", kv.join(" · ")),
+                dim,
+            )));
+        }
+        lines.push(Line::from(Span::styled("↵ deploy · Esc cancel", dim)));
+        f.render_widget(Paragraph::new(lines), bi);
+        return;
+    }
+
     // Picking: the menu sits where the input box will open.
     if batch.phase == BatchPhase::Pick {
         let blk = Block::default()
@@ -4286,7 +4732,10 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.accent))
             .padding(Padding::new(2, 2, 1, 0))
-            .title(Span::styled(" What to do to them? ", Style::default().fg(theme.accent).bold()));
+            .title(Span::styled(
+                " What to do to them? ",
+                Style::default().fg(theme.accent).bold(),
+            ));
         let bi = blk.inner(bottom);
         f.render_widget(blk, bottom);
         let key = Style::default().fg(theme.accent).bold();
@@ -4294,7 +4743,10 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
         let mut lines: Vec<Line> = crate::tui::BATCH_MENU
             .iter()
             .map(|(k, _, what)| {
-                Line::from(vec![Span::styled(format!("{k}  "), key), Span::styled(*what, text)])
+                Line::from(vec![
+                    Span::styled(format!("{k}  "), key),
+                    Span::styled(*what, text),
+                ])
             })
             .collect();
         lines.push(Line::from(Span::styled("Esc cancel", dim)));
@@ -4339,8 +4791,12 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
             Line::raw(""),
         ];
         let note = match act {
-            BatchAction::OpenPr => Some("pushes each branch, then `gh pr create` — repos on main are skipped"),
-            BatchAction::Run => Some("`sh -c` in each repo, one at a time — a failure pauses the rest"),
+            BatchAction::OpenPr => {
+                Some("pushes each branch, then `gh pr create` — repos on main are skipped")
+            }
+            BatchAction::Run => {
+                Some("`sh -c` in each repo, one at a time — a failure pauses the rest")
+            }
             _ => None,
         };
         if let (Some(note), true) = (note, bi.height >= 4) {
@@ -4529,9 +4985,12 @@ pub fn diff_bands_revealing(state: &AppState) -> bool {
     matches!(state.view, View::GitDiff)
         && state.git_diff.as_ref().is_some_and(|dv| {
             dv.opened_tick.is_some()
-                && dv.band_seen.borrow().iter().flatten().any(|&t| {
-                    (state.tick_count.saturating_sub(t) as f64) < BAND_WIPE_TICKS
-                })
+                && dv
+                    .band_seen
+                    .borrow()
+                    .iter()
+                    .flatten()
+                    .any(|&t| (state.tick_count.saturating_sub(t) as f64) < BAND_WIPE_TICKS)
         })
 }
 
@@ -4550,19 +5009,19 @@ fn lang_icon(path: &str) -> &'static str {
     }
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
-        "rs" => "\u{e7a8}",                          // rust gear
-        "py" => "\u{e73c}",                          // python
-        "ts" | "tsx" => "\u{e628}",                  // typescript
-        "js" | "jsx" | "mjs" | "cjs" => "\u{e74e}",  // javascript
-        "go" => "\u{e627}",                          // gopher
+        "rs" => "\u{e7a8}",                         // rust gear
+        "py" => "\u{e73c}",                         // python
+        "ts" | "tsx" => "\u{e628}",                 // typescript
+        "js" | "jsx" | "mjs" | "cjs" => "\u{e74e}", // javascript
+        "go" => "\u{e627}",                         // gopher
         "java" => "\u{e738}",
         "c" | "h" => "\u{e61e}",
         "cpp" | "cc" | "cxx" | "hpp" => "\u{e61d}",
-        "rb" => "\u{e739}",                          // ruby
+        "rb" => "\u{e739}", // ruby
         "php" => "\u{e73d}",
         "lua" => "\u{e620}",
         "swift" => "\u{e755}",
-        "kt" | "kts" => "\u{e634}",                  // kotlin
+        "kt" | "kts" => "\u{e634}", // kotlin
         "html" | "htm" => "\u{e736}",
         "css" | "scss" | "sass" | "less" => "\u{e749}",
         "json" => "\u{e60b}",
@@ -4677,17 +5136,12 @@ fn diff_row_line(
 ) -> Line<'static> {
     let width = 2 * (gutter + 1) + DIFF_RULE.len() + left + right;
     match row {
-        DiffRow::File { path, add, del } => {
-            file_banner(path, *add, *del, width, wipe, icon, theme)
-        }
+        DiffRow::File { path, add, del } => file_banner(path, *add, *del, width, wipe, icon, theme),
         DiffRow::Section(label) => Line::from(Span::styled(
             truncate(&format!("── {label} "), width),
             Style::default().fg(theme.accent).bold(),
         )),
-        DiffRow::Meta(t) => Line::from(Span::styled(
-            truncate(t, width),
-            diff_line_style(t, theme),
-        )),
+        DiffRow::Meta(t) => Line::from(Span::styled(truncate(t, width), diff_line_style(t, theme))),
         DiffRow::Pair { old, new } => {
             // The gap opposite an added or removed line: a ground of its own,
             // because nothing was there — neither the file's ordinary ground
@@ -4838,8 +5292,11 @@ fn render_git_diff(f: &mut Frame, area: Rect, state: &AppState) {
         };
         dv.units.set(0);
         f.render_widget(
-            Paragraph::new(Span::styled(msg, Style::default().fg(theme.text_faint).italic()))
-                .block(styled_block(&title, theme)),
+            Paragraph::new(Span::styled(
+                msg,
+                Style::default().fg(theme.text_faint).italic(),
+            ))
+            .block(styled_block(&title, theme)),
             area,
         );
         return;
@@ -4861,7 +5318,11 @@ fn render_git_diff(f: &mut Frame, area: Rect, state: &AppState) {
     // A jump waiting on the layout — opening on a file, `n`/`p` — resolves
     // here, where which unit the offset counts is finally known.
     if let Some(fi) = dv.pending_jump.take() {
-        let starts = if split.is_some() { &dv.file_rows } else { &dv.file_lines };
+        let starts = if split.is_some() {
+            &dv.file_rows
+        } else {
+            &dv.file_lines
+        };
         if let Some(&target) = starts.get(fi) {
             dv.scroll.set(target.min(dv.max_scroll(viewport as usize)));
         }
@@ -4884,7 +5345,13 @@ fn render_git_diff(f: &mut Frame, area: Rect, state: &AppState) {
             .position(|f| f == path)
             .map_or(1.0, |fi| band_wipe_at(dv, fi, state.tick_count))
     };
-    let icon_for = |path: &str| if state.file_icons { lang_icon(path) } else { "" };
+    let icon_for = |path: &str| {
+        if state.file_icons {
+            lang_icon(path)
+        } else {
+            ""
+        }
+    };
     let lines: Vec<Line> = match split {
         Some((gutter, left, right)) => dv.rows[scroll..]
             .iter()
@@ -4937,18 +5404,30 @@ fn render_commit_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     else {
         return;
     };
-    let staged = state.git_view.as_ref().map(|g| g.staged_count()).unwrap_or(0);
+    let staged = state
+        .git_view
+        .as_ref()
+        .map(|g| g.staged_count())
+        .unwrap_or(0);
 
     let dialog_w = (area.width * 70 / 100).max(40).min(area.width);
     let dialog_h = 4u16.min(area.height);
     let x = area.x + area.width.saturating_sub(dialog_w) / 2;
     let y = area.y + area.height.saturating_sub(dialog_h) / 2;
-    let popup = Rect { x, y, width: dialog_w, height: dialog_h };
+    let popup = Rect {
+        x,
+        y,
+        width: dialog_w,
+        height: dialog_h,
+    };
 
     let accent = state.theme.accent;
     let block = Block::default()
         .title(Span::styled(
-            format!(" Commit {staged} staged file{} ", if staged == 1 { "" } else { "s" }),
+            format!(
+                " Commit {staged} staged file{} ",
+                if staged == 1 { "" } else { "s" }
+            ),
             Style::default().fg(accent).bold(),
         ))
         .title_alignment(ratatui::layout::Alignment::Center)
@@ -4989,7 +5468,12 @@ fn render_push_prompt(f: &mut Frame, area: Rect, state: &AppState) {
     let dialog_h = 6u16.min(area.height);
     let x = area.x + area.width.saturating_sub(dialog_w) / 2;
     let y = area.y + area.height.saturating_sub(dialog_h) / 2;
-    let popup = Rect { x, y, width: dialog_w, height: dialog_h };
+    let popup = Rect {
+        x,
+        y,
+        width: dialog_w,
+        height: dialog_h,
+    };
 
     let accent = theme.accent;
     let block = Block::default()
@@ -5019,7 +5503,10 @@ fn render_push_prompt(f: &mut Frame, area: Rect, state: &AppState) {
                 Style::default().bg(accent).fg(theme.surface).bold(),
             )
         } else {
-            Span::styled(format!("  {label}  "), Style::default().fg(theme.text_muted))
+            Span::styled(
+                format!("  {label}  "),
+                Style::default().fg(theme.text_muted),
+            )
         }
     };
 
@@ -5146,7 +5633,12 @@ fn render_finder_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     let dialog_h = (list_rows + 4).min(area.height);
     let x = area.x + area.width.saturating_sub(dialog_w) / 2;
     let y = area.y + area.height.saturating_sub(dialog_h) / 3;
-    let popup = Rect { x, y, width: dialog_w, height: dialog_h };
+    let popup = Rect {
+        x,
+        y,
+        width: dialog_w,
+        height: dialog_h,
+    };
 
     let accent = state.theme.accent;
     let label = match finder.kind {
@@ -5158,7 +5650,11 @@ fn render_finder_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     };
     let block = Block::default()
         .title(Span::styled(
-            format!(" {label}  ({}/{}) ", finder.matches.len(), finder.items.len()),
+            format!(
+                " {label}  ({}/{}) ",
+                finder.matches.len(),
+                finder.items.len()
+            ),
             Style::default().fg(accent).bold(),
         ))
         .title_alignment(ratatui::layout::Alignment::Center)
@@ -5170,7 +5666,10 @@ fn render_finder_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
             Span::styled("  ", Style::default().fg(accent)),
-            Span::styled(finder.query.as_str(), Style::default().fg(theme.text_bright)),
+            Span::styled(
+                finder.query.as_str(),
+                Style::default().fg(theme.text_bright),
+            ),
             Span::styled("█", Style::default().fg(accent)),
         ]),
         Line::from(Span::styled(
@@ -5202,8 +5701,14 @@ fn render_finder_overlay(f: &mut Frame, area: Rect, state: &AppState) {
             Style::default().fg(theme.text_muted)
         };
         let line = Line::from(vec![
-            Span::styled(if selected { "▶ " } else { "  " }, Style::default().fg(accent)),
-            Span::styled(truncate(label, inner.width.saturating_sub(3) as usize), style),
+            Span::styled(
+                if selected { "▶ " } else { "  " },
+                Style::default().fg(accent),
+            ),
+            Span::styled(
+                truncate(label, inner.width.saturating_sub(3) as usize),
+                style,
+            ),
         ]);
         lines.push(if selected {
             line.style(Style::default().bg(theme.select_bg))
@@ -5260,14 +5765,18 @@ fn live_strip_below(
 fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     let count = state.workflows.len();
-    let (wf_ok, wf_fail, wf_run) = state.workflows.iter().fold((0u32, 0u32, 0u32), |(o, f, r), w| {
-        match w.last_status.unwrap_or(Status::Unknown) {
-            Status::Success => (o + 1, f, r),
-            Status::Failure => (o, f + 1, r),
-            Status::Running => (o, f, r + 1),
-            _ => (o, f, r),
-        }
-    });
+    let (wf_ok, wf_fail, wf_run) =
+        state
+            .workflows
+            .iter()
+            .fold((0u32, 0u32, 0u32), |(o, f, r), w| {
+                match w.last_status.unwrap_or(Status::Unknown) {
+                    Status::Success => (o + 1, f, r),
+                    Status::Failure => (o, f + 1, r),
+                    Status::Running => (o, f, r + 1),
+                    _ => (o, f, r),
+                }
+            });
     let mut tallies = vec![
         Span::styled(format!("✓{wf_ok}"), Style::default().fg(theme.success)),
         Span::styled(format!("  ✗{wf_fail}"), Style::default().fg(theme.failure)),
@@ -5278,7 +5787,12 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
             Style::default().fg(theme.warning).bold(),
         ));
     }
-    let blk = panel(&format!("Workflows  {count}"), tallies, theme, theme.primary);
+    let blk = panel(
+        &format!("Workflows  {count}"),
+        tallies,
+        theme,
+        theme.primary,
+    );
     let inner = blk.inner(area);
     f.render_widget(blk, area);
 
@@ -5317,7 +5831,11 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
                 .map(|t| relative_styled(t.with_timezone(&Utc), theme))
                 .unwrap_or_else(|| ("—".into(), Style::default().fg(theme.unknown)));
             let trig = if w.triggerable { "t" } else { " " };
-            let pulse = state.workflow_pulse.get(&w.file_name).copied().unwrap_or_default();
+            let pulse = state
+                .workflow_pulse
+                .get(&w.file_name)
+                .copied()
+                .unwrap_or_default();
             let bg = pulsed_bg(
                 row_bg_for_status(status, theme),
                 pulse,
@@ -5327,7 +5845,10 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
             );
 
             let mut cells = vec![
-                Cell::from(Span::styled(animated_glyph(status, state.tick_count), style_for_status(status, &state.theme))),
+                Cell::from(Span::styled(
+                    animated_glyph(status, state.tick_count),
+                    style_for_status(status, &state.theme),
+                )),
                 Cell::from(Span::styled(
                     w.name.clone(),
                     if i == state.workflow_cursor {
@@ -5364,14 +5885,17 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
                 }
                 cells.push(Cell::from(Line::from(strip)));
             }
-            cells.push(Cell::from(Span::styled(trig, Style::default().fg(theme.accent))));
+            cells.push(Cell::from(Span::styled(
+                trig,
+                Style::default().fg(theme.accent),
+            )));
             Row::new(cells).style(row_dress(bg, i, i == state.workflow_cursor, theme))
         })
         .collect();
 
     let mut widths = vec![
-        Constraint::Length(1),       // status glyph
-        Constraint::Fill(1),         // workflow name — takes the slack
+        Constraint::Length(1), // status glyph
+        Constraint::Fill(1),   // workflow name — takes the slack
         // Given a floor rather than a share where there is room for one:
         // `deploy_to_stage.yml` cut to `deploy_to_stage.y` is the truncation
         // that reads as a bug. Where there isn't, the name outranks it — a
@@ -5381,8 +5905,8 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
         } else {
             Constraint::Fill(1)
         },
-        Constraint::Length(10),      // last run
-        Constraint::Length(1),       // trig
+        Constraint::Length(10), // last run
+        Constraint::Length(1),  // trig
     ];
     if show_recent {
         widths.insert(4, Constraint::Length(spark_w as u16 + 9));
@@ -5491,7 +6015,10 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
 
     if runs.is_empty() {
         f.render_widget(
-            Paragraph::new(Span::styled("loading…", Style::default().fg(theme.text_faint))),
+            Paragraph::new(Span::styled(
+                "loading…",
+                Style::default().fg(theme.text_faint),
+            )),
             inner,
         );
         return;
@@ -5518,17 +6045,24 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
     let window: Vec<&&Run> = runs.iter().take(max_bars).rev().collect();
     for (i, run) in window.into_iter().enumerate() {
         let bar_color = match run.status {
-            Status::Success                     => theme.success,
-            Status::Failure                     => theme.failure,
-            Status::Running                     => theme.warning,
+            Status::Success => theme.success,
+            Status::Failure => theme.failure,
+            Status::Running => theme.warning,
             Status::Cancelled | Status::Skipped => theme.unknown,
-            _                                   => theme.unknown,
+            _ => theme.unknown,
         };
         let x = bar_area.x + i as u16 * step;
-        if x + bar_w > bar_area.x + bar_area.width { break; }
+        if x + bar_w > bar_area.x + bar_area.width {
+            break;
+        }
         let h = (bar_area.height / 2).max(1);
         let y = bar_area.y + (bar_area.height - h) / 2;
-        let rect = Rect { x, y, width: bar_w, height: h };
+        let rect = Rect {
+            x,
+            y,
+            width: bar_w,
+            height: h,
+        };
         f.render_widget(Block::default().style(Style::default().bg(bar_color)), rect);
     }
 
@@ -5549,8 +6083,14 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
         .map(|r| {
             let (when_text, when_style) = relative_styled(r.updated_at, theme);
             Row::new(vec![
-                Cell::from(Span::styled(animated_glyph(r.status, state.tick_count), style_for_status(r.status, &state.theme))),
-                Cell::from(Span::styled(r.head_branch.clone(), Style::default().fg(theme.accent))),
+                Cell::from(Span::styled(
+                    animated_glyph(r.status, state.tick_count),
+                    style_for_status(r.status, &state.theme),
+                )),
+                Cell::from(Span::styled(
+                    r.head_branch.clone(),
+                    Style::default().fg(theme.accent),
+                )),
                 Cell::from(Span::styled(when_text, when_style)),
             ])
             .style(Style::default().bg(row_bg_for_status(r.status, theme)))
@@ -5558,15 +6098,20 @@ fn render_workflows_preview(f: &mut Frame, area: Rect, state: &AppState) {
         .collect();
 
     let widths = [
-        Constraint::Length(1),       // status glyph
-        Constraint::Fill(1),         // branch (fills remaining)
-        Constraint::Length(10),      // updated
+        Constraint::Length(1),  // status glyph
+        Constraint::Fill(1),    // branch (fills remaining)
+        Constraint::Length(10), // updated
     ];
 
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(2)
-        .row_highlight_style(Style::default().bg(sel_bg).fg(sel_fg).add_modifier(Modifier::BOLD))
+        .row_highlight_style(
+            Style::default()
+                .bg(sel_bg)
+                .fg(sel_fg)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
 
     let mut ts = TableState::default();
@@ -5593,14 +6138,16 @@ fn render_runs(f: &mut Frame, area: Rect, state: &AppState) {
 fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     let wf_label = state.workflow_for_runs.as_deref().unwrap_or("?");
-    let (ok, fail, running) = state.runs.iter().fold((0u32, 0u32, 0u32), |(o, f, r), x| {
-        match x.status {
-            Status::Success => (o + 1, f, r),
-            Status::Failure => (o, f + 1, r),
-            Status::Running => (o, f, r + 1),
-            _ => (o, f, r),
-        }
-    });
+    let (ok, fail, running) =
+        state
+            .runs
+            .iter()
+            .fold((0u32, 0u32, 0u32), |(o, f, r), x| match x.status {
+                Status::Success => (o + 1, f, r),
+                Status::Failure => (o, f + 1, r),
+                Status::Running => (o, f, r + 1),
+                _ => (o, f, r),
+            });
     let mut tallies = vec![
         Span::styled(format!("✓{ok}"), Style::default().fg(theme.success)),
         Span::styled(format!("  ✗{fail}"), Style::default().fg(theme.failure)),
@@ -5616,8 +6163,7 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
     } else {
         format!("Runs  {}", state.runs.len())
     };
-    let blk = panel(&name, tallies, theme, theme.primary)
-        .style(Style::default().bg(theme.overlay));
+    let blk = panel(&name, tallies, theme, theme.primary).style(Style::default().bg(theme.overlay));
     let inner = blk.inner(area);
     f.render_widget(blk, area);
 
@@ -5665,7 +6211,10 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
                 ])
             };
             let branch_cell = ratatui::text::Text::from(vec![
-                Line::from(Span::styled(r.head_branch.clone(), Style::default().fg(theme.accent))),
+                Line::from(Span::styled(
+                    r.head_branch.clone(),
+                    Style::default().fg(theme.accent),
+                )),
                 commit_line,
             ]);
             let pulse = state.run_pulse.get(&r.id).copied().unwrap_or_default();
@@ -5677,7 +6226,10 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
                 theme,
             );
             Row::new(vec![
-                Cell::from(Span::styled(animated_glyph(r.status, state.tick_count), style_for_status(r.status, &state.theme))),
+                Cell::from(Span::styled(
+                    animated_glyph(r.status, state.tick_count),
+                    style_for_status(r.status, &state.theme),
+                )),
                 Cell::from(branch_cell),
                 Cell::from(Line::from(Span::styled(when_text, when_style)).right_aligned()),
                 Cell::from(Line::from(Span::styled(dur_text, dur_style)).right_aligned()),
@@ -5690,10 +6242,10 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
         .collect();
 
     let widths = [
-        Constraint::Length(1),   // glyph
-        Constraint::Fill(1),     // branch + commit
-        Constraint::Length(10),  // updated
-        Constraint::Length(7),   // duration
+        Constraint::Length(1),  // glyph
+        Constraint::Fill(1),    // branch + commit
+        Constraint::Length(10), // updated
+        Constraint::Length(7),  // duration
     ];
 
     let table = Table::new(rows, widths)
@@ -5738,25 +6290,31 @@ fn render_runs_list(f: &mut Frame, area: Rect, state: &AppState) {
         let body = inner.height.saturating_sub(HEADER_LINES) as usize;
         // Two lines per run, so the sweep still crosses one screen line at a
         // time but the list only reaches half as far down it.
-        let drawn = HEADER_LINES as usize
-            + (state.runs.len().saturating_sub(ts.offset()) * 2).min(body);
+        let drawn =
+            HEADER_LINES as usize + (state.runs.len().saturating_sub(ts.offset()) * 2).min(body);
         sweep_in(f, inner, drawn, theme.overlay, |line| {
             list_reveal_at(state, line)
         });
     }
     // Runs rows are two lines tall (branch over commit message).
-    register_table_hits(state, inner, 2, 2, state.runs.len(), state.run_cursor, |r| {
-        Some(Hit::Run(r))
-    });
+    register_table_hits(
+        state,
+        inner,
+        2,
+        2,
+        state.runs.len(),
+        state.run_cursor,
+        |r| Some(Hit::Run(r)),
+    );
 }
 
 fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
     let selected = state.runs.get(state.run_cursor);
 
-    let title = selected.map(|r| {
-        format!("{} — {}", r.display_title, r.head_branch)
-    }).unwrap_or_else(|| "Preview".into());
+    let title = selected
+        .map(|r| format!("{} — {}", r.display_title, r.head_branch))
+        .unwrap_or_else(|| "Preview".into());
 
     let blk = styled_block(&title, &state.theme);
     let inner = blk.inner(area);
@@ -5773,7 +6331,10 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
 
     if !preview_ready {
         f.render_widget(
-            Paragraph::new(Span::styled("loading…", Style::default().fg(theme.text_faint))),
+            Paragraph::new(Span::styled(
+                "loading…",
+                Style::default().fg(theme.text_faint),
+            )),
             inner,
         );
         return;
@@ -5800,13 +6361,17 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
         let mut lines: Vec<Line> = Vec::new();
 
         if let Some(run) = selected
-            && !run.commit_msg.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled("󰊢 ", Style::default().fg(theme.text_muted)),
-                    Span::styled(run.commit_msg.clone(), Style::default().fg(theme.text).italic()),
-                ]));
-                lines.push(Line::default());
-            }
+            && !run.commit_msg.is_empty()
+        {
+            lines.push(Line::from(vec![
+                Span::styled("󰊢 ", Style::default().fg(theme.text_muted)),
+                Span::styled(
+                    run.commit_msg.clone(),
+                    Style::default().fg(theme.text).italic(),
+                ),
+            ]));
+            lines.push(Line::default());
+        }
 
         // Where the eye should land when there are more steps than room: the
         // step in flight, or failing that the one that broke. A pane that
@@ -5816,7 +6381,10 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
         let mut broken: Option<usize> = None;
         for job in &detail.jobs {
             lines.push(Line::from(vec![
-                Span::styled(animated_glyph(job.status, state.tick_count), style_for_status(job.status, &state.theme)),
+                Span::styled(
+                    animated_glyph(job.status, state.tick_count),
+                    style_for_status(job.status, &state.theme),
+                ),
                 Span::raw(" "),
                 Span::styled(job.name.clone(), Style::default().bold()),
             ]));
@@ -5829,7 +6397,10 @@ fn render_runs_preview(f: &mut Frame, area: Rect, state: &AppState) {
                 }
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(animated_glyph(step.status, state.tick_count), style_for_status(step.status, &state.theme)),
+                    Span::styled(
+                        animated_glyph(step.status, state.tick_count),
+                        style_for_status(step.status, &state.theme),
+                    ),
                     Span::raw(format!(" {}. {}", si + 1, step.name)),
                 ]));
             }
@@ -5976,7 +6547,13 @@ impl GraphCol {
         let open = self.boxes.iter().any(|b| b.open);
         let rows: Vec<GraphRow> = self.boxes.drain(..).flat_map(|b| b.rows).collect();
         let status = worst_status(rows.iter().map(|r| r.status));
-        self.boxes = vec![GraphBox { rows, feeds, status, hidden: 0, open }];
+        self.boxes = vec![GraphBox {
+            rows,
+            feeds,
+            status,
+            hidden: 0,
+            open,
+        }];
         self.trim_to(cap);
     }
 }
@@ -6011,15 +6588,22 @@ fn graph_plan(cols: &[GraphCol], width: usize) -> Option<GraphPlan> {
     if cols.is_empty() {
         return None;
     }
-    let rows = || cols.iter().flat_map(|c| c.boxes.iter()).flat_map(|b| b.rows.iter());
+    let rows = || {
+        cols.iter()
+            .flat_map(|c| c.boxes.iter())
+            .flat_map(|b| b.rows.iter())
+    };
     let name_max = rows().map(|r| disp_width(&r.name)).max().unwrap_or(8);
-    let meta_max = rows().map(|r| disp_width(&r.meta)).max().unwrap_or(0).min(14);
+    let meta_max = rows()
+        .map(|r| disp_width(&r.meta))
+        .max()
+        .unwrap_or(0)
+        .min(14);
     // 2 borders + 2 padding + the glyph and the space after it. The duration
     // brings a gap of its own when it is there at all.
     const CHROME: usize = 6;
-    let ideal = |name_w: usize, meta_w: usize| {
-        CHROME + name_w + if meta_w > 0 { 1 + meta_w } else { 0 }
-    };
+    let ideal =
+        |name_w: usize, meta_w: usize| CHROME + name_w + if meta_w > 0 { 1 + meta_w } else { 0 };
     // The widest box that still lets every column stand.
     let room = |n: usize| width.saturating_sub(n.saturating_sub(1) * GRAPH_ARROW) / n.max(1);
 
@@ -6044,7 +6628,12 @@ fn graph_plan(cols: &[GraphCol], width: usize) -> Option<GraphPlan> {
     };
     // Narrower than the narrowest box: nothing else to give but columns.
     if plan.box_w > have {
-        plan = GraphPlan { box_w: ideal(8, 0), name_w: 8, meta_w: 0, ..plan };
+        plan = GraphPlan {
+            box_w: ideal(8, 0),
+            name_w: 8,
+            meta_w: 0,
+            ..plan
+        };
     }
 
     let fits = |n: usize, w: usize| n * w + n.saturating_sub(1) * GRAPH_ARROW <= width;
@@ -6152,7 +6741,12 @@ fn graph_band(
     } else {
         "⇉ all at once".to_string()
     };
-    Some(GraphBand { cols, plan, note, height })
+    Some(GraphBand {
+        cols,
+        plan,
+        note,
+        height,
+    })
 }
 
 /// The dashboard's graph band: the stage chain of a run in flight — see
@@ -6211,7 +6805,10 @@ fn dash_graph_band(state: &AppState, area: Rect) -> Option<(Line<'static>, Graph
 fn graph_caption(run: &Run, tick: u64, theme: &Theme) -> Line<'static> {
     let (when, when_style) = relative_styled(run.updated_at, theme);
     Line::from(vec![
-        Span::styled(animated_glyph(run.status, tick), style_for_status(run.status, theme)),
+        Span::styled(
+            animated_glyph(run.status, tick),
+            style_for_status(run.status, theme),
+        ),
         Span::raw(" "),
         Span::styled(
             truncate(&run.display_title, 40),
@@ -6263,7 +6860,11 @@ fn workflow_graph_below(f: &mut Frame, area: Rect, state: &AppState) -> Rect {
     let Some(height) = area.height.checked_sub(2) else {
         return area;
     };
-    let room = Rect { height, width: area.width.saturating_sub(2), ..area };
+    let room = Rect {
+        height,
+        width: area.width.saturating_sub(2),
+        ..area
+    };
     let stages = state.stages_of(detail);
     let Some(band) = graph_band(state, detail, &stages, true, room) else {
         return area;
@@ -6280,7 +6881,11 @@ fn workflow_graph_below(f: &mut Frame, area: Rect, state: &AppState) -> Rect {
             Constraint::Length(1),
         ])
         .split(area);
-    let inset = |r: Rect| Rect { x: r.x + 1, width: r.width.saturating_sub(2), ..r };
+    let inset = |r: Rect| Rect {
+        x: r.x + 1,
+        width: r.width.saturating_sub(2),
+        ..r
+    };
     f.render_widget(
         Paragraph::new(graph_caption(&detail.run, state.tick_count, theme)),
         inset(chunks[1]),
@@ -6310,7 +6915,9 @@ struct GraphBand {
 /// and the column has already spent its rows on jobs.
 fn render_run_graph(f: &mut Frame, area: Rect, state: &AppState, band: &GraphBand) {
     let (theme, tick) = (&state.theme, state.tick_count);
-    let GraphBand { cols, plan, note, .. } = band;
+    let GraphBand {
+        cols, plan, note, ..
+    } = band;
     // Fitted together rather than one at a time, so two names that would cut
     // down to the same thing are cut differently instead.
     let names: Vec<&str> = cols
@@ -6330,7 +6937,12 @@ fn render_run_graph(f: &mut Frame, area: Rect, state: &AppState, band: &GraphBan
         let mut rects = Vec::new();
         for b in &col.boxes {
             let h = (b.drawn() + 2) as u16;
-            rects.push(Rect { x, y, width: plan.box_w as u16, height: h });
+            rects.push(Rect {
+                x,
+                y,
+                width: plan.box_w as u16,
+                height: h,
+            });
             y += h + GRAPH_GAP as u16;
         }
         placed.push(rects);
@@ -6340,7 +6952,15 @@ fn render_run_graph(f: &mut Frame, area: Rect, state: &AppState, band: &GraphBan
     let mut label = 0usize;
     for (ci, col) in cols.iter().enumerate() {
         for (bi, b) in col.boxes.iter().enumerate() {
-            draw_graph_box(f, placed[ci][bi], b, &labels[label..], plan.meta_w, tick, theme);
+            draw_graph_box(
+                f,
+                placed[ci][bi],
+                b,
+                &labels[label..],
+                plan.meta_w,
+                tick,
+                theme,
+            );
             register_graph_hits(state, placed[ci][bi], b);
             label += b.rows.len();
             // The arrow leaves this box only if something is waiting on it,
@@ -6356,11 +6976,15 @@ fn render_run_graph(f: &mut Frame, area: Rect, state: &AppState, band: &GraphBan
             // The edge the run is crossing right now marches; every other one
             // is a still rule. One moving thing at a time is what makes it
             // mean "here".
-            let crossing = cols[..=ci].iter().all(GraphCol::terminal)
-                && !cols[ci + 1].terminal();
+            let crossing = cols[..=ci].iter().all(GraphCol::terminal) && !cols[ci + 1].terminal();
             f.render_widget(
                 Paragraph::new(Line::from(graph_connector(crossing, tick, theme))),
-                Rect { x: rect.right(), y, width: GRAPH_ARROW as u16, height: 1 },
+                Rect {
+                    x: rect.right(),
+                    y,
+                    width: GRAPH_ARROW as u16,
+                    height: 1,
+                },
             );
         }
     }
@@ -6465,7 +7089,13 @@ fn graph_box(
         .nodes
         .iter()
         .any(|n| matches!(n, RunNode::Matrix { key, .. } if open(key)));
-    GraphBox { rows, feeds: g.feeds, status, hidden: 0, open: is_open }
+    GraphBox {
+        rows,
+        feeds: g.feeds,
+        status,
+        hidden: 0,
+        open: is_open,
+    }
 }
 
 /// What one node of the graph says: its verdict, its name, and its numbers.
@@ -6496,22 +7126,24 @@ fn graph_rows(
             status,
             toggle: Some(key.clone()),
         }];
-        rows.extend(jobs.iter().map(|j| GraphRow {
-            glyph: animated_glyph(j.status, tick).to_string(),
-            // The box above already says `build`; repeating it on every leg
-            // spends the width the part that differs needs.
-            name: format!(
-                "  {}",
-                j.name.strip_prefix(&format!("{key} ")).unwrap_or(&j.name)
-            ),
-            meta: j
-                .duration_secs()
-                .map(|s| format_step_dur(s as f64))
-                .unwrap_or_default(),
-            status: j.status,
-            // Every leg folds the box, so closing it does not mean hunting
-            // for the one line that opened it.
-            toggle: Some(key.clone()),
+        rows.extend(jobs.iter().map(|j| {
+            GraphRow {
+                glyph: animated_glyph(j.status, tick).to_string(),
+                // The box above already says `build`; repeating it on every leg
+                // spends the width the part that differs needs.
+                name: format!(
+                    "  {}",
+                    j.name.strip_prefix(&format!("{key} ")).unwrap_or(&j.name)
+                ),
+                meta: j
+                    .duration_secs()
+                    .map(|s| format_step_dur(s as f64))
+                    .unwrap_or_default(),
+                status: j.status,
+                // Every leg folds the box, so closing it does not mean hunting
+                // for the one line that opened it.
+                toggle: Some(key.clone()),
+            }
         }));
         return rows;
     }
@@ -6550,7 +7182,11 @@ fn graph_row(node: &RunNode, detail: &RunDetail, tick: u64) -> GraphRow {
             // reaching it. Saying so with a terminal status is what keeps the
             // chain from holding an arrow marching into a run that is over.
             let over = detail.run.status.is_terminal();
-            let status = if over { Status::Skipped } else { Status::Unknown };
+            let status = if over {
+                Status::Skipped
+            } else {
+                Status::Unknown
+            };
             GraphRow {
                 glyph: if over {
                     animated_glyph(status, tick).to_string()
@@ -6599,7 +7235,11 @@ fn graph_row(node: &RunNode, detail: &RunDetail, tick: u64) -> GraphRow {
 fn register_graph_hits(state: &AppState, area: Rect, b: &GraphBox) {
     // The "+N more" line stands for rows that are not on screen, so it is not
     // any one of them to click.
-    let real = if b.hidden > 0 { b.drawn() - 1 } else { b.drawn() };
+    let real = if b.hidden > 0 {
+        b.drawn() - 1
+    } else {
+        b.drawn()
+    };
     let mut hits = state.hits.borrow_mut();
     for (i, row) in b.rows.iter().take(real).enumerate() {
         let Some(key) = &row.toggle else { continue };
@@ -6608,7 +7248,12 @@ fn register_graph_hits(state: &AppState, area: Rect, b: &GraphBox) {
             break;
         }
         hits.push((
-            Rect { x: area.x + 1, y, width: area.width.saturating_sub(2), height: 1 },
+            Rect {
+                x: area.x + 1,
+                y,
+                width: area.width.saturating_sub(2),
+                height: 1,
+            },
             Hit::GraphNode(key.clone()),
         ));
     }
@@ -6653,7 +7298,11 @@ fn draw_graph_box(
     }
     let w = inner.width as usize;
     // A trimmed box spends its last row saying what it isn't showing.
-    let real = if b.hidden > 0 { b.drawn() - 1 } else { b.drawn() };
+    let real = if b.hidden > 0 {
+        b.drawn() - 1
+    } else {
+        b.drawn()
+    };
     let mut lines: Vec<Line> = b.rows[..real]
         .iter()
         .zip(labels)
@@ -6698,12 +7347,23 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
         .unwrap_or_default();
 
     // Max completed step duration per job — used to scale the ■ bars.
-    let max_secs_per_job: Vec<f64> = detail.jobs.iter().map(|job| {
-        job.steps.iter().filter_map(|s| {
-            let ms = (s.completed_at? - s.started_at?).num_milliseconds();
-            if ms > 0 { Some(ms as f64 / 1000.0) } else { None }
-        }).fold(0.0_f64, f64::max)
-    }).collect();
+    let max_secs_per_job: Vec<f64> = detail
+        .jobs
+        .iter()
+        .map(|job| {
+            job.steps
+                .iter()
+                .filter_map(|s| {
+                    let ms = (s.completed_at? - s.started_at?).num_milliseconds();
+                    if ms > 0 {
+                        Some(ms as f64 / 1000.0)
+                    } else {
+                        None
+                    }
+                })
+                .fold(0.0_f64, f64::max)
+        })
+        .collect();
 
     let items = state.detail_items();
     let cursor = state.detail_cursor;
@@ -6722,135 +7382,150 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
         v
     };
 
-    let rows: Vec<Row> = items.iter().enumerate().map(|(flat_idx, item)| {
-        let selected = flat_idx == cursor;
-        let row_style = if selected { Style::default().bg(sel_bg) } else { Style::default() };
-        match item {
-            DetailItem::Group(ni) => {
-                let RunNode::Matrix { key, legs } = &state.run_shape[*ni] else {
-                    return Row::new(vec![Cell::from("")]);
-                };
-                let open = state.group_is_open(key, legs);
-                let jobs: Vec<&Job> = legs.iter().map(|&i| &detail.jobs[i]).collect();
-                let status = worst_status(jobs.iter().map(|j| j.status));
-                let failed = jobs.iter().filter(|j| j.status.is_failure()).count();
-                let prefix = if selected { "▶ " } else { "  " };
-                let name_style = if selected {
-                    Style::default().bold().fg(theme.primary)
-                } else {
-                    Style::default().bold().fg(theme.text_bright)
-                };
-                let name_cell = Cell::from(Line::from(vec![
-                    Span::raw(prefix),
-                    Span::styled(
-                        animated_glyph(status, state.tick_count),
-                        style_for_status(status, &state.theme),
-                    ),
-                    Span::styled(
-                        if open { " ▾ " } else { " ▸ " },
-                        Style::default().fg(theme.text_muted),
-                    ),
-                    Span::styled(format!("Matrix: {key}"), name_style),
-                ]));
-                // The box's own clock is the wall time it took, not the sum of
-                // its legs — they ran side by side.
-                let dur_cell = match group_secs(&jobs) {
-                    Some(secs) => Cell::from(format!("{:>6}", format_step_dur(secs as f64)))
-                        .style(Style::default().fg(theme.text_ghost)),
-                    None => Cell::from(""),
-                };
-                let badge = if failed > 0 {
-                    Span::styled(
-                        format!("  {failed}/{} legs failed", legs.len()),
-                        Style::default().fg(theme.failure).bold(),
-                    )
-                } else {
-                    Span::styled(
-                        format!("  {} legs", legs.len()),
-                        Style::default().fg(theme.text_muted),
-                    )
-                };
-                Row::new(vec![
-                    name_cell,
-                    dur_cell,
-                    Cell::from(""),
-                    Cell::from(Line::from(badge)),
-                ])
-                .style(row_style)
-            }
-            DetailItem::Job(ji) => {
-                let job = &detail.jobs[*ji];
-                let prefix = if selected {
-                    format!("{}▶ ", indent[*ji])
-                } else {
-                    format!("{}  ", indent[*ji])
-                };
-                let name_style = if selected {
-                    Style::default().bold().fg(theme.primary)
-                } else {
-                    Style::default().bold()
-                };
-                let name_cell = Cell::from(Line::from(vec![
-                    Span::raw(prefix),
-                    Span::styled(animated_glyph(job.status, state.tick_count), style_for_status(job.status, &state.theme)),
-                    Span::raw(" "),
-                    Span::styled(job.name.clone(), name_style),
-                ]));
-                let dur_cell = match job.duration_secs() {
-                    Some(secs) => Cell::from(format!("{:>6}", format_step_dur(secs as f64)))
-                        .style(Style::default().fg(theme.text_ghost)),
-                    None => Cell::from(""),
-                };
-                Row::new(vec![name_cell, dur_cell, Cell::from(""), Cell::from("")])
-                    .style(row_style)
-            }
-            DetailItem::Step { job: ji, step: si } => {
-                let step = &detail.jobs[*ji].steps[*si];
-                let prefix = if selected {
-                    format!("{}  ▶ ", indent[*ji])
-                } else {
-                    format!("{}    ", indent[*ji])
-                };
-                let name_style = if selected {
-                    Style::default().fg(theme.text_bright).bold()
-                } else {
-                    Style::default().fg(theme.text_muted)
-                };
-                let name_cell = Cell::from(Line::from(vec![
-                    Span::raw(prefix),
-                    Span::styled(animated_glyph(step.status, state.tick_count), style_for_status(step.status, &state.theme)),
-                    Span::raw(format!(" {:2}. ", si + 1)),
-                    Span::styled(step.name.clone(), name_style),
-                ]));
-                let (dur_cell, bar_cell) = if let Some((dur, bar)) =
-                    step_timing(step, max_secs_per_job[*ji], state.tick_count)
-                {
-                    let bar_color = style_for_status(step.status, &state.theme)
-                        .fg.unwrap_or(theme.text_faint);
-                    (
-                        Cell::from(format!("{dur:>6}")).style(Style::default().fg(theme.text_ghost)),
-                        Cell::from(bar).style(Style::default().fg(bar_color)),
-                    )
-                } else {
-                    (Cell::from(""), Cell::from(""))
-                };
-                let badge_cell = if let Some((failed, total)) = stats.get(&step.name).copied()
-                    && failed > 0
-                {
-                    let s = if failed * 2 >= total {
-                        Style::default().fg(theme.failure).bold()
-                    } else {
-                        Style::default().fg(theme.accent)
+    let rows: Vec<Row> = items
+        .iter()
+        .enumerate()
+        .map(|(flat_idx, item)| {
+            let selected = flat_idx == cursor;
+            let row_style = if selected {
+                Style::default().bg(sel_bg)
+            } else {
+                Style::default()
+            };
+            match item {
+                DetailItem::Group(ni) => {
+                    let RunNode::Matrix { key, legs } = &state.run_shape[*ni] else {
+                        return Row::new(vec![Cell::from("")]);
                     };
-                    Cell::from(format!("  {failed}/{total} fails")).style(s)
-                } else {
-                    Cell::from("")
-                };
-                Row::new(vec![name_cell, dur_cell, bar_cell, badge_cell])
+                    let open = state.group_is_open(key, legs);
+                    let jobs: Vec<&Job> = legs.iter().map(|&i| &detail.jobs[i]).collect();
+                    let status = worst_status(jobs.iter().map(|j| j.status));
+                    let failed = jobs.iter().filter(|j| j.status.is_failure()).count();
+                    let prefix = if selected { "▶ " } else { "  " };
+                    let name_style = if selected {
+                        Style::default().bold().fg(theme.primary)
+                    } else {
+                        Style::default().bold().fg(theme.text_bright)
+                    };
+                    let name_cell = Cell::from(Line::from(vec![
+                        Span::raw(prefix),
+                        Span::styled(
+                            animated_glyph(status, state.tick_count),
+                            style_for_status(status, &state.theme),
+                        ),
+                        Span::styled(
+                            if open { " ▾ " } else { " ▸ " },
+                            Style::default().fg(theme.text_muted),
+                        ),
+                        Span::styled(format!("Matrix: {key}"), name_style),
+                    ]));
+                    // The box's own clock is the wall time it took, not the sum of
+                    // its legs — they ran side by side.
+                    let dur_cell = match group_secs(&jobs) {
+                        Some(secs) => Cell::from(format!("{:>6}", format_step_dur(secs as f64)))
+                            .style(Style::default().fg(theme.text_ghost)),
+                        None => Cell::from(""),
+                    };
+                    let badge = if failed > 0 {
+                        Span::styled(
+                            format!("  {failed}/{} legs failed", legs.len()),
+                            Style::default().fg(theme.failure).bold(),
+                        )
+                    } else {
+                        Span::styled(
+                            format!("  {} legs", legs.len()),
+                            Style::default().fg(theme.text_muted),
+                        )
+                    };
+                    Row::new(vec![
+                        name_cell,
+                        dur_cell,
+                        Cell::from(""),
+                        Cell::from(Line::from(badge)),
+                    ])
                     .style(row_style)
+                }
+                DetailItem::Job(ji) => {
+                    let job = &detail.jobs[*ji];
+                    let prefix = if selected {
+                        format!("{}▶ ", indent[*ji])
+                    } else {
+                        format!("{}  ", indent[*ji])
+                    };
+                    let name_style = if selected {
+                        Style::default().bold().fg(theme.primary)
+                    } else {
+                        Style::default().bold()
+                    };
+                    let name_cell = Cell::from(Line::from(vec![
+                        Span::raw(prefix),
+                        Span::styled(
+                            animated_glyph(job.status, state.tick_count),
+                            style_for_status(job.status, &state.theme),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(job.name.clone(), name_style),
+                    ]));
+                    let dur_cell = match job.duration_secs() {
+                        Some(secs) => Cell::from(format!("{:>6}", format_step_dur(secs as f64)))
+                            .style(Style::default().fg(theme.text_ghost)),
+                        None => Cell::from(""),
+                    };
+                    Row::new(vec![name_cell, dur_cell, Cell::from(""), Cell::from("")])
+                        .style(row_style)
+                }
+                DetailItem::Step { job: ji, step: si } => {
+                    let step = &detail.jobs[*ji].steps[*si];
+                    let prefix = if selected {
+                        format!("{}  ▶ ", indent[*ji])
+                    } else {
+                        format!("{}    ", indent[*ji])
+                    };
+                    let name_style = if selected {
+                        Style::default().fg(theme.text_bright).bold()
+                    } else {
+                        Style::default().fg(theme.text_muted)
+                    };
+                    let name_cell = Cell::from(Line::from(vec![
+                        Span::raw(prefix),
+                        Span::styled(
+                            animated_glyph(step.status, state.tick_count),
+                            style_for_status(step.status, &state.theme),
+                        ),
+                        Span::raw(format!(" {:2}. ", si + 1)),
+                        Span::styled(step.name.clone(), name_style),
+                    ]));
+                    let (dur_cell, bar_cell) = if let Some((dur, bar)) =
+                        step_timing(step, max_secs_per_job[*ji], state.tick_count)
+                    {
+                        let bar_color = style_for_status(step.status, &state.theme)
+                            .fg
+                            .unwrap_or(theme.text_faint);
+                        (
+                            Cell::from(format!("{dur:>6}"))
+                                .style(Style::default().fg(theme.text_ghost)),
+                            Cell::from(bar).style(Style::default().fg(bar_color)),
+                        )
+                    } else {
+                        (Cell::from(""), Cell::from(""))
+                    };
+                    let badge_cell = if let Some((failed, total)) = stats.get(&step.name).copied()
+                        && failed > 0
+                    {
+                        let s = if failed * 2 >= total {
+                            Style::default().fg(theme.failure).bold()
+                        } else {
+                            Style::default().fg(theme.accent)
+                        };
+                        Cell::from(format!("  {failed}/{total} fails")).style(s)
+                    } else {
+                        Cell::from("")
+                    };
+                    Row::new(vec![name_cell, dur_cell, bar_cell, badge_cell]).style(row_style)
+                }
             }
-        }
-    }).collect();
+        })
+        .collect();
 
     let title = format!(
         "Run {} — {} ({})",
@@ -6889,7 +7564,10 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
         detail,
         stages,
         known,
-        Rect { height: inner.height.saturating_sub(2 + digest_h), ..inner },
+        Rect {
+            height: inner.height.saturating_sub(2 + digest_h),
+            ..inner
+        },
     );
     let graph_h = band.as_ref().map(|b| b.height).unwrap_or(0);
     let inner_chunks = Layout::default()
@@ -6942,7 +7620,11 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
     let skipped = tally(Status::Skipped);
     let cancelled = tally(Status::Cancelled);
     let passed = tally(Status::Success);
-    let live = detail.jobs.iter().filter(|j| !j.status.is_terminal()).count();
+    let live = detail
+        .jobs
+        .iter()
+        .filter(|j| !j.status.is_terminal())
+        .count();
     let dur = format_elapsed(elapsed_seconds(&detail.run));
     let theme = &state.theme;
     let mut summary = vec![Span::styled(
@@ -7007,15 +7689,18 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
         );
     }
 
-    let table = Table::new(rows, [
-        // The name column takes whatever the fixed ones leave — job names
-        // carry a matrix leg or a called workflow in them and were being cut
-        // in half by a badge column that is mostly empty.
-        Constraint::Min(20),     // name
-        Constraint::Length(6),   // duration (right-aligned inside cell)
-        Constraint::Length(10),  // ■ bar
-        Constraint::Length(18),  // historical badge
-    ])
+    let table = Table::new(
+        rows,
+        [
+            // The name column takes whatever the fixed ones leave — job names
+            // carry a matrix leg or a called workflow in them and were being cut
+            // in half by a badge column that is mostly empty.
+            Constraint::Min(20),    // name
+            Constraint::Length(6),  // duration (right-aligned inside cell)
+            Constraint::Length(10), // ■ bar
+            Constraint::Length(18), // historical badge
+        ],
+    )
     .column_spacing(1)
     // The row under the cursor is dressed by hand — see `render_repos` — so
     // the table's own highlight must not paint over it.
@@ -7035,15 +7720,25 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
     // Inner area = area minus the rounded border (1 row/col on each side).
     let viewport = area.height.saturating_sub(2);
     state.last_logs_viewport_height.set(viewport);
-    state.last_logs_viewport_width.set(area.width.saturating_sub(2));
+    state
+        .last_logs_viewport_width
+        .set(area.width.saturating_sub(2));
 
     let mut log_title = if state.log_section_idx.is_some() {
         if let Some(step_idx) = state.current_step_idx() {
-            let name = state.log_step_names.get(step_idx).map(|s| s.as_str()).unwrap_or("?");
+            let name = state
+                .log_step_names
+                .get(step_idx)
+                .map(|s| s.as_str())
+                .unwrap_or("?");
             let total = state.log_step_names.len();
             format!("Logs — {name}  [{}/{}]", step_idx + 1, total)
         } else if let Some(idx) = state.log_section_idx {
-            let name = state.log_sections.get(idx).map(|s| s.as_str()).unwrap_or("?");
+            let name = state
+                .log_sections
+                .get(idx)
+                .map(|s| s.as_str())
+                .unwrap_or("?");
             let total = state.log_sections.len();
             format!("Logs — {name}  [{}/{}]", idx + 1, total)
         } else {
@@ -7106,7 +7801,9 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
     // corruption rather than as a second thing on the screen.
     let mapped = minimap_fits(area, state.log_rendered.len(), viewport as usize);
     if mapped {
-        state.last_logs_viewport_width.set(area.width.saturating_sub(4));
+        state
+            .last_logs_viewport_width
+            .set(area.width.saturating_sub(4));
     }
     let mut blk = styled_block(&log_title, &state.theme);
     if mapped {
@@ -7134,13 +7831,7 @@ fn minimap_fits(area: Rect, total: usize, viewport: usize) -> bool {
 /// question a log actually gets asked — *where are the bad parts, and am I near
 /// one* — by marking every error and warning at its position in the whole file,
 /// with a bracket showing what is currently on screen.
-fn render_log_minimap(
-    f: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    first: usize,
-    viewport: usize,
-) {
+fn render_log_minimap(f: &mut Frame, area: Rect, state: &AppState, first: usize, viewport: usize) {
     let theme = &state.theme;
     let total = state.log_rendered.len();
     let rows = area.height.saturating_sub(2) as usize;
@@ -7159,9 +7850,8 @@ fn render_log_minimap(
     };
     // `log_*_lines` index the raw log; the map is over rendered rows, which
     // folding can make fewer. `log_rendered_src` maps one to the other.
-    let rendered_row = |raw: usize| -> Option<usize> {
-        state.log_rendered_src.iter().position(|s| *s == raw)
-    };
+    let rendered_row =
+        |raw: usize| -> Option<usize> { state.log_rendered_src.iter().position(|s| *s == raw) };
     for l in &state.log_warn_lines {
         if let Some(r) = rendered_row(*l) {
             mark(r, 1);
@@ -7191,20 +7881,32 @@ fn render_log_minimap(
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(ch, style))),
-            Rect { x, y: area.y + 1 + i as u16, width: 1, height: 1 },
+            Rect {
+                x,
+                y: area.y + 1 + i as u16,
+                width: 1,
+                height: 1,
+            },
         );
     }
 }
 
 fn render_search_overlay(f: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
-    let Some(buf) = &state.log_search_input else { return };
+    let Some(buf) = &state.log_search_input else {
+        return;
+    };
 
     let dialog_w = (area.width * 60 / 100).max(40).min(area.width);
     let dialog_h = 3u16;
     let x = area.x + area.width.saturating_sub(dialog_w) / 2;
     let y = area.y + area.height.saturating_sub(dialog_h) / 2;
-    let popup_area = Rect { x, y, width: dialog_w, height: dialog_h };
+    let popup_area = Rect {
+        x,
+        y,
+        width: dialog_w,
+        height: dialog_h,
+    };
 
     let accent = state.theme.accent;
     let block = Block::default()
@@ -7268,7 +7970,10 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
             d,
             stages,
             known,
-            Rect { height: area.height.saturating_sub(7 + tail_h), ..area },
+            Rect {
+                height: area.height.saturating_sub(7 + tail_h),
+                ..area
+            },
         )
     });
     let graph_h = band.as_ref().map(|b| b.height).unwrap_or(0);
@@ -7303,12 +8008,7 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
                     .rev()
                     .take(viewport)
                     .rev()
-                    .map(|l| {
-                        Line::from(ansi_line_to_spans(
-                            l,
-                            Style::default().fg(theme.text),
-                        ))
-                    })
+                    .map(|l| Line::from(ansi_line_to_spans(l, Style::default().fg(theme.text))))
                     .collect();
                 (
                     format!("Live log — {}  ({} lines)", t.job_name, t.lines.len()),
@@ -7409,10 +8109,7 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
         // the ones nobody opened this view to read — the ones that passed,
         // from the top — and only start on the rest once they've all gone.
         let avail = chunks[2].height as usize;
-        let mut open: Vec<bool> = nodes
-            .iter()
-            .map(|n| matches!(n, RunNode::Job(_)))
-            .collect();
+        let mut open: Vec<bool> = nodes.iter().map(|n| matches!(n, RunNode::Job(_))).collect();
         let used = |open: &[bool]| -> usize {
             nodes
                 .iter()
@@ -7452,16 +8149,20 @@ fn render_watch(f: &mut Frame, area: Rect, state: &AppState) {
         // Drawn full height into a buffer of its own, then the window that
         // fits is copied across. Laying the blocks out inside the visible area
         // and clipping would be the same code with every height wrong.
-        let tall = Rect { height: total as u16, ..chunks[2] };
+        let tall = Rect {
+            height: total as u16,
+            ..chunks[2]
+        };
         let mut scratch = ratatui::buffer::Buffer::empty(tall);
         draw_watch_blocks(&mut scratch, tall, nodes, &open, detail, state);
         let buf = f.buffer_mut();
         for row in 0..chunks[2].height {
             let from = tall.y + scroll + row;
             for x in chunks[2].x..chunks[2].right() {
-                if let (Some(src), Some(dst)) =
-                    (scratch.cell((x, from)).cloned(), buf.cell_mut((x, chunks[2].y + row)))
-                {
+                if let (Some(src), Some(dst)) = (
+                    scratch.cell((x, from)).cloned(),
+                    buf.cell_mut((x, chunks[2].y + row)),
+                ) {
                     *dst = src;
                 }
             }
@@ -7553,7 +8254,10 @@ fn draw_watch_job(
     let mut label = vec![
         Span::styled(animated_glyph(job.status, state.tick_count), g_style),
         Span::raw(" "),
-        Span::styled(job.name.clone(), Style::default().fg(theme.text_bright).bold()),
+        Span::styled(
+            job.name.clone(),
+            Style::default().fg(theme.text_bright).bold(),
+        ),
         Span::styled(
             format!("  {}/{}", done as u32, total as u32),
             Style::default().fg(theme.text_muted),
@@ -7588,7 +8292,10 @@ fn draw_watch_job(
             Line::from(vec![
                 Span::raw("  "),
                 Span::styled(animated_glyph(step.status, state.tick_count), glyph_style),
-                Span::styled(format!(" {}. ", si + 1), Style::default().fg(theme.text_ghost)),
+                Span::styled(
+                    format!(" {}. ", si + 1),
+                    Style::default().fg(theme.text_ghost),
+                ),
                 Span::styled(step.name.clone(), name_style),
             ])
         })
@@ -7689,7 +8396,10 @@ fn draw_watch_matrix(
             lines.push(Line::from(vec![
                 Span::raw("    "),
                 Span::styled(animated_glyph(step.status, state.tick_count), glyph_style),
-                Span::styled(format!(" {}. ", si + 1), Style::default().fg(theme.text_ghost)),
+                Span::styled(
+                    format!(" {}. ", si + 1),
+                    Style::default().fg(theme.text_ghost),
+                ),
                 Span::styled(truncate(&step.name, w.saturating_sub(10)), name_style),
             ]));
         }
@@ -7736,7 +8446,9 @@ fn render_diff(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     };
     let Some(wf) = state.workflow_for_runs.as_deref() else {
-        let p = Paragraph::new("(no workflow context — diff needs to be opened from a workflow's run list)");
+        let p = Paragraph::new(
+            "(no workflow context — diff needs to be opened from a workflow's run list)",
+        );
         f.render_widget(p, inner);
         return;
     };
@@ -7814,7 +8526,10 @@ fn render_diff(f: &mut Frame, area: Rect, state: &AppState) {
         }
         if !job_lines.is_empty() {
             lines.push(Line::from(vec![
-                Span::styled(animated_glyph(job.status, state.tick_count), style_for_status(job.status, &state.theme)),
+                Span::styled(
+                    animated_glyph(job.status, state.tick_count),
+                    style_for_status(job.status, &state.theme),
+                ),
                 Span::raw(" "),
                 Span::styled(job.name.clone(), Style::default().bold()),
             ]));
@@ -7902,12 +8617,11 @@ fn style_for_status(s: Status, theme: &Theme) -> Style {
 
 fn row_bg_for_status(s: Status, theme: &Theme) -> Color {
     match s {
-        Status::Failure            => theme.row_failure,
-        Status::Running            => theme.row_running,
-        Status::Queued             => theme.row_queued,
-        Status::Cancelled
-        | Status::Skipped          => theme.row_idle,
-        _                          => theme.surface,
+        Status::Failure => theme.row_failure,
+        Status::Running => theme.row_running,
+        Status::Queued => theme.row_queued,
+        Status::Cancelled | Status::Skipped => theme.row_idle,
+        _ => theme.surface,
     }
 }
 
@@ -7976,7 +8690,10 @@ fn render_trigger_prompt(f: &mut Frame, area: Rect, state: &AppState) {
         };
         let mut spans = vec![
             Span::raw(prefix),
-            Span::styled(format!("{:<width$}", field.name, width = name_width), label_style),
+            Span::styled(
+                format!("{:<width$}", field.name, width = name_width),
+                label_style,
+            ),
             Span::raw("  "),
             Span::styled(value_display, value_style),
             Span::styled(editing_marker, Style::default().fg(theme.accent)),
@@ -8018,8 +8735,14 @@ fn render_trigger_prompt(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(" cancel", Style::default().fg(theme.text_faint)),
     ];
     if has_options {
-        hint_spans.push(Span::styled("  Space", Style::default().fg(theme.text_bright).bold()));
-        hint_spans.push(Span::styled(" cycle", Style::default().fg(theme.text_faint)));
+        hint_spans.push(Span::styled(
+            "  Space",
+            Style::default().fg(theme.text_bright).bold(),
+        ));
+        hint_spans.push(Span::styled(
+            " cycle",
+            Style::default().fg(theme.text_faint),
+        ));
     }
     lines.push(Line::from(hint_spans));
     // A workflow with more inputs than the modal is tall used to hide the rest
@@ -8037,11 +8760,7 @@ fn render_trigger_prompt(f: &mut Frame, area: Rect, state: &AppState) {
     let rows_of = |l: &Line| l.width().div_ceil(text_w).max(1);
     let viewport = modal.height.saturating_sub(2);
     // Field `i` is line `i`: nothing is pushed before the loop above.
-    let through_cursor: usize = lines
-        .iter()
-        .take(prompt.cursor + 1)
-        .map(&rows_of)
-        .sum();
+    let through_cursor: usize = lines.iter().take(prompt.cursor + 1).map(&rows_of).sum();
     let total_rows: usize = lines.iter().map(&rows_of).sum();
     let scroll = (through_cursor as u16)
         .saturating_sub(viewport)
@@ -8112,7 +8831,11 @@ fn format_step_dur(secs: f64) -> String {
     } else {
         let m = (secs / 60.0) as u64;
         let s = (secs % 60.0) as u64;
-        if s == 0 { format!("{m}m") } else { format!("{m}m {s}s") }
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m {s}s")
+        }
     }
 }
 
@@ -8144,18 +8867,19 @@ fn group_secs(legs: &[&Job]) -> Option<i64> {
     Some((end - start).num_seconds().max(0))
 }
 
-fn step_timing(
-    step: &crate::provider::Step,
-    max_secs: f64,
-    tick: u64,
-) -> Option<(String, String)> {
+fn step_timing(step: &crate::provider::Step, max_secs: f64, tick: u64) -> Option<(String, String)> {
     use crate::provider::Status;
     let start = step.started_at?;
     let (secs, running) = if let Some(end) = step.completed_at {
-        ((end - start).num_milliseconds().max(0) as f64 / 1000.0, false)
+        (
+            (end - start).num_milliseconds().max(0) as f64 / 1000.0,
+            false,
+        )
     } else {
-        ((Utc::now() - start).num_milliseconds().max(0) as f64 / 1000.0,
-         step.status == Status::Running)
+        (
+            (Utc::now() - start).num_milliseconds().max(0) as f64 / 1000.0,
+            step.status == Status::Running,
+        )
     };
     let dur = format_step_dur(secs);
     let bar = if running {
@@ -8203,8 +8927,7 @@ mod tests {
     /// so the assertions below are about what a user actually sees rather than
     /// about the state that feeds it.
     fn draw_logs(state: &AppState, w: u16, h: u16) -> String {
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         term.draw(|f| render_logs(f, f.area(), state)).unwrap();
         let buf = term.backend().buffer().clone();
         (0..buf.area.height)
@@ -8250,7 +8973,10 @@ mod tests {
         assert_eq!(help_reveal_at(&st, 0), 0.0, "nothing has arrived yet");
         st.tick_count = 103;
         assert_eq!(help_reveal_at(&st, 0), 1.0, "the first row has landed");
-        assert!(help_reveal_at(&st, 20) < 1.0, "later rows are still arriving");
+        assert!(
+            help_reveal_at(&st, 20) < 1.0,
+            "later rows are still arriving"
+        );
         st.tick_count = 100 + HELP_REVEAL_HORIZON;
         assert!(!help_revealing(&st), "the entrance ends");
         // Without an opening tick (a redraw, a test), the card is simply
@@ -8262,15 +8988,17 @@ mod tests {
     fn diff_state(text: &str) -> AppState {
         let mut st = noisy_log_state(false);
         let mut dv = crate::app::state::GitDiffView::new("acme/api".into(), "src/api.rs".into());
-        dv.set_sections(vec![crate::git::DiffSection { label: "unstaged", text: text.into() }]);
+        dv.set_sections(vec![crate::git::DiffSection {
+            label: "unstaged",
+            text: text.into(),
+        }]);
         st.git_diff = Some(dv);
         st.view = View::GitDiff;
         st
     }
 
     fn draw_diff(st: &AppState, w: u16, h: u16) -> String {
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         term.draw(|f| render_git_diff(f, f.area(), st)).unwrap();
         let buf = term.backend().buffer().clone();
         (0..buf.area.height)
@@ -8318,7 +9046,10 @@ mod tests {
         assert_eq!(before.trim(), "", "the gap opposite an addition was filled");
 
         // Context is carried by both sides, so the eye never loses the file.
-        assert!(out.lines().any(|l| l.matches("Ok(())").count() == 2), "{out}");
+        assert!(
+            out.lines().any(|l| l.matches("Ok(())").count() == 2),
+            "{out}"
+        );
     }
 
     #[test]
@@ -8326,8 +9057,7 @@ mod tests {
         // Its own hunk: emphasis is only claimed for runs that pair up one for
         // one, and the shared one adds a line as well as changing one.
         let st = diff_state("@@ -13 +13 @@\n-    let x = 1;\n+    let x = 2;\n");
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
         term.draw(|f| render_git_diff(f, f.area(), &st)).unwrap();
         let buf = term.backend().buffer().clone();
         let cells = || (0..buf.area.height).flat_map(|y| (0..buf.area.width).map(move |x| (x, y)));
@@ -8348,7 +9078,10 @@ mod tests {
             .map(|x| (x, row))
             .filter(|&p| buf[p].modifier.contains(Modifier::BOLD))
             .collect();
-        let text: String = marked.iter().map(|&p| buf[p].symbol().to_string()).collect();
+        let text: String = marked
+            .iter()
+            .map(|&p| buf[p].symbol().to_string())
+            .collect();
         assert_eq!(text, "12", "got {text:?}");
 
         // Two tones of one hue, not an inversion: the span's ground is deeper
@@ -8357,8 +9090,16 @@ mod tests {
         // darkest on the row.
         let (mx, my) = marked[0];
         let row_bg = buf[(mx - 1, my)].bg;
-        assert_ne!(buf[(mx, my)].bg, row_bg, "the span sits on the line's own ground");
-        assert_ne!(buf[(mx, my)].fg, buf[(mx - 1, my)].fg, "the span's text was not lifted");
+        assert_ne!(
+            buf[(mx, my)].bg,
+            row_bg,
+            "the span sits on the line's own ground"
+        );
+        assert_ne!(
+            buf[(mx, my)].fg,
+            buf[(mx - 1, my)].fg,
+            "the span's text was not lifted"
+        );
         assert!(
             !cells().any(|p| buf[p].modifier.contains(Modifier::REVERSED)),
             "reverse video is for the unified fallback, which has no tint to deepen"
@@ -8385,7 +9126,10 @@ mod tests {
         assert!(band.contains("src/api.rs  +2 −1"), "got {band:?}");
         // …so the title counts files instead of repeating the name above it.
         assert!(out.starts_with("╭─┤ 1 file  +2 −1 ├"), "got:\n{out}");
-        assert!(!out.lines().next().unwrap().contains("api.rs"), "got:\n{out}");
+        assert!(
+            !out.lines().next().unwrap().contains("api.rs"),
+            "got:\n{out}"
+        );
     }
 
     #[test]
@@ -8408,14 +9152,22 @@ mod tests {
 
     #[test]
     fn the_combined_diff_opens_at_the_chosen_file_under_its_own_banner() {
-        let sec = |text: &str| crate::git::DiffSection { label: "unstaged", text: text.into() };
+        let sec = |text: &str| crate::git::DiffSection {
+            label: "unstaged",
+            text: text.into(),
+        };
         let long: String = (0..40).map(|i| format!("+l{i}\n")).collect();
         let mut st = noisy_log_state(false);
-        let mut dv =
-            crate::app::state::GitDiffView::new("acme/api".into(), "src/b.rs".into());
+        let mut dv = crate::app::state::GitDiffView::new("acme/api".into(), "src/b.rs".into());
         dv.set_files(vec![
-            ("src/a.rs".into(), vec![sec(&format!("@@ -1 +1,40 @@\n{long}"))]),
-            ("src/b.rs".into(), vec![sec(&format!("@@ -1 +1,40 @@\n{long}\n-x\n"))]),
+            (
+                "src/a.rs".into(),
+                vec![sec(&format!("@@ -1 +1,40 @@\n{long}"))],
+            ),
+            (
+                "src/b.rs".into(),
+                vec![sec(&format!("@@ -1 +1,40 @@\n{long}\n-x\n"))],
+            ),
         ]);
         st.git_diff = Some(dv);
         st.view = View::GitDiff;
@@ -8439,10 +9191,12 @@ mod tests {
 
     #[test]
     fn a_file_band_sweeps_in_when_first_seen_then_settles() {
-        let sec = |text: &str| crate::git::DiffSection { label: "unstaged", text: text.into() };
+        let sec = |text: &str| crate::git::DiffSection {
+            label: "unstaged",
+            text: text.into(),
+        };
         let mut st = noisy_log_state(false);
-        let mut dv =
-            crate::app::state::GitDiffView::new("acme/api".into(), "src/a.rs".into());
+        let mut dv = crate::app::state::GitDiffView::new("acme/api".into(), "src/a.rs".into());
         dv.set_files(vec![
             ("src/a.rs".into(), vec![sec("@@ -1 +1 @@\n+one\n")]),
             ("src/b.rs".into(), vec![sec("@@ -1 +1 @@\n+two\n")]),
@@ -8460,7 +9214,11 @@ mod tests {
             term.draw(|f| render_git_diff(f, f.area(), st)).unwrap();
             let buf = term.backend().buffer().clone();
             (0..buf.area.height)
-                .map(|y| (0..buf.area.width).filter(|&x| buf[(x, y)].bg == st.theme.accent).count())
+                .map(|y| {
+                    (0..buf.area.width)
+                        .filter(|&x| buf[(x, y)].bg == st.theme.accent)
+                        .count()
+                })
                 .max()
                 .unwrap_or(0)
         };
@@ -8468,13 +9226,19 @@ mod tests {
         st.tick_count = 0;
         let partial = band_cols(&st);
         assert!(partial > 0, "the sweep starts with something on screen");
-        assert!(partial < 90, "the first frame already spans the pane: {partial}");
+        assert!(
+            partial < 90,
+            "the first frame already spans the pane: {partial}"
+        );
         assert!(diff_bands_revealing(&st), "mid-sweep, the loop owes frames");
 
         st.tick_count = 30;
         let full = band_cols(&st);
         assert_eq!(full, 98, "settled, the band runs edge to edge");
-        assert!(!diff_bands_revealing(&st), "settled, it stops asking for them");
+        assert!(
+            !diff_bands_revealing(&st),
+            "settled, it stops asking for them"
+        );
     }
 
     #[test]
@@ -8487,10 +9251,12 @@ mod tests {
         // Unrecognised gets the plain file — the honest mark for it.
         assert_eq!(lang_icon("LICENSE"), "\u{f016}");
 
-        let sec = |text: &str| crate::git::DiffSection { label: "unstaged", text: text.into() };
+        let sec = |text: &str| crate::git::DiffSection {
+            label: "unstaged",
+            text: text.into(),
+        };
         let mut st = noisy_log_state(false);
-        let mut dv =
-            crate::app::state::GitDiffView::new("acme/api".into(), "src/a.rs".into());
+        let mut dv = crate::app::state::GitDiffView::new("acme/api".into(), "src/a.rs".into());
         dv.set_files(vec![
             ("src/a.rs".into(), vec![sec("@@ -1 +1 @@\n+one\n")]),
             ("src/b.py".into(), vec![sec("@@ -1 +1 @@\n+two\n")]),
@@ -8505,8 +9271,14 @@ mod tests {
         // forge icon.
         st.file_icons = false;
         let out = draw_diff(&st, 100, 20);
-        assert!(!out.contains('\u{e7a8}'), "mark still drawn when off:\n{out}");
-        assert!(out.contains(" src/a.rs"), "the name must survive the mark:\n{out}");
+        assert!(
+            !out.contains('\u{e7a8}'),
+            "mark still drawn when off:\n{out}"
+        );
+        assert!(
+            out.contains(" src/a.rs"),
+            "the name must survive the mark:\n{out}"
+        );
     }
 
     #[test]
@@ -8519,7 +9291,10 @@ mod tests {
         assert_eq!(dash_reveal_at(&st, 0), 0.0, "nothing has arrived yet");
         st.tick_count = 103;
         assert_eq!(dash_reveal_at(&st, 0), 1.0, "the first line has landed");
-        assert!(dash_reveal_at(&st, 20) < 1.0, "later lines are still arriving");
+        assert!(
+            dash_reveal_at(&st, 20) < 1.0,
+            "later lines are still arriving"
+        );
         st.tick_count = 200;
         assert!(!dash_revealing(&st), "the entrance ends");
         // A dashboard on screen without the clock having been started (a test,
@@ -8566,7 +9341,11 @@ mod tests {
         let name_x = (0..buf.area.width)
             .find(|&x| buf[(x, y)].symbol() == "a")
             .unwrap();
-        assert_eq!(buf[(name_x, y)].fg, st.theme.row_idle, "the name has not arrived");
+        assert_eq!(
+            buf[(name_x, y)].fg,
+            st.theme.row_idle,
+            "the name has not arrived"
+        );
         // The space under the last row belongs to the terminal, not to the
         // sweep: blending it would flash a slab of ground and take it away.
         let below = buf.area.height - 1;
@@ -8576,16 +9355,20 @@ mod tests {
         st.tick_count = 200;
         let buf = draw(&st);
         let y = row_of(&buf, "acme/api");
-        assert_ne!(buf[(name_x, y)].fg, st.theme.row_idle, "the name never landed");
+        assert_ne!(
+            buf[(name_x, y)].fg,
+            st.theme.row_idle,
+            "the name never landed"
+        );
     }
 
     #[test]
     fn the_help_card_stands_on_its_own_ground_and_admits_to_scrolling() {
         let mut st = noisy_log_state(false);
         st.show_help = true; // no opening tick: drawn settled
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 24)).unwrap();
-        term.draw(|f| render_help_overlay(f, f.area(), &st)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 24)).unwrap();
+        term.draw(|f| render_help_overlay(f, f.area(), &st))
+            .unwrap();
         let buf = term.backend().buffer().clone();
         let out: String = (0..buf.area.height)
             .map(|y| {
@@ -8605,7 +9388,12 @@ mod tests {
     #[test]
     fn click_targets_match_the_rows_the_frame_would_draw() {
         let st = noisy_log_state(false);
-        let inner = Rect { x: 2, y: 3, width: 60, height: 12 };
+        let inner = Rect {
+            x: 2,
+            y: 3,
+            width: 60,
+            height: 12,
+        };
         // 30 rows, 10 visible under a 2-row header, cursor at 20: the window
         // must scroll exactly far enough for row 20 to be the bottom row.
         register_table_hits(&st, inner, 2, 1, 30, 20, |r| Some(Hit::Workflow(r)));
@@ -8631,8 +9419,14 @@ mod tests {
     #[test]
     #[ignore = "visual check: cargo test show_logs -- --ignored --nocapture"]
     fn show_logs() {
-        println!("─── unfocused ───\n{}", draw_logs(&noisy_log_state(false), 80, 12));
-        println!("─── focus (F) ───\n{}", draw_logs(&noisy_log_state(true), 80, 12));
+        println!(
+            "─── unfocused ───\n{}",
+            draw_logs(&noisy_log_state(false), 80, 12)
+        );
+        println!(
+            "─── focus (F) ───\n{}",
+            draw_logs(&noisy_log_state(true), 80, 12)
+        );
     }
 
     #[test]
@@ -8664,7 +9458,11 @@ mod tests {
         assert!(col.ends_with('█'), "near the end of the log, got {col:?}");
         // …and the bracket says where you are, which is the top.
         assert!(col.starts_with('│'), "got {col:?}");
-        assert_eq!(col.matches('│').count(), 1, "the viewport is one band, got {col:?}");
+        assert_eq!(
+            col.matches('│').count(),
+            1,
+            "the viewport is one band, got {col:?}"
+        );
     }
 
     #[test]
@@ -8696,9 +9494,9 @@ mod tests {
 
     /// Draw the Changes pane off-screen, same idea as `draw_logs`.
     fn draw_changes(state: &AppState, w: u16, h: u16) -> String {
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-        term.draw(|f| render_git_status(f, f.area(), state)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_git_status(f, f.area(), state))
+            .unwrap();
         let buf = term.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
@@ -8733,7 +9531,11 @@ mod tests {
 
     /// A budget `pct` spent, refilling at `reset`.
     fn quota_at(pct: u32, reset: chrono::DateTime<Utc>) -> crate::provider::github::Quota {
-        crate::provider::github::Quota { limit: 100, used: pct, reset }
+        crate::provider::github::Quota {
+            limit: 100,
+            used: pct,
+            reset,
+        }
     }
 
     /// The push question over an open working tree, as it is drawn.
@@ -8747,8 +9549,7 @@ mod tests {
             yes: true,
             batch_count: None,
         });
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 14)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 14)).unwrap();
         term.draw(|f| render(f, &st)).unwrap();
         let buf = term.backend().buffer().clone();
         let text = (0..buf.area.height)
@@ -8804,7 +9605,14 @@ mod tests {
         let out = draw_changes(&state_with_op(op), 100, 14);
         // Reading it, copying it, and putting it away — plus the two keys that
         // get the commit made once the hook's complaint has been dealt with.
-        for want in ["j/k scroll", "e/E error", "y yank", "Esc dismiss", "a stage all", "c commit again"] {
+        for want in [
+            "j/k scroll",
+            "e/E error",
+            "y yank",
+            "Esc dismiss",
+            "a stage all",
+            "c commit again",
+        ] {
             assert!(out.contains(want), "no `{want}` on the pane:\n{out}");
         }
     }
@@ -8954,7 +9762,10 @@ mod tests {
         }
         failed.finished = true;
         failed.failed = true;
-        println!("─── failed ───\n{}", draw_changes(&state_with_op(failed), 80, 14));
+        println!(
+            "─── failed ───\n{}",
+            draw_changes(&state_with_op(failed), 80, 14)
+        );
     }
 
     #[test]
@@ -8970,8 +9781,7 @@ mod tests {
         }
         st.view = View::Repos;
 
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 10)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 10)).unwrap();
         term.draw(|f| render_repos(f, f.area(), &st)).unwrap();
         let buf = term.backend().buffer().clone();
         let rows: Vec<String> = (0..buf.area.height)
@@ -9021,7 +9831,8 @@ mod tests {
         let draw = |st: &AppState| {
             let mut term =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
-            term.draw(|f| render_services_overlay(f, f.area(), st)).unwrap();
+            term.draw(|f| render_services_overlay(f, f.area(), st))
+                .unwrap();
             let buf = term.backend().buffer().clone();
             (0..buf.area.height)
                 .map(|y| {
@@ -9080,9 +9891,9 @@ mod tests {
         ];
         st.service_repos.insert("API".into(), "acme/backend".into());
 
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
-        term.draw(|f| render_services_overlay(f, f.area(), &st)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| render_services_overlay(f, f.area(), &st))
+            .unwrap();
         let buf = term.backend().buffer().clone();
         let out = (0..buf.area.height)
             .map(|y| {
@@ -9096,7 +9907,10 @@ mod tests {
         // The groups are the production/stage answer; tags are the other one.
         assert!(out.contains("production") && out.contains("stage"), "{out}");
         assert!(out.contains("#critical"), "{out}");
-        assert!(out.contains("→ acme/backend"), "mapped monitors say whose row they sit on\n{out}");
+        assert!(
+            out.contains("→ acme/backend"),
+            "mapped monitors say whose row they sit on\n{out}"
+        );
         // The unmapped monitor is exactly the one only this card can show.
         assert!(out.contains("Logs UI") && out.contains("down"), "{out}");
         assert!(out.contains("97.0% today"), "{out}");
@@ -9127,21 +9941,31 @@ mod tests {
             svc("web", vec!["Prod".into(), "critical".into()]),
             svc("Stage", Vec::new()),
         ];
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 14)).unwrap();
-        term.draw(|f| render_services_overlay(f, f.area(), &st)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 14)).unwrap();
+        term.draw(|f| render_services_overlay(f, f.area(), &st))
+            .unwrap();
         let buf = term.backend().buffer().clone();
         let out = (0..buf.area.height)
-            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
             out.contains("▐ Prod ▌"),
             "the shared tag heads its section, as a chip\n{out}"
         );
-        assert!(!out.contains("#Prod"), "…and is not repeated on every row\n{out}");
+        assert!(
+            !out.contains("#Prod"),
+            "…and is not repeated on every row\n{out}"
+        );
         assert!(out.contains("#critical"), "other tags stay as chips\n{out}");
-        assert!(out.contains("▐ untagged ▌"), "the tagless get a section, at the end\n{out}");
+        assert!(
+            out.contains("▐ untagged ▌"),
+            "the tagless get a section, at the end\n{out}"
+        );
     }
 
     #[test]
@@ -9169,7 +9993,8 @@ mod tests {
         let card = |st: &AppState| {
             let mut term =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 10)).unwrap();
-            term.draw(|f| render_services_overlay(f, f.area(), st)).unwrap();
+            term.draw(|f| render_services_overlay(f, f.area(), st))
+                .unwrap();
             let buf = term.backend().buffer().clone();
             (0..buf.area.height)
                 .map(|y| {
@@ -9190,8 +10015,14 @@ mod tests {
         st.tick_count = 100;
         st.services_opened_tick = Some(100);
         let opening = card(&st);
-        assert!(opening.contains("API") && opening.contains("site"), "{opening}");
-        assert!(!opening.contains("down"), "the verdict is not there yet\n{opening}");
+        assert!(
+            opening.contains("API") && opening.contains("site"),
+            "{opening}"
+        );
+        assert!(
+            !opening.contains("down"),
+            "the verdict is not there yet\n{opening}"
+        );
 
         // Mid-entrance the top row has said its piece and the one under it has
         // not — that stagger *is* the animation.
@@ -9199,7 +10030,10 @@ mod tests {
         let mid = card(&st);
         assert!(mid.contains(" up "), "the first row is in\n{mid}");
         assert!(!mid.contains("down"), "the second is still coming\n{mid}");
-        assert!(services_revealing(&st), "and the loop keeps redrawing for it");
+        assert!(
+            services_revealing(&st),
+            "and the loop keeps redrawing for it"
+        );
 
         // Then it stops: a card that kept animating would pull the eye back to
         // it for as long as it was open.
@@ -9261,7 +10095,10 @@ mod tests {
             svc("site", crate::kuma::ServiceState::Up),
         ];
         let text = |spans: Vec<Span>| spans.iter().map(|s| s.content.clone()).collect::<String>();
-        assert!(text(workspace_tallies(&st)).contains("♥2"), "quietly all up");
+        assert!(
+            text(workspace_tallies(&st)).contains("♥2"),
+            "quietly all up"
+        );
         st.services[0].state = crate::kuma::ServiceState::Down;
         assert!(
             text(workspace_tallies(&st)).contains("♥1/2"),
@@ -9272,7 +10109,10 @@ mod tests {
         st.tick_count = 0;
         assert!(text(now_playing(&st)).starts_with("♥"), "tick 0 is a beat");
         st.tick_count = 8;
-        assert!(text(now_playing(&st)).starts_with("♡"), "tick 8 is the rest");
+        assert!(
+            text(now_playing(&st)).starts_with("♡"),
+            "tick 8 is the rest"
+        );
     }
 
     #[test]
@@ -9343,8 +10183,7 @@ mod tests {
     }
 
     fn draw_watch(state: &AppState, w: u16, h: u16) -> String {
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         term.draw(|f| render_watch(f, f.area(), state)).unwrap();
         let buf = term.backend().buffer().clone();
         (0..buf.area.height)
@@ -9504,7 +10343,10 @@ jobs:
             .map(|l| l.trim())
             .collect();
         assert_eq!(legs.len(), 5, "one line per leg:\n{out}");
-        assert!(legs[0].contains("db-backup") && legs[4].contains("wecker"), "{out}");
+        assert!(
+            legs[0].contains("db-backup") && legs[4].contains("wecker"),
+            "{out}"
+        );
         // Each leg carries its own clock, the way the run page prints them.
         assert!(legs.iter().all(|l| l.contains("1m 35s")), "{out}");
         // The leg still working says what it is working on; the four that
@@ -9555,7 +10397,10 @@ jobs:
 
         st.watch_scroll = 99; // clamped to the end by the draw
         let bottom = draw_watch(&st, 70, 18);
-        assert!(bottom.contains("job number 11"), "the last job should be reachable:\n{bottom}");
+        assert!(
+            bottom.contains("job number 11"),
+            "the last job should be reachable:\n{bottom}"
+        );
         assert!(!bottom.contains("job number 0"), "{bottom}");
     }
 
@@ -9585,9 +10430,9 @@ jobs:
     }
 
     fn draw_detail(state: &AppState, w: u16, h: u16) -> String {
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-        term.draw(|f| render_run_detail(f, f.area(), state)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_run_detail(f, f.area(), state))
+            .unwrap();
         let buf = term.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
@@ -9670,7 +10515,10 @@ jobs:
             );
             heads.insert(before.find('━'));
         }
-        assert!(heads.len() > 1, "the lit cell should travel, not sit: {heads:?}");
+        assert!(
+            heads.len() > 1,
+            "the lit cell should travel, not sit: {heads:?}"
+        );
 
         // Once the run has landed nothing marches: a still graph is the point
         // of a finished run.
@@ -9718,7 +10566,10 @@ jobs:
         st.rebuild_run_shape();
         let known = draw_detail(&st, 120, 28);
         assert!(known.contains("all at once"), "{known}");
-        assert!(!known.contains("──▸"), "nothing waits, so nothing points:\n{known}");
+        assert!(
+            !known.contains("──▸"),
+            "nothing waits, so nothing points:\n{known}"
+        );
 
         // Without it, one stage is only what is left when nothing is known —
         // and the band says so rather than asserting the same thing.
@@ -9750,9 +10601,12 @@ jobs:
     /// job list underneath answering for it.
     fn band_of(out: &str) -> String {
         out.lines()
-            .filter(|l| l.matches('╭').count() > 1 || l.contains('│') && l.contains('▸')
-                || l.matches('╰').count() > 1
-                || (l.contains('│') && l.contains("  ") && l.matches('│').count() > 2))
+            .filter(|l| {
+                l.matches('╭').count() > 1
+                    || l.contains('│') && l.contains('▸')
+                    || l.matches('╰').count() > 1
+                    || (l.contains('│') && l.contains("  ") && l.matches('│').count() > 2)
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -9772,8 +10626,14 @@ jobs:
         st.view = View::RunDetail;
 
         let folded = band_of(&draw_detail(&st, 120, 28));
-        assert!(folded.contains("+ Matrix: build"), "not folded by default:\n{folded}");
-        assert!(!folded.contains("db-backup"), "legs before a click:\n{folded}");
+        assert!(
+            folded.contains("+ Matrix: build"),
+            "not folded by default:\n{folded}"
+        );
+        assert!(
+            !folded.contains("db-backup"),
+            "legs before a click:\n{folded}"
+        );
 
         st.toggle_graph_box("build");
         let open = band_of(&draw_detail(&st, 120, 28));
@@ -9828,14 +10688,20 @@ jobs:
             if !has_band(&folded) {
                 continue;
             }
-            assert!(has_band(&opened), "opening took the band away at h={h}:\n{opened}");
+            assert!(
+                has_band(&opened),
+                "opening took the band away at h={h}:\n{opened}"
+            );
             // Either it opened, or it stayed folded because there was no room
             // — never a box that claims to be open and shows nothing.
             let band = band_of(&opened);
             if band.contains("+ Matrix") {
                 ever_fell_back = true;
             } else {
-                assert!(band.contains("db-backup"), "open but empty at h={h}:\n{band}");
+                assert!(
+                    band.contains("db-backup"),
+                    "open but empty at h={h}:\n{band}"
+                );
             }
         }
         assert!(ever_fell_back, "the folded fallback was never exercised");
@@ -9928,7 +10794,10 @@ jobs:
         st.view = View::RunDetail;
         let out = draw_detail(&st, 120, 28);
         // Folded, and saying so: the `+` is what advertises that it opens.
-        assert!(out.contains("+ Matrix: build"), "the matrix is one box:\n{out}");
+        assert!(
+            out.contains("+ Matrix: build"),
+            "the matrix is one box:\n{out}"
+        );
         assert!(out.contains("5 legs"), "{out}");
         assert!(out.contains("──▸"), "stages are chained:\n{out}");
         // Four stages, so three arrows: the commit check, the matrix — folded
@@ -9939,11 +10808,17 @@ jobs:
         // where the two would cut down to the same text, they are cut from the
         // other end so the pair can still be told apart.
         assert!(out.contains("(GPU"), "{out}");
-        assert!(!out.contains("deploy-stage /"), "the call is what the chain says:\n{out}");
+        assert!(
+            !out.contains("deploy-stage /"),
+            "the call is what the chain says:\n{out}"
+        );
         // Four stages of name *and* duration don't fit across 120 columns, and
         // the names are the half worth keeping — the list underneath still has
         // every duration, and nothing else has the names.
-        assert!(out.contains("v0.0.21 → stage"), "the names survive the squeeze:\n{out}");
+        assert!(
+            out.contains("v0.0.21 → stage"),
+            "the names survive the squeeze:\n{out}"
+        );
         // Give it the room and the numbers come back, on the row with the name
         // the way the run page writes them.
         let wide = draw_detail(&st, 180, 28);
@@ -9956,12 +10831,18 @@ jobs:
             .map(|x| &buf[(x, 4)])
             .find(|c| c.symbol() == "▸")
             .expect("an arrow on the connector row");
-        assert_ne!(arrow.fg, st.theme.border, "the chain should not be the dimmest thing on screen");
+        assert_ne!(
+            arrow.fg, st.theme.border,
+            "the chain should not be the dimmest thing on screen"
+        );
         let corner = (0..buf.area.width)
             .map(|x| &buf[(x, 3)])
             .find(|c| c.symbol() == "╭")
             .expect("a box");
-        assert_eq!(corner.fg, st.theme.success_dim, "a passing box wears its verdict");
+        assert_eq!(
+            corner.fg, st.theme.success_dim,
+            "a passing box wears its verdict"
+        );
 
         // In the live view too, and there the running stage is the point.
         st.view = View::Watch;
@@ -9978,9 +10859,7 @@ jobs:
         let runs = draw_view(&st, 200, 30, render_runs);
         assert!(runs.contains("──▸"), "{runs}");
         std::fs::remove_dir_all(chained_run_dir()).ok();
-
     }
-
 
     /// Where this layout came from: a screenshot of `vakanzo/vakanzo` next to
     /// the same run on GitHub. Three jobs wait on `guards`; the two beside it
@@ -10027,7 +10906,12 @@ jobs:
                 a_job_at("website (static site)", Status::Success, 29, step),
                 a_job_at("guards + what changed", Status::Success, 8, step),
                 a_job_at("bench (trend on main)", Status::Skipped, 0, step),
-                a_job_at("python suites (skills + ingestor)", Status::Running, 88, step),
+                a_job_at(
+                    "python suites (skills + ingestor)",
+                    Status::Running,
+                    88,
+                    step,
+                ),
                 a_job_at("gojobi (app)", Status::Running, 89, step),
                 a_job_at("bench (performance gate)", Status::Success, 64, step),
             ],
@@ -10092,7 +10976,6 @@ jobs:
         std::fs::remove_dir_all(&root).ok();
     }
 
-
     /// A column taller than the rows the band may have keeps as many jobs as
     /// it can and says what it dropped, rather than running off the bottom of
     /// the pane or taking the list's rows with it.
@@ -10137,7 +11020,10 @@ jobs:
         );
         // Nine of the fourteen, and the note accounts for the rest.
         assert!(out.contains("+5 more"), "{out}");
-        assert!(!out.contains("│ ✓ job 9"), "job 9 is one of the five:\n{out}");
+        assert!(
+            !out.contains("│ ✓ job 9"),
+            "job 9 is one of the five:\n{out}"
+        );
         // Whatever it kept, the band stayed inside its ceiling and the list
         // underneath still got its rows.
         // Skipping the pane's own top border, which is a `╭` of its own.
@@ -10151,7 +11037,11 @@ jobs:
         };
         // The band runs from its first border to the line the list starts on.
         let (top, list) = (at("╭"), at("▶"));
-        assert!(list - top <= GRAPH_ROWS_MAX, "the band took {} rows:\n{out}", list - top);
+        assert!(
+            list - top <= GRAPH_ROWS_MAX,
+            "the band took {} rows:\n{out}",
+            list - top
+        );
         assert!(
             out.lines().count() - list > GRAPH_KEEP as usize,
             "the list keeps its rows:\n{out}"
@@ -10210,7 +11100,10 @@ jobs:
         // One row stands for all five legs, with the wall clock of the box.
         assert!(out.contains("▸ Matrix: build"), "{out}");
         assert!(out.contains("5 legs"), "{out}");
-        assert!(!out.contains("build gojobi"), "legs stay folded away:\n{out}");
+        assert!(
+            !out.contains("build gojobi"),
+            "legs stay folded away:\n{out}"
+        );
 
         let mut red = watching_a_matrix_run(&[
             ("build db-backup", Status::Success),
@@ -10245,9 +11138,13 @@ jobs:
         assert_eq!(open - shut, 5 * 4);
     }
 
-    fn draw_view(state: &AppState, w: u16, h: u16, draw: fn(&mut Frame, Rect, &AppState)) -> String {
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    fn draw_view(
+        state: &AppState,
+        w: u16,
+        h: u16,
+        draw: fn(&mut Frame, Rect, &AppState),
+    ) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw(f, f.area(), state)).unwrap();
         let buf = term.backend().buffer().clone();
         (0..buf.area.height)
@@ -10351,7 +11248,10 @@ jobs:
                 run,
                 jobs: vec![
                     lint,
-                    a_job("build gojobi", &[("Run docker/build-push-action@v6", Status::Running)]),
+                    a_job(
+                        "build gojobi",
+                        &[("Run docker/build-push-action@v6", Status::Running)],
+                    ),
                 ],
             }],
         );
@@ -10418,11 +11318,17 @@ jobs:
         let run = st.repo_runs[0].clone();
         st.run_progress.insert(
             "vakanzo/vakanzo".into(),
-            vec![crate::provider::RunDetail { run: run.clone(), jobs: Vec::new() }],
+            vec![crate::provider::RunDetail {
+                run: run.clone(),
+                jobs: Vec::new(),
+            }],
         );
         let cold = draw_view(&st, 150, 30, render_workflows);
         for stage in ["lint", "build gojobi", "deploy"] {
-            assert!(cold.contains(stage), "no {stage} before the run got there:\n{cold}");
+            assert!(
+                cold.contains(stage),
+                "no {stage} before the run got there:\n{cold}"
+            );
         }
         assert!(cold.contains('▸'), "no chain at all:\n{cold}");
 
@@ -10432,13 +11338,26 @@ jobs:
         lint.status = Status::Success;
         st.run_progress.insert(
             "vakanzo/vakanzo".into(),
-            vec![crate::provider::RunDetail { run, jobs: vec![lint] }],
+            vec![crate::provider::RunDetail {
+                run,
+                jobs: vec![lint],
+            }],
         );
         let warm = draw_view(&st, 150, 30, render_workflows);
         let boxes = |out: &str| out.matches('╭').count();
-        assert_eq!(boxes(&cold), boxes(&warm), "the chain changed shape:\n{warm}");
-        assert!(warm.contains("✓ lint"), "the finished stage is not green:\n{warm}");
-        assert!(warm.contains("· deploy"), "later stages should still wait:\n{warm}");
+        assert_eq!(
+            boxes(&cold),
+            boxes(&warm),
+            "the chain changed shape:\n{warm}"
+        );
+        assert!(
+            warm.contains("✓ lint"),
+            "the finished stage is not green:\n{warm}"
+        );
+        assert!(
+            warm.contains("· deploy"),
+            "later stages should still wait:\n{warm}"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -10456,7 +11375,10 @@ jobs:
         // A landed run is no longer tracked as in flight — its jobs come from
         // the fetch the band makes once the row goes quiet.
         st.run_progress.remove("vakanzo/vakanzo");
-        st.workflow_graph_run = Some(crate::provider::RunDetail { run, jobs: vec![lint] });
+        st.workflow_graph_run = Some(crate::provider::RunDetail {
+            run,
+            jobs: vec![lint],
+        });
         let out = draw_view(&st, 150, 30, render_workflows);
         let edges: String = out.lines().filter(|l| l.contains('▸')).collect();
         assert!(!edges.is_empty(), "no chain:\n{out}");
@@ -10476,12 +11398,21 @@ jobs:
         st.run_progress.remove("vakanzo/vakanzo");
 
         // Accepted, nothing built: the file is the whole picture.
-        let waiting = crate::provider::RunDetail { run: run.clone(), jobs: Vec::new() };
-        assert!(st.graph_known(&waiting), "no chain before the run got going");
+        let waiting = crate::provider::RunDetail {
+            run: run.clone(),
+            jobs: Vec::new(),
+        };
+        assert!(
+            st.graph_known(&waiting),
+            "no chain before the run got going"
+        );
 
         // The same empty list, once the run is over.
         run.status = Status::Cancelled;
-        let over = crate::provider::RunDetail { run, jobs: Vec::new() };
+        let over = crate::provider::RunDetail {
+            run,
+            jobs: Vec::new(),
+        };
         assert!(!st.graph_known(&over), "every stage reported as skipped");
         std::fs::remove_dir_all(root).ok();
     }
@@ -10496,11 +11427,17 @@ jobs:
         assert!(tall.contains('▸'), "{tall}");
 
         let short = draw_view(&st, 150, 14, render_workflows);
-        assert!(!short.contains('▸'), "the band took the lists' rows:\n{short}");
+        assert!(
+            !short.contains('▸'),
+            "the band took the lists' rows:\n{short}"
+        );
 
         st.repo_root = None;
         let unknown = draw_view(&st, 150, 30, render_workflows);
-        assert!(!unknown.contains('▸'), "a chain with no file behind it:\n{unknown}");
+        assert!(
+            !unknown.contains('▸'),
+            "a chain with no file behind it:\n{unknown}"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -10540,8 +11477,7 @@ jobs:
         h: u16,
         draw: fn(&mut Frame, Rect, &AppState),
     ) -> ratatui::buffer::Buffer {
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw(f, f.area(), state)).unwrap();
         term.backend().buffer().clone()
     }
@@ -10555,7 +11491,10 @@ jobs:
         // Fresh verdict: the row is tinted.
         st.workflow_pulse.insert(
             "ci.yml".into(),
-            Pulse { changed: Some(100), settled: Some((100, Status::Success)) },
+            Pulse {
+                changed: Some(100),
+                settled: Some((100, Status::Success)),
+            },
         );
         let lit = buffer_of(&st, 110, 12, render_workflows_list);
         assert_ne!(quiet, lit, "a landing should colour its row");
@@ -10564,7 +11503,10 @@ jobs:
         // spinner is at the same frame, so nothing else can account for it.
         st.workflow_pulse.insert(
             "ci.yml".into(),
-            Pulse { changed: Some(0), settled: Some((0, Status::Success)) },
+            Pulse {
+                changed: Some(0),
+                settled: Some((0, Status::Success)),
+            },
         );
         let faded = buffer_of(&st, 110, 12, render_workflows_list);
         assert_eq!(quiet, faded, "the breath should not outlast its window");
@@ -10590,7 +11532,10 @@ jobs:
     fn the_live_strip_lets_go_of_a_run_that_has_landed() {
         let mut st = single_repo_session();
         let out = draw_view(&st, 140, 20, render_workflows);
-        assert!(out.contains("Live"), "the strip is there to begin with:\n{out}");
+        assert!(
+            out.contains("Live"),
+            "the strip is there to begin with:\n{out}"
+        );
 
         // The run the strip is tracking finishes. Its own copy inside
         // `run_progress` is as old as the fetch that started it and still says
@@ -10602,7 +11547,10 @@ jobs:
             }
         }
         let after = draw_view(&st, 140, 20, render_workflows);
-        assert!(!after.contains("in flight"), "the strip should let go:\n{after}");
+        assert!(
+            !after.contains("in flight"),
+            "the strip should let go:\n{after}"
+        );
     }
 
     #[test]
@@ -10640,7 +11588,9 @@ jobs:
             "the verdict should reach the preview:\n{out}"
         );
         assert!(
-            !rows.iter().any(|r| r.contains('⠋') || r.contains('⠙') || r.contains('⠹')),
+            !rows
+                .iter()
+                .any(|r| r.contains('⠋') || r.contains('⠙') || r.contains('⠹')),
             "nothing should still be spinning:\n{out}"
         );
     }
@@ -10747,8 +11697,7 @@ jobs:
     }
 
     fn draw_repos(state: &AppState, w: u16, h: u16) -> String {
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         term.draw(|f| render_repos(f, f.area(), state)).unwrap();
         let buf = term.backend().buffer().clone();
         (0..buf.area.height)
@@ -10816,7 +11765,10 @@ jobs:
 
         // The table is still the view: the band sits below it, it does not
         // replace it or push it down.
-        assert!(out.contains("muufree/website"), "the table went missing:\n{out}");
+        assert!(
+            out.contains("muufree/website"),
+            "the table went missing:\n{out}"
+        );
         let at = |needle: &str| out.lines().position(|l| l.contains(needle));
         let header = at("Local branch").expect("a table header");
         let band = at("▸").expect("a band");
@@ -10848,11 +11800,17 @@ jobs:
         let (mut st, root) = dashboard_with_a_chain("noroot");
         let with_chain = draw_repos(&st, 150, 30);
 
-        assert!(with_chain.contains('▸'), "no chain with the file:\n{with_chain}");
+        assert!(
+            with_chain.contains('▸'),
+            "no chain with the file:\n{with_chain}"
+        );
 
         st.repos[0].path = None;
         let without = draw_repos(&st, 150, 30);
-        assert!(!without.contains('▸'), "a chain with no file behind it:\n{without}");
+        assert!(
+            !without.contains('▸'),
+            "a chain with no file behind it:\n{without}"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -10902,12 +11860,16 @@ jobs:
         let mut st = dashboard_with_live_ci();
         let second = a_run(11, "CI for Backend", Status::Running, 61);
         st.repos[0].runs.push(second.clone());
-        st.run_progress.get_mut("muufree/backend").unwrap().push(
-            crate::provider::RunDetail {
+        st.run_progress
+            .get_mut("muufree/backend")
+            .unwrap()
+            .push(crate::provider::RunDetail {
                 run: second,
-                jobs: vec![a_job("test (3.13)", &[("Run tests with pytest", Status::Running)])],
-            },
-        );
+                jobs: vec![a_job(
+                    "test (3.13)",
+                    &[("Run tests with pytest", Status::Running)],
+                )],
+            });
 
         let out = draw_repos(&st, 150, 16);
         assert!(out.contains("3 in flight"), "got:\n{out}");
@@ -10930,7 +11892,12 @@ jobs:
         // strip is read down its columns — ragged ones make it unreadable, and
         // the longest row's branch fell off the end of the cell entirely.
         let mut st = dashboard_with_live_ci();
-        st.repos[1].runs = vec![a_run(2, "Build & Test Frontend Everywhere", Status::Running, 40)];
+        st.repos[1].runs = vec![a_run(
+            2,
+            "Build & Test Frontend Everywhere",
+            Status::Running,
+            40,
+        )];
         st.run_progress.insert(
             "muufree/cms".into(),
             vec![crate::provider::RunDetail {
@@ -10962,7 +11929,11 @@ jobs:
         let at = |needle: &str| -> Vec<usize> {
             strip
                 .iter()
-                .map(|l| l.find(needle).map(|b| disp_width(&l[..b])).unwrap_or(usize::MAX))
+                .map(|l| {
+                    l.find(needle)
+                        .map(|b| disp_width(&l[..b]))
+                        .unwrap_or(usize::MAX)
+                })
                 .collect()
         };
         let branch = at("main");
@@ -11027,9 +11998,7 @@ jobs:
             b.items[0].sha = Some("9f2c1ab".into());
             b.cursor = 1;
             b.items[1].state = match phase {
-                BatchPhase::Paused => {
-                    crate::app::state::ItemState::Failed("pytest failed".into())
-                }
+                BatchPhase::Paused => crate::app::state::ItemState::Failed("pytest failed".into()),
                 _ => crate::app::state::ItemState::Running,
             };
             let mut op = GitOp::new("commit", Some("pre-commit".into()), 0);
@@ -11045,9 +12014,9 @@ jobs:
     }
 
     fn draw_batch(state: &AppState, w: u16, h: u16) -> String {
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-        term.draw(|f| render_batch_commit(f, f.area(), state)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_batch_commit(f, f.area(), state))
+            .unwrap();
         let buf = term.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
@@ -11084,7 +12053,10 @@ jobs:
         let out = draw_batch(&st, 110, 16);
         assert!(out.contains("3 marked repos"), "got:\n{out}");
         for (k, _, what) in crate::tui::BATCH_MENU {
-            assert!(out.contains(&format!("{k}  {what}")), "{what} missing from:\n{out}");
+            assert!(
+                out.contains(&format!("{k}  {what}")),
+                "{what} missing from:\n{out}"
+            );
         }
         assert!(out.contains("Esc cancel"), "got:\n{out}");
     }
@@ -11138,7 +12110,8 @@ jobs:
         if let Some(b) = st.batch.as_mut() {
             b.items[1].state = crate::app::state::ItemState::Committed;
             b.items[1].sha = Some("77aa310".into());
-            b.items[2].state = crate::app::state::ItemState::Nothing("working tree is clean".into());
+            b.items[2].state =
+                crate::app::state::ItemState::Nothing("working tree is clean".into());
         }
         st.git_ops.clear();
         let out = draw_batch(&st, 110, 12);
@@ -11169,7 +12142,10 @@ jobs:
         assert!(!bar.contains("repos"), "nothing to jump to:\n{bar}");
 
         // A dirty tree marks the key, so the footer says why to press it.
-        assert!(!bar.contains("changes ●"), "clean says nothing extra:\n{bar}");
+        assert!(
+            !bar.contains("changes ●"),
+            "clean says nothing extra:\n{bar}"
+        );
         st.repos[0].git = Some(crate::git::parse_status("## main\0 M a.txt\0"));
         assert!(draw_footer(&st, 150).contains("changes ●"));
 
@@ -11238,14 +12214,16 @@ jobs:
             ("paused", BatchPhase::Paused),
             ("done", BatchPhase::Done),
         ] {
-            println!("─── {label} ───\n{}", draw_batch(&batch_state(phase), 110, 14));
+            println!(
+                "─── {label} ───\n{}",
+                draw_batch(&batch_state(phase), 110, 14)
+            );
         }
     }
 
     /// The background colour of the row naming `spec`.
     fn row_bg(state: &AppState, spec: &str) -> Color {
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 12)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 12)).unwrap();
         term.draw(|f| render_repos(f, f.area(), state)).unwrap();
         let buf = term.backend().buffer().clone();
         let y = (0..buf.area.height)
@@ -11261,8 +12239,7 @@ jobs:
 
     /// Every cell of the row a repo is on, as (symbol, fg, bg).
     fn row_cells(state: &AppState, spec: &str) -> Vec<(String, Color, Color)> {
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 12)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 12)).unwrap();
         term.draw(|f| render_repos(f, f.area(), state)).unwrap();
         let buf = term.backend().buffer().clone();
         let y = (0..buf.area.height)
@@ -11416,8 +12393,18 @@ jobs:
         // wall of green.
         let runs: Vec<Run> = (0..6)
             .map(|i| {
-                let mut r = a_run(i, "CI", if i < 2 { Status::Failure } else { Status::Success }, 60);
-                r.updated_at = r.created_at + chrono::Duration::seconds(if i == 5 { 300 } else { 60 });
+                let mut r = a_run(
+                    i,
+                    "CI",
+                    if i < 2 {
+                        Status::Failure
+                    } else {
+                        Status::Success
+                    },
+                    60,
+                );
+                r.updated_at =
+                    r.created_at + chrono::Duration::seconds(if i == 5 { 300 } else { 60 });
                 r
             })
             .collect();
@@ -11480,7 +12467,10 @@ jobs:
         st.repos[2].changed_tick = Some(100);
         st.tick_count = 100;
         let lit = row_bg(&st, "muufree/website");
-        assert_ne!(lit, settled, "a change you did not watch happen is invisible");
+        assert_ne!(
+            lit, settled,
+            "a change you did not watch happen is invisible"
+        );
 
         // …and it does not stay lit: a dashboard that keeps glowing at you
         // teaches you to stop looking at the glow.
@@ -11567,7 +12557,10 @@ jobs:
         st.quota = Some(quota_at(40, Utc::now() + chrono::Duration::minutes(23)));
         let calm = draw_header(&st, 120);
         assert!(calm.contains("API 40%"), "{calm}");
-        assert!(!calm.contains("till"), "a clock you have no use for is noise: {calm}");
+        assert!(
+            !calm.contains("till"),
+            "a clock you have no use for is noise: {calm}"
+        );
 
         // Past the line the number stops being trivia and becomes a plan: this
         // is how long to stay out of jog.
@@ -11575,7 +12568,10 @@ jobs:
         st.quota = Some(quota_at(94, Utc::now() + chrono::Duration::minutes(23)));
         let hot = draw_header(&st, 120);
         assert!(hot.contains("API 94%"), "{hot}");
-        assert!(hot.contains(&format!("till {}", at.format("%H:%M"))), "{hot}");
+        assert!(
+            hot.contains(&format!("till {}", at.format("%H:%M"))),
+            "{hot}"
+        );
     }
 
     #[test]
@@ -11630,7 +12626,9 @@ jobs:
     fn workspace_dashboard() -> AppState {
         let mut st = dashboard_with_live_ci();
         st.workspace_root = Some(std::path::PathBuf::from("/data/repos/muufree/github"));
-        st.repos[1].git = Some(crate::git::parse_status("## main\0M  a.rs\0 M b.rs\0 M c.rs\0"));
+        st.repos[1].git = Some(crate::git::parse_status(
+            "## main\0M  a.rs\0 M b.rs\0 M c.rs\0",
+        ));
         st
     }
 
@@ -11729,7 +12727,10 @@ jobs:
         let out = draw_header(&st, 150);
         // Three rows can only repeat "rate limited". The header is where there
         // is room to say when it stops being true.
-        assert!(out.contains(&format!("retry {}", at.format("%H:%M"))), "{out}");
+        assert!(
+            out.contains(&format!("retry {}", at.format("%H:%M"))),
+            "{out}"
+        );
     }
 
     #[test]
@@ -11812,7 +12813,10 @@ jobs:
         // and lets the rows disagree in their own cells.
         assert!(shared_fault_detail(&st).is_none());
         let out = draw_repos(&st, 150, 12);
-        assert!(out.contains("rate limited") && out.contains("not found"), "{out}");
+        assert!(
+            out.contains("rate limited") && out.contains("not found"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -11923,8 +12927,7 @@ jobs:
         }
         st.workspace_root = Some(std::path::PathBuf::from("/data/repos/muufree/github"));
 
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 50)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 50)).unwrap();
         // Warm the buffers so the first-frame allocations are not in the sample.
         for _ in 0..50 {
             term.draw(|f| render(f, &st)).unwrap();
@@ -12098,9 +13101,9 @@ jobs:
 
     /// Draw the help overlay into an off-screen terminal and return it as text.
     fn draw_help(state: &AppState, w: u16, h: u16) -> String {
-        let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-        term.draw(|f| render_help_overlay(f, f.area(), state)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_help_overlay(f, f.area(), state))
+            .unwrap();
         let buf = term.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
@@ -12135,7 +13138,10 @@ jobs:
         // The current view's section floats to the top and wears the mark.
         assert!(text.contains("you are here"));
         let here_line = text.lines().find(|l| l.contains("you are here")).unwrap();
-        assert!(here_line.contains("Logs"), "the mark sits on the open view's section: {here_line}");
+        assert!(
+            here_line.contains("Logs"),
+            "the mark sits on the open view's section: {here_line}"
+        );
         // Two columns: some row shares a line with content in the right half.
         let two_col = text.lines().any(|l| {
             let half = l.len() / 2;
@@ -12156,7 +13162,10 @@ jobs:
         st.view = View::Repos;
         st.show_help = true;
         let text = draw_help(&st, 60, 20);
-        assert!(text.contains("scroll"), "a clipped overlay says how to scroll:\n{text}");
+        assert!(
+            text.contains("scroll"),
+            "a clipped overlay says how to scroll:\n{text}"
+        );
         // Long descriptions wrap instead of running off the dialog edge.
         assert!(
             text.lines().all(|l| l.chars().count() <= 60),
@@ -12177,12 +13186,24 @@ jobs:
         st.show_help = true;
         st.help_search = "stage".into();
         let text = draw_help(&st, 120, 54);
-        assert!(text.contains("stage all"), "the matching rows survive:\n{text}");
+        assert!(
+            text.contains("stage all"),
+            "the matching rows survive:\n{text}"
+        );
         // Rows that say nothing about staging are gone, and so are the
         // sections left with nothing in them.
-        assert!(!text.contains("quit"), "unmatched rows are filtered out:\n{text}");
-        assert!(!text.contains("Trigger prompt"), "empty sections drop out:\n{text}");
-        assert!(text.contains("Esc clears"), "the filter says how to drop it:\n{text}");
+        assert!(
+            !text.contains("quit"),
+            "unmatched rows are filtered out:\n{text}"
+        );
+        assert!(
+            !text.contains("Trigger prompt"),
+            "empty sections drop out:\n{text}"
+        );
+        assert!(
+            text.contains("Esc clears"),
+            "the filter says how to drop it:\n{text}"
+        );
 
         // With Global filtered away there is nothing to float under, so the
         // open view's section takes the top-left corner itself.
@@ -12200,13 +13221,33 @@ jobs:
 
     #[test]
     fn every_term_of_a_help_search_has_to_land_somewhere_on_the_row() {
-        assert!(help_row_matches("p", "push — sets upstream on first push", "push"));
+        assert!(help_row_matches(
+            "p",
+            "push — sets upstream on first push",
+            "push"
+        ));
         // Both words, in either order, anywhere in key or description.
-        assert!(help_row_matches("p", "push — sets upstream on first push", "push upstream"));
-        assert!(help_row_matches("p", "push — sets upstream on first push", "upstream push"));
-        assert!(!help_row_matches("p", "push — sets upstream on first push", "push tag"));
+        assert!(help_row_matches(
+            "p",
+            "push — sets upstream on first push",
+            "push upstream"
+        ));
+        assert!(help_row_matches(
+            "p",
+            "push — sets upstream on first push",
+            "upstream push"
+        ));
+        assert!(!help_row_matches(
+            "p",
+            "push — sets upstream on first push",
+            "push tag"
+        ));
         // The binding itself is searchable, and case never matters.
-        assert!(help_row_matches("ctrl+p", "fuzzy find in the current list", "CTRL"));
+        assert!(help_row_matches(
+            "ctrl+p",
+            "fuzzy find in the current list",
+            "CTRL"
+        ));
     }
 
     #[test]
@@ -12221,7 +13262,10 @@ jobs:
         st.show_help = true;
         st.help_search = "xyzzy".into();
         let text = draw_help(&st, 120, 54);
-        assert!(text.contains("no binding matches"), "an empty result explains itself:\n{text}");
+        assert!(
+            text.contains("no binding matches"),
+            "an empty result explains itself:\n{text}"
+        );
     }
 
     #[test]
@@ -12256,7 +13300,10 @@ jobs:
             .iter()
             .find(|(_, d)| d.starts_with("commit"))
             .expect("commit row");
-        assert_eq!(commit.0, "x", "help must show the configured key, not the default");
+        assert_eq!(
+            commit.0, "x",
+            "help must show the configured key, not the default"
+        );
     }
 
     #[test]

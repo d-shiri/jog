@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span};
 use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::text::{Line, Span};
 
 use rayon::prelude::*;
 
@@ -16,7 +16,6 @@ use crate::history::History;
 use crate::provider::github::{ApiError, Quota};
 use crate::provider::graph::{NodeGroup, RunNode, WorkflowGraph, shape, stages};
 use crate::provider::{Job, PrInfo, Run, RunDetail, Status, Workflow};
-
 
 /// Cache key for a parsed workflow file: which checkout it came out of, and
 /// its name inside it.
@@ -62,7 +61,10 @@ pub enum DetailItem {
     /// Folding it hides the legs behind it.
     Group(usize),
     Job(usize),
-    Step { job: usize, step: usize },
+    Step {
+        job: usize,
+        step: usize,
+    },
 }
 
 /// What a mouse click at some screen position would land on.
@@ -338,7 +340,10 @@ impl GitView {
     }
 
     pub fn entries(&self) -> &[crate::git::StatusEntry] {
-        self.status.as_ref().map(|s| s.entries.as_slice()).unwrap_or(&[])
+        self.status
+            .as_ref()
+            .map(|s| s.entries.as_slice())
+            .unwrap_or(&[])
     }
 
     pub fn selected(&self) -> Option<&crate::git::StatusEntry> {
@@ -530,7 +535,11 @@ impl GitOp {
 pub enum DiffLine {
     /// The banner opening one file's diff, with that file's own +/− counts
     /// so the divider says what the file cost.
-    File { path: String, add: usize, del: usize },
+    File {
+        path: String,
+        add: usize,
+        del: usize,
+    },
     Section(String),
     Text(String),
 }
@@ -558,7 +567,11 @@ pub struct DiffSide {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffRow {
     /// The banner opening one file's diff in the combined view.
-    File { path: String, add: usize, del: usize },
+    File {
+        path: String,
+        add: usize,
+        del: usize,
+    },
     /// A staged/unstaged banner.
     Section(String),
     /// A line belonging to neither side: a hunk header, a file header, a
@@ -652,7 +665,11 @@ pub fn diff_rows(lines: &[DiffLine], emphasis: &[Option<ByteSpan>]) -> Vec<DiffR
             continue;
         }
         if let DiffLine::File { path, add, del } = &lines[i] {
-            rows.push(DiffRow::File { path: path.clone(), add: *add, del: *del });
+            rows.push(DiffRow::File {
+                path: path.clone(),
+                add: *add,
+                del: *del,
+            });
             i += 1;
             continue;
         }
@@ -668,10 +685,20 @@ pub fn diff_rows(lines: &[DiffLine], emphasis: &[Option<ByteSpan>]) -> Vec<DiffR
             let (dn, an) = (add - del, i - add);
             for k in 0..dn.max(an) {
                 let old = (k < dn).then(|| {
-                    diff_side(text_at(del + k).unwrap_or(""), emph_at(del + k), old_no + k + 1, true)
+                    diff_side(
+                        text_at(del + k).unwrap_or(""),
+                        emph_at(del + k),
+                        old_no + k + 1,
+                        true,
+                    )
                 });
                 let new = (k < an).then(|| {
-                    diff_side(text_at(add + k).unwrap_or(""), emph_at(add + k), new_no + k + 1, true)
+                    diff_side(
+                        text_at(add + k).unwrap_or(""),
+                        emph_at(add + k),
+                        new_no + k + 1,
+                        true,
+                    )
                 });
                 rows.push(DiffRow::Pair { old, new });
             }
@@ -813,7 +840,11 @@ impl GitDiffView {
             }
             let (add, del) = section_stats(sections);
             self.file_lines.push(self.lines.len());
-            self.lines.push(DiffLine::File { path: path.clone(), add, del });
+            self.lines.push(DiffLine::File {
+                path: path.clone(),
+                add,
+                del,
+            });
             self.lines.push(DiffLine::Text(String::new()));
             self.files.push(path.clone());
             if sections.is_empty() {
@@ -939,9 +970,7 @@ pub type ByteSpan = (usize, usize);
 /// outside hunks anyway.
 fn diff_emphasis(lines: &[DiffLine]) -> Vec<Option<ByteSpan>> {
     let mut out = vec![None; lines.len()];
-    let is = |i: usize, mark: char, header: &str| {
-        matches!(&lines[i], DiffLine::Text(t) if t.starts_with(mark) && !t.starts_with(header))
-    };
+    let is = |i: usize, mark: char, header: &str| matches!(&lines[i], DiffLine::Text(t) if t.starts_with(mark) && !t.starts_with(header));
     let mut i = 0;
     while i < lines.len() {
         if !is(i, '-', "---") {
@@ -1036,7 +1065,12 @@ pub struct BatchItem {
 
 impl BatchItem {
     pub fn new(spec: String, path: PathBuf) -> Self {
-        Self { spec, path, state: ItemState::Queued, sha: None }
+        Self {
+            spec,
+            path,
+            state: ItemState::Queued,
+            sha: None,
+        }
     }
 
     /// Has a commit from this batch that hasn't been pushed yet.
@@ -1059,6 +1093,8 @@ pub enum BatchAction {
     OpenPr,
     /// Any shell command, `sh -c`, in each repo.
     Run,
+    /// `workflow_dispatch` one workflow in each repo, on its current branch.
+    Deploy,
 }
 
 impl BatchAction {
@@ -1070,7 +1106,7 @@ impl BatchAction {
             Self::NewBranch => Some("branch name"),
             Self::OpenPr => Some("PR title"),
             Self::Run => Some("command"),
-            Self::BackToMain => None,
+            Self::BackToMain | Self::Deploy => None,
         }
     }
 
@@ -1088,6 +1124,7 @@ impl BatchAction {
             Self::BackToMain => "Back to main in",
             Self::OpenPr => "Open PRs in",
             Self::Run => "Run in",
+            Self::Deploy => "Deploy",
         }
     }
 
@@ -1099,6 +1136,7 @@ impl BatchAction {
             Self::BackToMain => "switching",
             Self::OpenPr => "opening PR",
             Self::Run => "running",
+            Self::Deploy => "dispatching",
         }
     }
 
@@ -1110,6 +1148,7 @@ impl BatchAction {
             Self::BackToMain => "on",
             Self::OpenPr => "opened",
             Self::Run => "done",
+            Self::Deploy => "started on",
         }
     }
 
@@ -1122,6 +1161,7 @@ impl BatchAction {
             Self::BackToMain => "back on main",
             Self::OpenPr => "PRs opened",
             Self::Run => "done",
+            Self::Deploy => "deploys started",
         }
     }
 }
@@ -1130,6 +1170,12 @@ impl BatchAction {
 pub enum BatchPhase {
     /// Choosing what to do to the marked repos.
     Pick,
+    /// Deploy: choosing which workflow to run.
+    ChooseWorkflow,
+    /// Deploy: the workflow's input form is open (in the trigger prompt).
+    AwaitInputs,
+    /// Deploy: showing exactly what will run where, before anything does.
+    Confirm,
     /// Typing the one message (or branch name) that every repo will get.
     Compose,
     Committing,
@@ -1139,6 +1185,57 @@ pub enum BatchPhase {
     AskPush,
     Pushing,
     Done,
+}
+
+/// Starts one workflow run: `(owner/repo, workflow file, ref, inputs)`.
+pub type Dispatch =
+    Arc<dyn Fn(&str, &str, &str, HashMap<String, String>) -> Result<(), String> + Send + Sync>;
+
+/// A workflow some of the marked repos can dispatch, matched by file name —
+/// the display names differ by emoji from repo to repo, the files do not.
+#[derive(Debug, Clone)]
+pub struct DeployChoice {
+    pub file: String,
+    pub name: String,
+    /// The first marked repo's copy: whose inputs the form asks for.
+    pub workflow: Workflow,
+    /// Marked repos that have it, with the input names their copy declares.
+    pub repos: HashMap<String, Vec<String>>,
+}
+
+/// Where one repo's run will go: its GitHub repo and the branch it is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployTarget {
+    pub remote: String,
+    pub branch: String,
+}
+
+/// Everything a deploy batch needs once the workflow is chosen.
+#[derive(Clone, Default)]
+pub struct DeployPlan {
+    pub choices: Vec<DeployChoice>,
+    pub cursor: usize,
+    pub inputs: HashMap<String, String>,
+    /// Per repo: where it will run, or why it won't.
+    pub targets: HashMap<String, Result<DeployTarget, String>>,
+    pub dispatch: Option<Dispatch>,
+}
+
+impl std::fmt::Debug for DeployPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeployPlan")
+            .field("choices", &self.choices)
+            .field("cursor", &self.cursor)
+            .field("inputs", &self.inputs)
+            .field("targets", &self.targets)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeployPlan {
+    pub fn chosen(&self) -> Option<&DeployChoice> {
+        self.choices.get(self.cursor)
+    }
 }
 
 /// One commit message applied across several repos, one repo at a time.
@@ -1161,6 +1258,8 @@ pub struct BatchCommit {
     pub resume: BatchPhase,
     /// Tick the current repo started on, for its elapsed clock.
     pub started_tick: u64,
+    /// Set once Deploy is picked.
+    pub deploy: Option<DeployPlan>,
     /// Tick the run finished on — the clock a clean batch takes itself off
     /// screen against. `None` while it is still working, and after an abort:
     /// see [`BatchCommit::returns_on_its_own`].
@@ -1189,12 +1288,17 @@ impl BatchCommit {
             resume: BatchPhase::Committing,
             started_tick: tick,
             done_tick: None,
+            deploy: None,
         }
     }
 
     /// A batch that first asks what to do, rather than assuming a commit.
     pub fn pick(items: Vec<BatchItem>, tick: u64) -> Self {
-        Self { input: None, phase: BatchPhase::Pick, ..Self::new(items, tick) }
+        Self {
+            input: None,
+            phase: BatchPhase::Pick,
+            ..Self::new(items, tick)
+        }
     }
 
     /// Settle the action and open the input box for it.
@@ -1234,9 +1338,7 @@ impl BatchCommit {
             return None;
         }
         let next = match self.phase {
-            BatchPhase::Committing => {
-                self.items.iter().position(|i| i.state == ItemState::Queued)
-            }
+            BatchPhase::Committing => self.items.iter().position(|i| i.state == ItemState::Queued),
             BatchPhase::Pushing => self.items.iter().position(|i| i.ready_to_push()),
             _ => None,
         };
@@ -1477,12 +1579,14 @@ impl RepoCard {
 
     /// Counts across the loaded runs: (success, failure, in-flight).
     pub fn counts(&self) -> (u32, u32, u32) {
-        self.runs.iter().fold((0, 0, 0), |(o, f, r), run| match run.status {
-            Status::Success => (o + 1, f, r),
-            Status::Failure => (o, f + 1, r),
-            Status::Running | Status::Queued => (o, f, r + 1),
-            _ => (o, f, r),
-        })
+        self.runs
+            .iter()
+            .fold((0, 0, 0), |(o, f, r), run| match run.status {
+                Status::Success => (o + 1, f, r),
+                Status::Failure => (o, f + 1, r),
+                Status::Running | Status::Queued => (o, f, r + 1),
+                _ => (o, f, r),
+            })
     }
 }
 
@@ -1572,8 +1676,7 @@ pub fn fuzzy_score(haystack: &str, needle: &str) -> Option<i32> {
             score += 15;
         }
         // Start of the string or just after a separator.
-        let boundary = found == 0
-            || matches!(hay[found - 1], '_' | '-' | '.' | '/' | ' ' | ':');
+        let boundary = found == 0 || matches!(hay[found - 1], '_' | '-' | '.' | '/' | ' ' | ':');
         if boundary {
             score += 10;
         }
@@ -1664,13 +1767,14 @@ impl TriggerPrompt {
 
     pub fn cycle_option(&mut self) {
         if let Some(f) = self.current_field_mut()
-            && let Some(opts) = f.options.clone() {
-                if opts.is_empty() {
-                    return;
-                }
-                let idx = opts.iter().position(|o| o == &f.value).unwrap_or(0);
-                f.value = opts[(idx + 1) % opts.len()].clone();
+            && let Some(opts) = f.options.clone()
+        {
+            if opts.is_empty() {
+                return;
             }
+            let idx = opts.iter().position(|o| o == &f.value).unwrap_or(0);
+            f.value = opts[(idx + 1) % opts.len()].clone();
+        }
     }
 
     pub fn missing_required(&self) -> Vec<&str> {
@@ -1897,10 +2001,32 @@ impl Theme {
     }
 
     const TOKENS: [&'static str; 26] = [
-        "surface", "surface_alt", "overlay", "border", "border_dim", "text_bright", "text",
-        "text_muted", "text_faint", "text_ghost", "select_bg", "select_bg_dim", "primary",
-        "accent", "accent_dim", "info", "success", "success_dim", "failure", "failure_dim",
-        "warning", "unknown", "row_failure", "row_running", "row_queued", "row_idle",
+        "surface",
+        "surface_alt",
+        "overlay",
+        "border",
+        "border_dim",
+        "text_bright",
+        "text",
+        "text_muted",
+        "text_faint",
+        "text_ghost",
+        "select_bg",
+        "select_bg_dim",
+        "primary",
+        "accent",
+        "accent_dim",
+        "info",
+        "success",
+        "success_dim",
+        "failure",
+        "failure_dim",
+        "warning",
+        "unknown",
+        "row_failure",
+        "row_running",
+        "row_queued",
+        "row_idle",
     ];
 
     /// The house palette: cool slate, cyan headings, amber for anything moving.
@@ -2111,7 +2237,8 @@ pub struct AppState {
     /// Keyed by checkout as well as name because the dashboard asks about
     /// several repos in one session, and `tests.yml` is a different file with
     /// different `needs:` edges in each of them.
-    pub workflow_graphs: HashMap<String, (Option<std::time::SystemTime>, Option<Arc<WorkflowGraph>>)>,
+    pub workflow_graphs:
+        HashMap<String, (Option<std::time::SystemTime>, Option<Arc<WorkflowGraph>>)>,
     /// The checkout jog was launched in, when there is one — where the
     /// workflow YAML behind `run_shape` is read from.
     pub repo_root: Option<PathBuf>,
@@ -2452,7 +2579,13 @@ pub struct WatchTail {
 }
 
 impl AppState {
-    pub fn new(repo_label: String, current_branch: String, mut workflows: Vec<Workflow>, keymap: KeymapConfig, history: History) -> Self {
+    pub fn new(
+        repo_label: String,
+        current_branch: String,
+        mut workflows: Vec<Workflow>,
+        keymap: KeymapConfig,
+        history: History,
+    ) -> Self {
         for w in &mut workflows {
             if let Some(entry) = history.last_run(&w.file_name) {
                 w.last_run_at = Some(entry.created_at);
@@ -2872,7 +3005,10 @@ impl AppState {
     /// The dashboard twin of [`stages_of`](Self::stages_of): a row's run, read
     /// against that row's own checkout.
     pub fn dash_stages(&self, spec: &str, detail: &RunDetail) -> Vec<Vec<NodeGroup>> {
-        stages(&detail.jobs, self.dash_graph_of(spec, &detail.run).as_deref())
+        stages(
+            &detail.jobs,
+            self.dash_graph_of(spec, &detail.run).as_deref(),
+        )
     }
 
     /// The dashboard twin of [`graph_known`](Self::graph_known).
@@ -2994,7 +3130,9 @@ impl AppState {
     /// The detail view's rows for the run on screen.
     pub fn detail_items(&self) -> Vec<DetailItem> {
         match &self.run_detail {
-            Some(d) => build_detail_items(d, &self.run_shape, &|k, legs| self.group_is_open(k, legs)),
+            Some(d) => {
+                build_detail_items(d, &self.run_shape, &|k, legs| self.group_is_open(k, legs))
+            }
             None => Vec::new(),
         }
     }
@@ -3066,7 +3204,11 @@ impl AppState {
     }
 
     pub fn current_step_idx(&self) -> Option<usize> {
-        if self.log_step_names.is_empty() { None } else { self.log_section_idx }
+        if self.log_step_names.is_empty() {
+            None
+        } else {
+            self.log_section_idx
+        }
     }
 
     pub fn selected_workflow(&self) -> Option<&Workflow> {
@@ -3122,7 +3264,11 @@ impl AppState {
     fn compute_focus_hidden(&self) -> HashSet<usize> {
         let ctx = self.log_focus_context;
         let mut keep = HashSet::new();
-        for &i in self.log_error_lines.iter().chain(self.log_warn_lines.iter()) {
+        for &i in self
+            .log_error_lines
+            .iter()
+            .chain(self.log_warn_lines.iter())
+        {
             let lo = i.saturating_sub(ctx);
             let hi = (i + ctx).min(self.log_lines.len().saturating_sub(1));
             for l in lo..=hi {
@@ -3349,7 +3495,9 @@ impl AppState {
     pub fn recompute_log_matches(&mut self) {
         self.log_search_matches.clear();
         self.log_search_match_idx = None;
-        let Some(q) = self.log_search_query.as_deref() else { return };
+        let Some(q) = self.log_search_query.as_deref() else {
+            return;
+        };
         if q.is_empty() {
             return;
         }
@@ -3385,7 +3533,10 @@ impl AppState {
 
         let time_style = Style::default().fg(self.theme.text_ghost);
 
-        let header_to_group: HashMap<usize, usize> = self.log_groups.iter().enumerate()
+        let header_to_group: HashMap<usize, usize> = self
+            .log_groups
+            .iter()
+            .enumerate()
             .map(|(gi, g)| (g.header_line, gi))
             .collect();
 
@@ -3461,83 +3612,108 @@ impl AppState {
                 let (time, content) = split_time_prefix(l.as_str());
                 let mk_time = || time.map(|t| Span::styled(format!("{t} "), time_style));
 
-            let line: Line = if let Some(&gi) = header_to_group.get(&src_idx) {
-                let is_collapsed = collapsed.contains(&gi);
-                let title = content.strip_prefix("##[group]")
-                    .or_else(|| content.strip_prefix("##[section]"))
-                    .unwrap_or(content);
-                let title_style = Style::default().fg(self.theme.primary).bold();
-                let arrow = if is_collapsed { "▶ " } else { "▾ " };
-                let mut spans = vec![];
-                if let Some(ts) = mk_time() { spans.push(ts); }
-                spans.push(Span::styled(arrow, title_style));
-                spans.extend(ansi_line_to_spans(title, title_style));
-                Line::from(spans)
-            } else if let Some(cmd) = content.strip_prefix("##[command]") {
-                let mut spans = vec![];
-                if let Some(ts) = mk_time() { spans.push(ts); }
-                spans.push(Span::styled("▶ ", Style::default().fg(self.theme.success).bold()));
-                spans.extend(ansi_line_to_spans(cmd, Style::default().fg(self.theme.text_bright)));
-                Line::from(spans)
-            } else if let Some(msg) = content.strip_prefix("##[error]") {
-                let s = Style::default().fg(self.theme.failure).bold();
-                let mut spans = vec![];
-                if let Some(ts) = mk_time() { spans.push(ts); }
-                spans.push(Span::styled("✗ ", s));
-                spans.extend(ansi_line_to_spans(msg, s));
-                Line::from(spans)
-            } else if let Some(msg) = content.strip_prefix("##[warning]") {
-                let s = Style::default().fg(self.theme.warning);
-                let mut spans = vec![];
-                if let Some(ts) = mk_time() { spans.push(ts); }
-                spans.push(Span::styled("⚠ ", s.bold()));
-                spans.extend(ansi_line_to_spans(msg, s));
-                Line::from(spans)
-            } else if let Some(msg) = content.strip_prefix("##[debug]") {
-                let s = Style::default().fg(self.theme.text_faint);
-                let mut spans = vec![];
-                if let Some(ts) = mk_time() { spans.push(ts); }
-                spans.push(Span::styled("# ", s));
-                spans.extend(ansi_line_to_spans(msg, s));
-                Line::from(spans)
-            } else if let Some(msg) = content.strip_prefix("##[notice]") {
-                let s = Style::default().fg(self.theme.primary);
-                let mut spans = vec![];
-                if let Some(ts) = mk_time() { spans.push(ts); }
-                spans.push(Span::styled("ℹ ", s));
-                spans.extend(ansi_line_to_spans(msg, s));
-                Line::from(spans)
-            } else {
-                // Keyword detection runs on plain text regardless of ANSI presence.
-                // For ANSI lines the detected style becomes the default that ANSI
-                // resets (`\x1b[0m`) fall back to, so "FAILED" lines stay red even
-                // after the escape sequence ends.
-                let plain = if content.contains('\x1b') {
-                    strip_ansi(content)
+                let line: Line = if let Some(&gi) = header_to_group.get(&src_idx) {
+                    let is_collapsed = collapsed.contains(&gi);
+                    let title = content
+                        .strip_prefix("##[group]")
+                        .or_else(|| content.strip_prefix("##[section]"))
+                        .unwrap_or(content);
+                    let title_style = Style::default().fg(self.theme.primary).bold();
+                    let arrow = if is_collapsed { "▶ " } else { "▾ " };
+                    let mut spans = vec![];
+                    if let Some(ts) = mk_time() {
+                        spans.push(ts);
+                    }
+                    spans.push(Span::styled(arrow, title_style));
+                    spans.extend(ansi_line_to_spans(title, title_style));
+                    Line::from(spans)
+                } else if let Some(cmd) = content.strip_prefix("##[command]") {
+                    let mut spans = vec![];
+                    if let Some(ts) = mk_time() {
+                        spans.push(ts);
+                    }
+                    spans.push(Span::styled(
+                        "▶ ",
+                        Style::default().fg(self.theme.success).bold(),
+                    ));
+                    spans.extend(ansi_line_to_spans(
+                        cmd,
+                        Style::default().fg(self.theme.text_bright),
+                    ));
+                    Line::from(spans)
+                } else if let Some(msg) = content.strip_prefix("##[error]") {
+                    let s = Style::default().fg(self.theme.failure).bold();
+                    let mut spans = vec![];
+                    if let Some(ts) = mk_time() {
+                        spans.push(ts);
+                    }
+                    spans.push(Span::styled("✗ ", s));
+                    spans.extend(ansi_line_to_spans(msg, s));
+                    Line::from(spans)
+                } else if let Some(msg) = content.strip_prefix("##[warning]") {
+                    let s = Style::default().fg(self.theme.warning);
+                    let mut spans = vec![];
+                    if let Some(ts) = mk_time() {
+                        spans.push(ts);
+                    }
+                    spans.push(Span::styled("⚠ ", s.bold()));
+                    spans.extend(ansi_line_to_spans(msg, s));
+                    Line::from(spans)
+                } else if let Some(msg) = content.strip_prefix("##[debug]") {
+                    let s = Style::default().fg(self.theme.text_faint);
+                    let mut spans = vec![];
+                    if let Some(ts) = mk_time() {
+                        spans.push(ts);
+                    }
+                    spans.push(Span::styled("# ", s));
+                    spans.extend(ansi_line_to_spans(msg, s));
+                    Line::from(spans)
+                } else if let Some(msg) = content.strip_prefix("##[notice]") {
+                    let s = Style::default().fg(self.theme.primary);
+                    let mut spans = vec![];
+                    if let Some(ts) = mk_time() {
+                        spans.push(ts);
+                    }
+                    spans.push(Span::styled("ℹ ", s));
+                    spans.extend(ansi_line_to_spans(msg, s));
+                    Line::from(spans)
                 } else {
-                    content.to_string()
+                    // Keyword detection runs on plain text regardless of ANSI presence.
+                    // For ANSI lines the detected style becomes the default that ANSI
+                    // resets (`\x1b[0m`) fall back to, so "FAILED" lines stay red even
+                    // after the escape sequence ends.
+                    let plain = if content.contains('\x1b') {
+                        strip_ansi(content)
+                    } else {
+                        content.to_string()
+                    };
+                    let trimmed_lower = plain.trim_start().to_lowercase();
+                    let base = if trimmed_lower.starts_with("error")
+                        || trimmed_lower.starts_with("failed")
+                    {
+                        Style::default().fg(self.theme.failure)
+                    } else if trimmed_lower.starts_with("warn") {
+                        Style::default().fg(self.theme.warning)
+                    } else if trimmed_lower.starts_with('=')
+                        && trimmed_lower.len() > 3
+                        && trimmed_lower[..4].chars().all(|c| c == '=')
+                    {
+                        Style::default().fg(self.theme.warning).bold()
+                    } else if trimmed_lower.starts_with('-')
+                        && trimmed_lower.len() > 3
+                        && trimmed_lower[..4].chars().all(|c| c == '-')
+                    {
+                        Style::default().fg(self.theme.text_faint)
+                    } else {
+                        Style::default().fg(self.theme.text)
+                    };
+                    let mut spans = vec![];
+                    if let Some(ts) = mk_time() {
+                        spans.push(ts);
+                    }
+                    spans.extend(ansi_line_to_spans(content, base));
+                    Line::from(spans)
                 };
-                let trimmed_lower = plain.trim_start().to_lowercase();
-                let base = if trimmed_lower.starts_with("error") || trimmed_lower.starts_with("failed") {
-                    Style::default().fg(self.theme.failure)
-                } else if trimmed_lower.starts_with("warn") {
-                    Style::default().fg(self.theme.warning)
-                } else if trimmed_lower.starts_with('=') && trimmed_lower.len() > 3
-                    && trimmed_lower[..4].chars().all(|c| c == '=')
-                {
-                    Style::default().fg(self.theme.warning).bold()
-                } else if trimmed_lower.starts_with('-') && trimmed_lower.len() > 3
-                    && trimmed_lower[..4].chars().all(|c| c == '-')
-                {
-                    Style::default().fg(self.theme.text_faint)
-                } else {
-                    Style::default().fg(self.theme.text)
-                };
-                let mut spans = vec![];
-                if let Some(ts) = mk_time() { spans.push(ts); }
-                spans.extend(ansi_line_to_spans(content, base));
-                Line::from(spans)
-            };
 
                 match needle_lower.as_deref() {
                     Some(needle) => highlight_line(line, needle, false, &self.theme),
@@ -3655,8 +3831,7 @@ fn is_test_failure(trimmed: &str) -> bool {
     let lower = trimmed.to_lowercase();
     // `failures:` — the header over the list of what broke. Not caught by the
     // `failed` prefix: the word is "failures".
-    lower.starts_with("failures:")
-        || (lower.starts_with("assertion") && lower.contains("failed"))
+    lower.starts_with("failures:") || (lower.starts_with("assertion") && lower.contains("failed"))
 }
 
 pub fn classify_log_severity(lines: &[String]) -> (Vec<usize>, Vec<usize>) {
@@ -3710,13 +3885,20 @@ pub fn parse_log_groups(lines: &[String]) -> Vec<LogGroup> {
         } else if is_endgroup {
             depth = depth.saturating_sub(1);
             if depth == 0
-                && let Some(start) = current_start.take() {
-                    groups.push(LogGroup { header_line: start, end_line: i });
-                }
+                && let Some(start) = current_start.take()
+            {
+                groups.push(LogGroup {
+                    header_line: start,
+                    end_line: i,
+                });
+            }
         }
     }
     if let Some(start) = current_start.take() {
-        groups.push(LogGroup { header_line: start, end_line: lines.len().saturating_sub(1) });
+        groups.push(LogGroup {
+            header_line: start,
+            end_line: lines.len().saturating_sub(1),
+        });
     }
     groups
 }
@@ -3863,7 +4045,11 @@ pub fn highlight_line(
     if needle.is_empty() {
         return line;
     }
-    let hit_bg = if current { theme.accent } else { theme.accent_dim };
+    let hit_bg = if current {
+        theme.accent
+    } else {
+        theme.accent_dim
+    };
     let hit_fg = theme.surface;
     let need: Vec<char> = needle.chars().collect();
 
@@ -4069,10 +4255,17 @@ mod tests {
         let p = TriggerPrompt::from_workflow(&wf, View::Workflows, Some(&recall));
         let field = |n: &str| p.fields.iter().find(|f| f.name == n).unwrap();
         assert_eq!(field("env").value, "prod");
-        assert!(field("env").recalled, "a recall that changed the value is marked");
+        assert!(
+            field("env").recalled,
+            "a recall that changed the value is marked"
+        );
         assert_eq!(field("tag").value, "v3");
         assert!(field("tag").recalled);
-        assert_eq!(field("mode").value, "fast", "an invalid recall falls back to the default");
+        assert_eq!(
+            field("mode").value,
+            "fast",
+            "an invalid recall falls back to the default"
+        );
         assert!(!field("mode").recalled);
 
         // Without history the defaults stand, unmarked.
@@ -4086,7 +4279,10 @@ mod tests {
     }
 
     fn section(label: &'static str, text: &str) -> crate::git::DiffSection {
-        crate::git::DiffSection { label, text: text.to_string() }
+        crate::git::DiffSection {
+            label,
+            text: text.to_string(),
+        }
     }
 
     /// A batch over three repos, already past the message box.
@@ -4119,7 +4315,11 @@ mod tests {
         b.choose(BatchAction::BackToMain);
         assert!(b.is_working() && b.input.is_none());
         drive(&mut b, |_| Ok("main @ abc".into()));
-        assert_eq!(b.phase, BatchPhase::Done, "nothing to push after a checkout");
+        assert_eq!(
+            b.phase,
+            BatchPhase::Done,
+            "nothing to push after a checkout"
+        );
 
         let items = vec![BatchItem::new("acme/r0".into(), PathBuf::from("/tmp/r0"))];
         let mut b = BatchCommit::pick(items, 0);
@@ -4131,7 +4331,11 @@ mod tests {
 
         let mut b = BatchCommit::pick(Vec::new(), 0);
         b.choose(BatchAction::Run);
-        assert_eq!(b.phase, BatchPhase::Compose, "a command has to be typed first");
+        assert_eq!(
+            b.phase,
+            BatchPhase::Compose,
+            "a command has to be typed first"
+        );
     }
 
     #[test]
@@ -4141,7 +4345,10 @@ mod tests {
         let first = b.advance(0).unwrap();
         assert_eq!(b.items[first].state, ItemState::Running);
         assert_eq!(
-            b.items.iter().filter(|i| i.state == ItemState::Running).count(),
+            b.items
+                .iter()
+                .filter(|i| i.state == ItemState::Running)
+                .count(),
             1
         );
         b.record("acme/r0", Ok("abc1234".into()));
@@ -4355,10 +4562,19 @@ mod tests {
         // The point of choosing the indexed colour ourselves is that shades
         // meant to differ still differ; a terminal rounding them itself is what
         // collapses a five-step text ramp into two.
-        let ramp = [t.text_bright, t.text, t.text_muted, t.text_faint, t.text_ghost];
+        let ramp = [
+            t.text_bright,
+            t.text,
+            t.text_muted,
+            t.text_faint,
+            t.text_ghost,
+        ];
         for (i, c) in ramp.iter().enumerate() {
             assert!(matches!(c, Color::Indexed(_)), "{i} not degraded");
-            assert!(!ramp[i + 1..].contains(c), "step {i} collapsed into a later one");
+            assert!(
+                !ramp[i + 1..].contains(c),
+                "step {i} collapsed into a later one"
+            );
         }
         // Status colours must not land on the same cell either.
         assert_ne!(t.success, t.failure);
@@ -4481,8 +4697,10 @@ mod tests {
             crate::history::History::default(),
         );
         let view = || GitView::new("acme/api".into(), PathBuf::from("/tmp/api"), true);
-        st.git_ops
-            .insert("acme/api".into(), GitOp::new("commit", Some("pre-commit".into()), 0));
+        st.git_ops.insert(
+            "acme/api".into(),
+            GitOp::new("commit", Some("pre-commit".into()), 0),
+        );
         st.git_view = Some(view());
         assert!(st.current_op().is_some());
 
@@ -4594,12 +4812,18 @@ mod tests {
         // Context counts on both sides and keeps its own number on each.
         assert_eq!(
             sides(&dv.rows[3]),
-            (Some(("ctx".into(), Some(12))), Some(("ctx".into(), Some(12))))
+            (
+                Some(("ctx".into(), Some(12))),
+                Some(("ctx".into(), Some(12)))
+            )
         );
         // The replaced line is one row, read across.
         assert_eq!(
             sides(&dv.rows[4]),
-            (Some(("old".into(), Some(13))), Some(("new".into(), Some(13))))
+            (
+                Some(("old".into(), Some(13))),
+                Some(("new".into(), Some(13)))
+            )
         );
         // The run is longer on one side, so the row opposite the extra line is
         // a gap rather than someone else's line pulled up into it.
@@ -4607,7 +4831,10 @@ mod tests {
         // And the numbering has diverged by exactly the line that was added.
         assert_eq!(
             sides(&dv.rows[6]),
-            (Some(("ctx2".into(), Some(14))), Some(("ctx2".into(), Some(15))))
+            (
+                Some(("ctx2".into(), Some(14))),
+                Some(("ctx2".into(), Some(15)))
+            )
         );
     }
 
@@ -4615,7 +4842,11 @@ mod tests {
     fn tabs_are_expanded_and_the_mark_moves_with_them() {
         let mut dv = GitDiffView::new("acme/api".into(), "src/a.rs".into());
         dv.set_sections(vec![section("unstaged", "-\tlet x = 1;\n+\tlet x = 2;\n")]);
-        let DiffRow::Pair { old: Some(old), new: Some(new) } = &dv.rows[2] else {
+        let DiffRow::Pair {
+            old: Some(old),
+            new: Some(new),
+        } = &dv.rows[2]
+        else {
             panic!("not a pair: {:?}", dv.rows[2]);
         };
         // A raw tab jumps to the terminal's own stop, measured from the edge of
@@ -4641,7 +4872,10 @@ mod tests {
         let mut dv = GitDiffView::new("acme/api".into(), "src/a.rs".into());
         // Two deletions, one addition: pairing the first `-` with the `+`
         // would be a guess, and a wrong one marks unrelated lines.
-        dv.set_sections(vec![section("unstaged", "-let a = 1;\n-let b = 1;\n+let a = 2;\n")]);
+        dv.set_sections(vec![section(
+            "unstaged",
+            "-let a = 1;\n-let b = 1;\n+let a = 2;\n",
+        )]);
         // Two leading `None`s for the file's band and the blank under it.
         assert_eq!(dv.emphasis, vec![None, None, None, None, None]);
     }
@@ -4714,8 +4948,14 @@ mod tests {
             DiffLine::File { path, add: 1, del: 1 } if path == "b.rs"
         ));
         // The clear cut: two empty rows before the next file's band.
-        assert_eq!(dv.lines[dv.file_lines[1] - 1], DiffLine::Text(String::new()));
-        assert_eq!(dv.lines[dv.file_lines[1] - 2], DiffLine::Text(String::new()));
+        assert_eq!(
+            dv.lines[dv.file_lines[1] - 1],
+            DiffLine::Text(String::new())
+        );
+        assert_eq!(
+            dv.lines[dv.file_lines[1] - 2],
+            DiffLine::Text(String::new())
+        );
         // The bands survive the fold into side-by-side rows, where the jump
         // indices point straight at them.
         assert!(matches!(dv.rows[dv.file_rows[0]], DiffRow::File { .. }));
@@ -4745,7 +4985,11 @@ mod tests {
         dv.set_files(vec![("a.rs".into(), vec![section("unstaged", "+one\n")])]);
         assert_eq!(
             dv.lines.first(),
-            Some(&DiffLine::File { path: "a.rs".into(), add: 1, del: 0 })
+            Some(&DiffLine::File {
+                path: "a.rs".into(),
+                add: 1,
+                del: 0
+            })
         );
         // And it is the top of the file in both layouts, as before.
         assert_eq!(dv.file_lines, vec![0]);
@@ -4762,8 +5006,6 @@ mod tests {
         dv.set_sections(vec![section("unstaged", "+z\n")]);
         assert_eq!(dv.scroll.get(), 0);
     }
-
-
 
     #[test]
     fn decorate_marks_only_the_cursor_row() {
@@ -4855,7 +5097,13 @@ mod tests {
             History::default(),
         );
         st.log_lines = (0..1000)
-            .map(|i| if i % 7 == 0 { format!("needle {i}") } else { format!("plain {i}") })
+            .map(|i| {
+                if i % 7 == 0 {
+                    format!("needle {i}")
+                } else {
+                    format!("plain {i}")
+                }
+            })
             .collect();
         st.log_search_query = Some("needle".into());
         st.recompute_log_matches();
@@ -4955,7 +5203,6 @@ mod tests {
         assert_eq!(st.log_scroll, 1, "scrolled back up");
     }
 
-
     // ── Performance probes ────────────────────────────────────────────────
     // Run with: cargo test --release perf_ -- --nocapture --test-threads=1
 
@@ -5033,7 +5280,9 @@ mod tests {
         // Scrolling to the bottom, the worst case for keep_cursor_visible.
         st.log_scroll = 0;
         st.log_line_cursor = st.log_rendered.len() - 1;
-        timed("keep_cursor_visible (0 -> end)", || st.keep_cursor_visible());
+        timed("keep_cursor_visible (0 -> end)", || {
+            st.keep_cursor_visible()
+        });
 
         st.log_search_query = Some("failure".into());
         timed("recompute_log_matches", || st.recompute_log_matches());
@@ -5219,7 +5468,8 @@ mod tests {
     }
 
     fn fold_counts(st: &AppState) -> Vec<usize> {
-        let mut rows: Vec<(usize, usize)> = st.log_fold_rows.iter().map(|(&r, &n)| (r, n)).collect();
+        let mut rows: Vec<(usize, usize)> =
+            st.log_fold_rows.iter().map(|(&r, &n)| (r, n)).collect();
         rows.sort();
         rows.into_iter().map(|(_, n)| n).collect()
     }
@@ -5389,7 +5639,10 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert_eq!(tail, "x\x1b", "a lone ESC is not a sequence, so it is content");
+        assert_eq!(
+            tail, "x\x1b",
+            "a lone ESC is not a sequence, so it is content"
+        );
 
         // And a well-formed sequence still splits and styles as before.
         let ok = ansi_line_to_spans("a\x1b[31mb\x1b[0mc", Style::default());
@@ -5401,9 +5654,8 @@ mod tests {
     #[test]
     fn highlighting_survives_characters_whose_lowercase_is_a_different_length() {
         let theme = Theme::midnight();
-        let text_of = |l: &Line<'static>| -> String {
-            l.spans.iter().map(|s| s.content.as_ref()).collect()
-        };
+        let text_of =
+            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
 
         // U+212A KELVIN SIGN: three bytes in, one byte out. Offsets taken from
         // the lowercased copy used to land inside it.
@@ -5413,10 +5665,19 @@ mod tests {
             false,
             &theme,
         );
-        assert_eq!(text_of(&out), "\u{212A} error here", "no character is lost or doubled");
+        assert_eq!(
+            text_of(&out),
+            "\u{212A} error here",
+            "no character is lost or doubled"
+        );
 
         // U+0130: two bytes in, three out — offsets ran off the end instead.
-        let out = highlight_line(Line::from(Span::raw("\u{130}error")), "error", false, &theme);
+        let out = highlight_line(
+            Line::from(Span::raw("\u{130}error")),
+            "error",
+            false,
+            &theme,
+        );
         assert_eq!(text_of(&out), "\u{130}error");
 
         // A needle matching *inside* one character's expansion highlights that
@@ -5435,7 +5696,10 @@ mod tests {
             &theme,
         );
         let joined: String = out.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(joined, "Error: an ERROR and an error", "text is preserved exactly");
+        assert_eq!(
+            joined, "Error: an ERROR and an error",
+            "text is preserved exactly"
+        );
         // Three hits, case-insensitively, each carrying the hit background.
         let hits: Vec<&str> = out
             .spans

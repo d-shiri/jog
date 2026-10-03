@@ -57,8 +57,7 @@ pub fn emoji_width_safe(s: &str) -> String {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         out.push(c);
-        let followed_by_selector =
-            matches!(chars.peek(), Some('\u{FE0E}') | Some('\u{FE0F}'));
+        let followed_by_selector = matches!(chars.peek(), Some('\u{FE0E}') | Some('\u{FE0F}'));
         if !followed_by_selector
             && ('\u{1F000}'..='\u{1FAFF}').contains(&c)
             && UnicodeWidthChar::width(c) == Some(1)
@@ -104,10 +103,7 @@ impl Workflow {
     }
 
     /// Apply YAML defaults on top of user-supplied inputs.
-    pub fn merge_defaults(
-        &self,
-        user: HashMap<String, String>,
-    ) -> HashMap<String, String> {
+    pub fn merge_defaults(&self, user: HashMap<String, String>) -> HashMap<String, String> {
         let mut out = HashMap::new();
         for inp in &self.inputs {
             if let Some(d) = &inp.default {

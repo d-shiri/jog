@@ -408,8 +408,8 @@ fn read_table(path: &Path) -> Result<toml::Table> {
     if !path.exists() {
         return Ok(toml::Table::new());
     }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("read config {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
     raw.parse::<toml::Table>()
         .with_context(|| format!("parse config {}", path.display()))
 }
@@ -526,9 +526,11 @@ mod tests {
     fn a_repo_points_service_health_at_its_own_page() {
         let cfg = Config::layer(
             table(GLOBAL),
-            table(r#"[uptime_kuma]
+            table(
+                r#"[uptime_kuma]
                      url = "https://status.other.dev"
-                     status_page = "public""#),
+                     status_page = "public""#,
+            ),
         )
         .unwrap();
         let k = cfg.uptime_kuma.expect("still configured");
@@ -544,8 +546,10 @@ mod tests {
         // machine's settings and have no business being retyped per project.
         let cfg = Config::layer(
             table(GLOBAL),
-            table(r#"[uptime_kuma]
-                     status_page = "checkout""#),
+            table(
+                r#"[uptime_kuma]
+                     status_page = "checkout""#,
+            ),
         )
         .unwrap();
         let k = cfg.uptime_kuma.unwrap();
@@ -556,32 +560,49 @@ mod tests {
 
     #[test]
     fn an_empty_url_turns_service_health_off_for_this_repo() {
-        let cfg = Config::layer(table(GLOBAL), table(r#"[uptime_kuma]
-                                                        url = """#))
-            .unwrap();
-        assert!(cfg.uptime_kuma.is_none(), "no column, no tally, no requests");
+        let cfg = Config::layer(
+            table(GLOBAL),
+            table(
+                r#"[uptime_kuma]
+                                                        url = """#,
+            ),
+        )
+        .unwrap();
+        assert!(
+            cfg.uptime_kuma.is_none(),
+            "no column, no tally, no requests"
+        );
     }
 
     #[test]
     fn sub_tables_merge_rather_than_replace_each_other() {
         let cfg = Config::layer(
             table(GLOBAL),
-            table(r#"[ui]
-                     theme = "paper""#),
+            table(
+                r#"[ui]
+                     theme = "paper""#,
+            ),
         )
         .unwrap();
         assert_eq!(cfg.ui.theme, "paper");
         // Setting the theme locally must not erase the global colour overrides.
-        assert_eq!(cfg.ui.colors.get("accent").map(String::as_str), Some("#ff0000"));
+        assert_eq!(
+            cfg.ui.colors.get("accent").map(String::as_str),
+            Some("#ff0000")
+        );
     }
 
     #[test]
     fn a_repo_can_name_the_others_it_wants_beside_it() {
         let cfg = Config::layer(
-            table(r#"[provider]
-                     repos = ["acme/one"]"#),
-            table(r#"[provider]
-                     repos = ["acme/two", "acme/three"]"#),
+            table(
+                r#"[provider]
+                     repos = ["acme/one"]"#,
+            ),
+            table(
+                r#"[provider]
+                     repos = ["acme/two", "acme/three"]"#,
+            ),
         )
         .unwrap();
         // Arrays replace whole: a half-overridden list is nobody's intent.

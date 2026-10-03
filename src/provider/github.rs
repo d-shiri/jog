@@ -56,9 +56,10 @@ pub fn parse_remote_url(url: &str) -> Result<RepoSpec> {
 
 pub fn resolve_token() -> Result<String> {
     if let Ok(t) = std::env::var("GITHUB_TOKEN")
-        && !t.is_empty() {
-            return Ok(t);
-        }
+        && !t.is_empty()
+    {
+        return Ok(t);
+    }
     let out = match Command::new("gh").args(["auth", "token"]).output() {
         Ok(o) => o,
         Err(_) => {
@@ -195,12 +196,19 @@ pub struct ApiError {
 /// truncates away the answer. The row already names the repo and the column
 /// already means "latest run", so the call is the one part worth dropping.
 pub fn classify_error(err: &anyhow::Error) -> ApiError {
-    if let Some(gh) = err.chain().find_map(|c| c.downcast_ref::<octocrab::Error>()) {
+    if let Some(gh) = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<octocrab::Error>())
+    {
         return classify_octocrab(gh);
     }
     // Not an API failure at all (unparseable remote, git, io). The innermost
     // cause is the specific one; the layers above only say where it surfaced.
-    let root = err.chain().last().map(|c| c.to_string()).unwrap_or_default();
+    let root = err
+        .chain()
+        .last()
+        .map(|c| c.to_string())
+        .unwrap_or_default();
     ApiError {
         fault: ApiFault::Other,
         text: first_line(&root, "failed"),
@@ -421,18 +429,21 @@ impl GitHubProvider {
             .send()
             .await
             .context("list pull requests")?;
-        Ok(page.items.into_iter().next().map(|pr| crate::provider::PrInfo {
-            number: pr.number,
-            title: crate::provider::emoji_width_safe(&pr.title.unwrap_or_default()),
-            url: pr
-                .html_url
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| format!(
-                    "https://github.com/{}/{}/pull/{}",
-                    self.repo.owner, self.repo.repo, pr.number
-                )),
-            draft: pr.draft.unwrap_or(false),
-        }))
+        Ok(page
+            .items
+            .into_iter()
+            .next()
+            .map(|pr| crate::provider::PrInfo {
+                number: pr.number,
+                title: crate::provider::emoji_width_safe(&pr.title.unwrap_or_default()),
+                url: pr.html_url.map(|u| u.to_string()).unwrap_or_else(|| {
+                    format!(
+                        "https://github.com/{}/{}/pull/{}",
+                        self.repo.owner, self.repo.repo, pr.number
+                    )
+                }),
+                draft: pr.draft.unwrap_or(false),
+            }))
     }
 
     /// Bank the budget an answer arrived with, when it carried one.
@@ -504,8 +515,11 @@ impl GitHubProvider {
             // throwing them away: both callers answer `Err` by discarding the
             // whole poll, so propagating here would trade a run that is one leg
             // short for a strip that does not update at all.
-            let Ok(Some(mut p)) =
-                gated(self.crab.get_page::<octocrab::models::workflows::Job>(&page.next)).await
+            let Ok(Some(mut p)) = gated(
+                self.crab
+                    .get_page::<octocrab::models::workflows::Job>(&page.next),
+            )
+            .await
             else {
                 break;
             };
@@ -534,7 +548,10 @@ impl GitHubProvider {
         );
         let prev = lock(&self.run_etags).get(&key).map(|c| c.etag.clone());
         let mut headers = http::HeaderMap::new();
-        if let Some(etag) = prev.as_deref().and_then(|e| http::HeaderValue::from_str(e).ok()) {
+        if let Some(etag) = prev
+            .as_deref()
+            .and_then(|e| http::HeaderValue::from_str(e).ok())
+        {
             headers.insert(http::header::IF_NONE_MATCH, etag);
         }
         let resp = gated(self.crab._get_with_headers(route.as_str(), Some(headers)))
@@ -583,7 +600,13 @@ impl GitHubProvider {
         let runs = parse_runs_page(&body).context("parse repo runs")?;
         match etag {
             Some(etag) => {
-                lock(&self.run_etags).insert(key.to_string(), CachedRuns { etag, runs: runs.clone() });
+                lock(&self.run_etags).insert(
+                    key.to_string(),
+                    CachedRuns {
+                        etag,
+                        runs: runs.clone(),
+                    },
+                );
             }
             // No validator means the next request cannot be conditional; a
             // stale entry left behind would pair last poll's runs with an
@@ -716,9 +739,7 @@ fn parse_runs_page(body: &str) -> Result<Vec<Run>> {
 
 fn map_run(r: gh_workflows::Run) -> Run {
     let status = parse_run_status(&r.status, r.conclusion.as_deref());
-    let commit_msg = super::emoji_width_safe(
-        r.head_commit.message.lines().next().unwrap_or(""),
-    );
+    let commit_msg = super::emoji_width_safe(r.head_commit.message.lines().next().unwrap_or(""));
     Run {
         id: r.id.0,
         display_title: super::emoji_width_safe(&r.name),
@@ -815,26 +836,26 @@ impl Provider for GitHubProvider {
             // as a blank row that can't be opened or triggered.
             .filter(|wf| !wf.path.trim().is_empty())
             .map(|wf| async move {
-            let file_name = wf
-                .path
-                .rsplit('/')
-                .next()
-                .unwrap_or(wf.path.as_str())
-                .to_string();
-            let parsed = self
-                .fetch_workflow_yaml(&wf.path)
-                .await
-                .ok()
-                .and_then(|raw| super::discovery::parse_workflow_str(&raw, &file_name).ok());
-            parsed.unwrap_or(Workflow {
-                name: super::emoji_width_safe(&wf.name),
-                file_name,
-                triggerable: false,
-                last_status: None,
-                last_run_at: None,
-                inputs: Vec::new(),
-            })
-        });
+                let file_name = wf
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(wf.path.as_str())
+                    .to_string();
+                let parsed = self
+                    .fetch_workflow_yaml(&wf.path)
+                    .await
+                    .ok()
+                    .and_then(|raw| super::discovery::parse_workflow_str(&raw, &file_name).ok());
+                parsed.unwrap_or(Workflow {
+                    name: super::emoji_width_safe(&wf.name),
+                    file_name,
+                    triggerable: false,
+                    last_status: None,
+                    last_run_at: None,
+                    inputs: Vec::new(),
+                })
+            });
 
         let mut out = futures::future::join_all(fetches).await;
         out.sort_by_key(|w| w.name.to_lowercase());
@@ -918,7 +939,11 @@ impl Provider for GitHubProvider {
         }
         let chunks: Vec<Result<LogChunk>> = text
             .lines()
-            .map(|l| Ok(LogChunk { line: clean_log_line(l) }))
+            .map(|l| {
+                Ok(LogChunk {
+                    line: clean_log_line(l),
+                })
+            })
             .collect();
         Ok(futures::stream::iter(chunks).boxed())
     }
@@ -960,11 +985,7 @@ impl Provider for GitHubProvider {
             "/repos/{}/{}/actions/runs/{}/rerun",
             self.repo.owner, self.repo.repo, run_id
         );
-        let resp = self
-            .crab
-            ._post(route, None::<&()>)
-            .await
-            .context("rerun")?;
+        let resp = self.crab._post(route, None::<&()>).await.context("rerun")?;
         if !resp.status().is_success() {
             return Err(octocrab::map_github_error(resp).await.unwrap_err().into());
         }
@@ -1028,9 +1049,10 @@ fn extract_time(s: &str) -> (Option<&str>, &str) {
         && s.as_bytes().get(13) == Some(&b':')
         && s.as_bytes().get(16) == Some(&b':')
         && let Some(hms) = s.get(11..19)
-        && let Some(idx) = s.find(' ') {
-            return (Some(hms), &s[idx + 1..]);
-        }
+        && let Some(idx) = s.find(' ')
+    {
+        return (Some(hms), &s[idx + 1..]);
+    }
     (None, s)
 }
 
@@ -1042,7 +1064,9 @@ fn extract_time(s: &str) -> (Option<&str>, &str) {
 /// more, so the floor of 3 happened to stay below it, but a caller wanting one
 /// or two runs would have brought the poll down instead of shortening it.
 fn runs_per_workflow(limit: u8, files: usize) -> u8 {
-    (limit as usize / files.max(1)).max(3).min(limit.max(1) as usize) as u8
+    (limit as usize / files.max(1))
+        .max(3)
+        .min(limit.max(1) as usize) as u8
 }
 
 #[cfg(test)]
@@ -1104,7 +1128,10 @@ mod tests {
         assert_eq!(runs[0].display_title, "Deploy to Stage");
         assert_eq!(runs[0].status, Status::Success);
         // The bare name, which is what the rest of jog calls a workflow by.
-        assert_eq!(runs[0].workflow_file.as_deref(), Some("deploy_to_stage.yml"));
+        assert_eq!(
+            runs[0].workflow_file.as_deref(),
+            Some("deploy_to_stage.yml")
+        );
     }
 
     /// A body without the field still has to parse — it is the run list, and
@@ -1144,7 +1171,10 @@ mod tests {
             b.iter().map(|r| r.id).collect::<Vec<_>>(),
             "a 304 must replay exactly what the 200 said"
         );
-        assert!(!a.is_empty(), "cli/cli runs CI; an empty answer is a parse bug");
+        assert!(
+            !a.is_empty(),
+            "cli/cli runs CI; an empty answer is a parse bug"
+        );
     }
 
     fn rate_headers(pairs: &[(&str, &str)]) -> http::HeaderMap {
@@ -1283,7 +1313,11 @@ mod tests {
         // Passes every separator check, then turns multi-byte across offset 19.
         // Slicing blind here took the whole TUI down from one malformed line.
         let raw = "2025-04-29T08:12:3\u{2764}\u{2764} rest";
-        assert_eq!(clean_log_line(raw), raw, "no timestamp found, so nothing is stripped");
+        assert_eq!(
+            clean_log_line(raw),
+            raw,
+            "no timestamp found, so nothing is stripped"
+        );
 
         // The genuine article still parses, including the tight variant where
         // the separating space lands exactly at the end of the HH:MM:SS window.

@@ -104,7 +104,11 @@ impl StatusEntry {
         if self.is_untracked() {
             return "untracked";
         }
-        match if self.index != ' ' { self.index } else { self.worktree } {
+        match if self.index != ' ' {
+            self.index
+        } else {
+            self.worktree
+        } {
             'M' => "modified",
             'A' => "added",
             'D' => "deleted",
@@ -359,7 +363,10 @@ pub fn hook_path(dir: &Path, hook: &str) -> Option<PathBuf> {
             if p.is_absolute() { p } else { dir.join(p) }
         }
         None => {
-            let git_dir = git(dir, &["rev-parse", "--git-dir"]).ok()?.trim().to_string();
+            let git_dir = git(dir, &["rev-parse", "--git-dir"])
+                .ok()?
+                .trim()
+                .to_string();
             let git_dir = PathBuf::from(&git_dir);
             let git_dir = if git_dir.is_absolute() {
                 git_dir
@@ -413,7 +420,14 @@ pub fn fingerprint(dir: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let git = dir.join(".git");
-    for rel in ["HEAD", "index", "packed-refs", "MERGE_HEAD", "refs", "refs/heads"] {
+    for rel in [
+        "HEAD",
+        "index",
+        "packed-refs",
+        "MERGE_HEAD",
+        "refs",
+        "refs/heads",
+    ] {
         // Absence is state too: MERGE_HEAD disappearing is a merge finishing.
         match std::fs::metadata(git.join(rel)) {
             Ok(m) => {
@@ -531,11 +545,7 @@ pub fn unstage(dir: &Path, path: &str) -> Result<()> {
 /// Streams rather than buffers: `on_line` sees the `pre-commit` hook's output
 /// while it is still running, so a test suite that takes a minute reports its
 /// progress instead of looking like a hang.
-pub fn commit(
-    dir: &Path,
-    message: &str,
-    on_line: &mut dyn FnMut(String, bool),
-) -> Result<String> {
+pub fn commit(dir: &Path, message: &str, on_line: &mut dyn FnMut(String, bool)) -> Result<String> {
     let (ok, lines) = git_streaming(dir, &["commit", "-m", message], on_line)?;
     let text = lines.join("\n");
     if !ok {
@@ -568,7 +578,16 @@ pub fn check_branch_name(name: &str) -> Result<()> {
 
 /// Whether a local branch called `name` exists.
 pub fn branch_exists(dir: &Path, name: &str) -> bool {
-    git(dir, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{name}")]).is_ok()
+    git(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{name}"),
+        ],
+    )
+    .is_ok()
 }
 
 /// `git checkout -b <name>` off the current HEAD.
@@ -582,21 +601,33 @@ pub fn create_branch(
 ) -> Result<String> {
     let (ok, lines) = git_streaming(dir, &["checkout", "-b", name], on_line)?;
     if !ok {
-        return Err(command_failure(dir, "checkout", "post-checkout", &lines.join("\n")));
+        return Err(command_failure(
+            dir,
+            "checkout",
+            "post-checkout",
+            &lines.join("\n"),
+        ));
     }
     Ok(name.to_string())
 }
 
 /// The repo's mainline: `main`, else `master`, else nothing.
 pub fn main_branch(dir: &Path) -> Option<&'static str> {
-    ["main", "master"].into_iter().find(|b| branch_exists(dir, b))
+    ["main", "master"]
+        .into_iter()
+        .find(|b| branch_exists(dir, b))
 }
 
 /// `git checkout <name>` of a branch that exists.
 pub fn checkout(dir: &Path, name: &str, on_line: &mut dyn FnMut(String, bool)) -> Result<()> {
     let (ok, lines) = git_streaming(dir, &["checkout", name], on_line)?;
     if !ok {
-        return Err(command_failure(dir, "checkout", "post-checkout", &lines.join("\n")));
+        return Err(command_failure(
+            dir,
+            "checkout",
+            "post-checkout",
+            &lines.join("\n"),
+        ));
     }
     Ok(())
 }
@@ -606,7 +637,12 @@ pub fn checkout(dir: &Path, name: &str, on_line: &mut dyn FnMut(String, bool)) -
 pub fn pull_ff(dir: &Path, on_line: &mut dyn FnMut(String, bool)) -> Result<()> {
     let (ok, lines) = git_streaming(dir, &["pull", "--ff-only"], on_line)?;
     if !ok {
-        return Err(command_failure(dir, "pull", "post-merge", &lines.join("\n")));
+        return Err(command_failure(
+            dir,
+            "pull",
+            "post-merge",
+            &lines.join("\n"),
+        ));
     }
     Ok(())
 }
@@ -626,7 +662,9 @@ pub fn open_pr(
     title: &str,
     on_line: &mut dyn FnMut(String, bool),
 ) -> Result<PrOutcome> {
-    let args = ["pr", "create", "--head", branch, "--title", title, "--body", ""];
+    let args = [
+        "pr", "create", "--head", branch, "--title", title, "--body", "",
+    ];
     let (ok, lines) = run_streaming("gh", dir, &args, on_line)?;
     let url = lines
         .iter()
@@ -643,7 +681,11 @@ pub fn open_pr(
 }
 
 /// Run `command` under `sh -c` in `dir`. Returns its last line of output.
-pub fn run_shell(dir: &Path, command: &str, on_line: &mut dyn FnMut(String, bool)) -> Result<String> {
+pub fn run_shell(
+    dir: &Path,
+    command: &str,
+    on_line: &mut dyn FnMut(String, bool),
+) -> Result<String> {
     let (ok, lines) = run_streaming("sh", dir, &["-c", command], on_line)?;
     let text = lines.join("\n");
     if !ok {
@@ -794,7 +836,6 @@ mod tests {
         assert!(!s.has_upstream);
         assert_eq!((s.ahead, s.behind), (0, 0));
     }
-
 
     #[test]
     fn branch_is_reported_even_when_clean() {
@@ -1039,7 +1080,10 @@ mod tests {
         // before the command finishes, instead of the screen sitting blank and
         // then filling in all at once.
         let early = early_at.expect("the first line never arrived");
-        assert!(total >= Duration::from_millis(900), "hook exited too fast to tell: {total:?}");
+        assert!(
+            total >= Duration::from_millis(900),
+            "hook exited too fast to tell: {total:?}"
+        );
         assert!(
             early < Duration::from_millis(500),
             "first line took {early:?} of a {total:?} command — that is buffered, not streamed"
@@ -1078,7 +1122,10 @@ mod tests {
         // The step's name must show up while the step is still running — that
         // unterminated line is the only sign of what the wait is for.
         let at = partial_at.expect("the running step's name never arrived");
-        assert!(total >= Duration::from_millis(900), "hook exited too fast to tell: {total:?}");
+        assert!(
+            total >= Duration::from_millis(900),
+            "hook exited too fast to tell: {total:?}"
+        );
         assert!(
             at < Duration::from_millis(500),
             "step name took {at:?} of a {total:?} hook — the running step was invisible"
@@ -1186,7 +1233,10 @@ mod tests {
         }
         // Not in `.git/hooks`, so a naive lookup would report no hook at all.
         git(&dir, &["config", "core.hooksPath", "tooling-hooks"]).unwrap();
-        assert_eq!(hook_path(&dir, "pre-commit"), Some(elsewhere.join("pre-commit")));
+        assert_eq!(
+            hook_path(&dir, "pre-commit"),
+            Some(elsewhere.join("pre-commit"))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1276,7 +1326,10 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec![PathBuf::from("alpha"), ["group", "beta"].iter().collect::<PathBuf>()]
+            vec![
+                PathBuf::from("alpha"),
+                ["group", "beta"].iter().collect::<PathBuf>()
+            ]
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
