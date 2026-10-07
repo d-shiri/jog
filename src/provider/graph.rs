@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_yml::Value;
 
-use super::Job;
+use super::{Job, Status};
 
 /// One piece of a compiled `name:` template.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +84,11 @@ pub struct Placement {
     pub feeds: bool,
     /// See [`JobSpec::ord`].
     pub ord: usize,
+    /// The job's key, `caller/inner` for a job inside a reusable workflow
+    /// call — what another job's `needs:` names it by.
+    pub key: String,
+    /// The keys this job waits on, in the same spelling as `key`.
+    pub needs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -215,6 +220,17 @@ impl WorkflowGraph {
                 // starts.
                 feeds: within.feeds || (spec.feeds && within.depth + 1 == inner.span()),
                 ord: spec.ord,
+                key: format!("{}/{}", spec.key, within.key),
+                // The call's first column waits on what the caller waits on.
+                needs: if within.needs.is_empty() {
+                    spec.needs.clone()
+                } else {
+                    within
+                        .needs
+                        .iter()
+                        .map(|n| format!("{}/{n}", spec.key))
+                        .collect()
+                },
             });
         }
         Some(Placement {
@@ -223,6 +239,8 @@ impl WorkflowGraph {
             band: spec.band.clone(),
             feeds: spec.feeds,
             ord: spec.ord,
+            key: spec.key.clone(),
+            needs: spec.needs.clone(),
         })
     }
 
@@ -268,6 +286,8 @@ impl WorkflowGraph {
                     band: s.band.clone(),
                     feeds: s.feeds,
                     ord: s.ord,
+                    key: s.key.clone(),
+                    needs: s.needs.clone(),
                 },
             })
             .collect()
@@ -537,6 +557,10 @@ pub struct NodeGroup {
     /// are not all alike: `guards` holds up the next column, while the box
     /// beside it holds up nothing, and only one of them has earned an arrow.
     pub feeds: bool,
+    /// The keys of the jobs inside, and the keys they wait on — what the
+    /// arrows between two columns are drawn from.
+    pub keys: Vec<String>,
+    pub needs: Vec<String>,
 }
 
 /// The same arrangement, kept in the columns the `needs:` edges put it in:
@@ -567,6 +591,8 @@ pub fn stages(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<Vec<NodeGroup>
                 // Behind everything that actually ran when they share a slot:
                 // what happened outranks what is merely going to.
                 first: usize::MAX,
+                key: u.at.key,
+                needs: u.at.needs,
                 node: RunNode::Pending {
                     key: u.key,
                     label: u.label,
@@ -588,20 +614,47 @@ pub fn stages(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<Vec<NodeGroup>
         }
         let boxes = &mut out.last_mut().expect("just pushed").1;
         match boxes.iter_mut().find(|b| b.band == p.band) {
-            Some(b) => b.nodes.push(p.node),
+            Some(b) => {
+                b.nodes.push(p.node);
+                if !b.keys.contains(&p.key) {
+                    b.keys.push(p.key);
+                }
+                for n in p.needs {
+                    if !b.needs.contains(&n) {
+                        b.needs.push(n);
+                    }
+                }
+            }
             None => boxes.push(NodeGroup {
                 nodes: vec![p.node],
                 band: p.band,
                 feeds: p.feeds,
+                keys: vec![p.key],
+                needs: p.needs,
             }),
         }
     }
     for (_, boxes) in out.iter_mut() {
-        // The box the chain runs through goes on top, where the arrow out of
-        // it has the shortest way to go — the run page puts it there too.
-        boxes.sort_by_key(|b| !b.feeds);
+        // A box whose every job was skipped sinks below the ones that ran or
+        // are running — the run page stacks `Matrix: images` above a skipped
+        // `frontend` beside it, whatever order the file declares them in.
+        // Among the rest, the box the chain runs through goes on top, where
+        // the arrow out of it has the shortest way to go. The sort is stable,
+        // so the file's order decides everything else.
+        boxes.sort_by_key(|b| (all_skipped(b, jobs), !b.feeds));
     }
     out.into_iter().map(|(_, boxes)| boxes).collect()
+}
+
+/// Did every job in the box get skipped? A stage the run has not reached has
+/// no job to say so, and is not.
+fn all_skipped(b: &NodeGroup, jobs: &[Job]) -> bool {
+    let mut legs = b.nodes.iter().flat_map(|n| match n {
+        RunNode::Job(i) => vec![*i],
+        RunNode::Matrix { legs, .. } => legs.clone(),
+        RunNode::Pending { .. } => vec![usize::MAX],
+    });
+    legs.all(|i| jobs.get(i).is_some_and(|j| j.status == Status::Skipped))
 }
 
 /// One node of the graph with everything the layout needs to place it.
@@ -613,6 +666,8 @@ struct Placed {
     /// it — the first decides the order, the second breaks its ties.
     ord: usize,
     first: usize,
+    key: String,
+    needs: Vec<String>,
     node: RunNode,
 }
 
@@ -622,6 +677,8 @@ fn laid_out(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<Placed> {
     let mut band_of: Vec<String> = vec![String::new(); jobs.len()];
     let mut feeds_of: Vec<bool> = vec![false; jobs.len()];
     let mut ord_of: Vec<usize> = vec![0; jobs.len()];
+    let mut key_of: Vec<String> = vec![String::new(); jobs.len()];
+    let mut needs_of: Vec<Vec<String>> = vec![Vec::new(); jobs.len()];
     match graph {
         Some(g) => {
             // A job nothing in the file matches — renamed since the run, most
@@ -633,12 +690,19 @@ fn laid_out(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<Placed> {
                 band: String::new(),
                 feeds: false,
                 ord: 0,
+                key: String::new(),
+                needs: Vec::new(),
             };
             for (i, job) in jobs.iter().enumerate() {
                 let at = g.place(&job.name).unwrap_or_else(|| Placement {
                     group: None,
+                    // Nothing in the file is this job, so nothing waits on it
+                    // by name.
+                    key: String::new(),
                     ..last.clone()
                 });
+                key_of[i] = at.key.clone();
+                needs_of[i] = at.needs.clone();
                 depth_of[i] = at.depth;
                 band_of[i] = at.band.clone();
                 feeds_of[i] = at.feeds;
@@ -706,6 +770,8 @@ fn laid_out(jobs: &[Job], graph: Option<&WorkflowGraph>) -> Vec<Placed> {
             feeds: feeds_of[i],
             ord: ord_of[i],
             first: i,
+            key: key_of[i].clone(),
+            needs: needs_of[i].clone(),
             node,
         });
     }
@@ -819,6 +885,44 @@ jobs:
             }]),
             "{boxes:?}"
         );
+    }
+
+    #[test]
+    fn a_skipped_box_sinks_below_one_that_ran() {
+        // The file declares `frontend` first; it was skipped and the matrix
+        // beside it ran, so the matrix goes on top.
+        let g = WorkflowGraph::parse(
+            r#"
+jobs:
+  secrets: { name: 1 secrets }
+  frontend: { name: 3 frontend, needs: secrets }
+  images:
+    name: 5 images
+    needs: secrets
+    strategy: { matrix: { svc: [app, web] } }
+  stage: { name: 6 stage, needs: [frontend, images] }
+"#,
+        )
+        .unwrap();
+        let mut jobs = vec![
+            job(1, "1 secrets"),
+            job(2, "3 frontend"),
+            job(3, "5 images (app)"),
+            job(4, "5 images (web)"),
+        ];
+        jobs[1].status = Status::Skipped;
+        jobs[2].status = Status::Running;
+        let st = stages(&jobs, Some(&g));
+        assert!(
+            matches!(st[1][0].nodes[0], RunNode::Matrix { .. }),
+            "{:?}",
+            st[1]
+        );
+        assert_eq!(st[1][1].nodes, vec![RunNode::Job(1)]);
+        // Nothing skipped: the file's order stands.
+        jobs[1].status = Status::Success;
+        let st = stages(&jobs, Some(&g));
+        assert_eq!(st[1][0].nodes, vec![RunNode::Job(1)]);
     }
 
     #[test]

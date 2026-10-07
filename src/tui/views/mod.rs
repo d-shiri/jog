@@ -8,7 +8,7 @@ use ratatui::widgets::{
     Widget, Wrap,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::animated_glyph;
@@ -6468,6 +6468,10 @@ struct GraphBox {
     rows: Vec<GraphRow>,
     /// Anything downstream waiting on it. Only a box that feeds gets an arrow.
     feeds: bool,
+    /// The jobs inside and the jobs they wait on, by key — which box of the
+    /// column before an arrow into this one comes from.
+    keys: Vec<String>,
+    needs: Vec<String>,
     /// The worst of its rows, which is what its border says.
     status: Status,
     /// Rows given up to fit the height. The last row drawn then says how many.
@@ -6545,11 +6549,15 @@ impl GraphCol {
         // one box and the trimming starts again.
         let feeds = self.boxes.iter().any(|b| b.feeds);
         let open = self.boxes.iter().any(|b| b.open);
+        let keys: Vec<String> = self.boxes.iter().flat_map(|b| b.keys.clone()).collect();
+        let needs: Vec<String> = self.boxes.iter().flat_map(|b| b.needs.clone()).collect();
         let rows: Vec<GraphRow> = self.boxes.drain(..).flat_map(|b| b.rows).collect();
         let status = worst_status(rows.iter().map(|r| r.status));
         self.boxes = vec![GraphBox {
             rows,
             feeds,
+            keys,
+            needs,
             status,
             hidden: 0,
             open,
@@ -6963,30 +6971,24 @@ fn render_run_graph(f: &mut Frame, area: Rect, state: &AppState, band: &GraphBan
             );
             register_graph_hits(state, placed[ci][bi], b);
             label += b.rows.len();
-            // The arrow leaves this box only if something is waiting on it,
-            // and lands on the next column rather than in the air beside it.
-            let Some(next) = placed.get(ci + 1).filter(|n| !n.is_empty()) else {
-                continue;
-            };
-            if !b.feeds {
-                continue;
-            }
-            let rect = placed[ci][bi];
-            let y = graph_arrow_y(rect, next);
-            // The edge the run is crossing right now marches; every other one
-            // is a still rule. One moving thing at a time is what makes it
-            // mean "here".
-            let crossing = cols[..=ci].iter().all(GraphCol::terminal) && !cols[ci + 1].terminal();
-            f.render_widget(
-                Paragraph::new(Line::from(graph_connector(crossing, tick, theme))),
-                Rect {
-                    x: rect.right(),
-                    y,
-                    width: GRAPH_ARROW as u16,
-                    height: 1,
-                },
-            );
         }
+        let Some(next) = cols.get(ci + 1).filter(|n| !n.boxes.is_empty()) else {
+            continue;
+        };
+        // The edge the run is crossing right now marches; every other one
+        // is a still rule. One moving thing at a time is what makes it mean
+        // "here".
+        let crossing = cols[..=ci].iter().all(GraphCol::terminal) && !next.terminal();
+        let edges = graph_edges(&col.boxes, &next.boxes);
+        draw_graph_edges(
+            f.buffer_mut(),
+            &placed[ci],
+            &placed[ci + 1],
+            &edges,
+            crossing,
+            tick,
+            theme,
+        );
     }
 
     let used = (cols.len() * plan.box_w + cols.len().saturating_sub(1) * GRAPH_ARROW) as u16;
@@ -7007,67 +7009,144 @@ fn render_run_graph(f: &mut Frame, area: Rect, state: &AppState, band: &GraphBan
     }
 }
 
-/// The row an arrow out of `from` sits on to reach the next column.
+/// Which box of one column each box of the next waits on, as `(from, to)`
+/// indices — one arrow each, the way the run page draws a line per `needs:`.
 ///
-/// Its own box's middle, when that lands on a row some box of the next column
-/// is actually drawing — and otherwise the nearest row that does. Borders and
-/// the gaps between boxes are excluded at both ends, because an arrow head
-/// landing on a rounded corner reads as a chain that has come apart.
+/// A job inside a reusable workflow call is keyed `caller/inner`, while what
+/// waits on the call names only `caller`; either spelling is a match.
 ///
-/// This used to be the middle clamped to the next column's outer edge, which
-/// was the same answer whenever the two boxes were about the same height. An
-/// opened matrix is not: a seven-row box beside a three-row one has a middle
-/// well below anything the short box draws, and the clamp put the head on its
-/// bottom border.
-fn graph_arrow_y(from: Rect, next: &[Rect]) -> u16 {
-    let want = from.y + from.height / 2;
-    let (lo, hi) = (from.y + 1, from.bottom().saturating_sub(2));
-    let rows = || {
-        next.iter()
-            .flat_map(|b| (b.y + 1)..b.bottom().saturating_sub(1))
-    };
-    rows()
-        // Inside a box at both ends: the arrow touches what it joins.
-        .filter(|y| (lo..=hi).contains(y))
-        .min_by_key(|y| y.abs_diff(want))
-        // Nothing overlaps — keep the tail on this box and let the head
-        // reach as near as it can.
-        .or_else(|| {
-            rows()
-                .min_by_key(|y| y.abs_diff(want))
-                .map(|y| y.clamp(lo, hi))
+/// Boxes with no keys to go by — a run the file no longer describes — fall
+/// back to the old chain: every box that feeds points at the box nearest it.
+fn graph_edges(from: &[GraphBox], next: &[GraphBox]) -> Vec<(usize, usize)> {
+    let waits_on = |dst: &GraphBox, src: &GraphBox| {
+        dst.needs.iter().any(|n| {
+            src.keys.iter().any(|k| {
+                k == n
+                    || k.strip_prefix(n.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
         })
-        .unwrap_or(want)
+    };
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for (a, src) in from.iter().enumerate().filter(|(_, b)| b.feeds) {
+        edges.extend(
+            next.iter()
+                .enumerate()
+                .filter(|(_, dst)| waits_on(dst, src))
+                .map(|(d, _)| (a, d)),
+        );
+    }
+    if edges.is_empty() {
+        let fed = from.iter().enumerate().filter(|(_, b)| b.feeds);
+        edges.extend(fed.map(|(a, _)| (a, a.min(next.len().saturating_sub(1)))));
+    }
+    edges
 }
 
-/// The rule between two stages: still, or — while the run is crossing it — a
-/// bright cell travelling along it into the stage that is working.
+/// Draw the arrows between two columns into the gap between them.
 ///
-/// Three columns is not much to move in, so the travel is carried by weight as
-/// well as colour: the lit cell is drawn heavy, which still reads on a terminal
-/// that has flattened the palette. The pause at the end of each pass keeps it
-/// from reading as a strobe.
-fn graph_connector(crossing: bool, tick: u64, theme: &Theme) -> Vec<Span<'static>> {
-    let still = Style::default().fg(theme.text_muted);
-    if !crossing {
-        return vec![Span::styled("──▸", still)];
+/// The gap is [`GRAPH_ARROW`] cells wide: a tail leaving the source box, a
+/// lane where the arrow turns up or down, and the head against the box it
+/// waits on. Arrows that share a lane share its cells, so two jobs feeding
+/// one box meet in a `┤` and one job feeding two splits at a `├` — what the
+/// run page's curves say, at the size of a character.
+fn draw_graph_edges(
+    buf: &mut ratatui::buffer::Buffer,
+    from: &[Rect],
+    to: &[Rect],
+    edges: &[(usize, usize)],
+    crossing: bool,
+    tick: u64,
+    theme: &Theme,
+) {
+    const UP: u8 = 1;
+    const DOWN: u8 = 2;
+    const LEFT: u8 = 4;
+    const RIGHT: u8 = 8;
+    let Some(x0) = from.first().map(|r| r.right()) else {
+        return;
+    };
+    let mid = |r: &Rect| r.y + r.height / 2;
+    let mut cells: HashMap<(u16, u16), u8> = HashMap::new();
+    let mut heads: HashSet<u16> = HashSet::new();
+    for &(a, d) in edges {
+        let (Some(src), Some(dst)) = (from.get(a), to.get(d)) else {
+            continue;
+        };
+        // Straight across wherever the two boxes share a row to do it on —
+        // the nearest such row to the source's middle. Otherwise out of the
+        // source's middle and into the nearest row the target draws. Never a
+        // border at either end: a head on a corner reads as come apart.
+        let inner = |r: &Rect| (r.y + 1, r.bottom().saturating_sub(2).max(r.y + 1));
+        let ((s_lo, s_hi), (d_lo, d_hi)) = (inner(src), inner(dst));
+        let (lo, hi) = (s_lo.max(d_lo), s_hi.min(d_hi));
+        let (sy, dy) = if lo <= hi {
+            let y = mid(src).clamp(lo, hi);
+            (y, y)
+        } else {
+            (mid(src), mid(src).clamp(d_lo, d_hi))
+        };
+        *cells.entry((x0, sy)).or_default() |= LEFT | RIGHT;
+        let turn = match dy.cmp(&sy) {
+            std::cmp::Ordering::Equal => RIGHT,
+            std::cmp::Ordering::Greater => DOWN,
+            std::cmp::Ordering::Less => UP,
+        };
+        *cells.entry((x0 + 1, sy)).or_default() |= LEFT | turn;
+        for y in sy.min(dy) + 1..sy.max(dy) {
+            *cells.entry((x0 + 1, y)).or_default() |= UP | DOWN;
+        }
+        if dy != sy {
+            let back = if dy > sy { UP } else { DOWN };
+            *cells.entry((x0 + 1, dy)).or_default() |= back | RIGHT;
+        }
+        heads.insert(dy);
     }
-    // One beat of rest at the end of each pass — enough that it reads as
-    // something travelling rather than a continuous crawl, not so much that the
-    // edge spends half its time looking dead.
-    let head = Motion::new(tick).sweep(GRAPH_ARROW, 1);
+
+    let still = Style::default().fg(theme.text_muted);
     let lit = Style::default().fg(theme.warning).bold();
-    (0..GRAPH_ARROW)
-        .map(|i| {
-            let on = i == head;
-            match (i == GRAPH_ARROW - 1, on) {
-                (true, true) => Span::styled("▸", lit),
-                (true, false) => Span::styled("▸", still),
-                (false, true) => Span::styled("━", lit),
-                (false, false) => Span::styled("─", still),
+    // One beat of rest at the end of each pass — enough that it reads as
+    // something travelling rather than a continuous crawl.
+    let head = Motion::new(tick).sweep(GRAPH_ARROW, 1) as u16;
+    let style_at = |x: u16| {
+        if crossing && x == x0 + head {
+            lit
+        } else {
+            still
+        }
+    };
+    let area = buf.area;
+    let mut put = |x: u16, y: u16, sym: &str, style: Style| {
+        if x < area.right() && y < area.bottom() {
+            buf[(x, y)].set_symbol(sym).set_style(style);
+        }
+    };
+    for (&(x, y), &bits) in &cells {
+        let lit_here = crossing && x == x0 + head;
+        let sym = match bits {
+            b if b == LEFT | RIGHT => {
+                if lit_here {
+                    "━"
+                } else {
+                    "─"
+                }
             }
-        })
-        .collect()
+            b if b == UP | DOWN => "│",
+            b if b == LEFT | DOWN => "╮",
+            b if b == LEFT | UP => "╯",
+            b if b == RIGHT | DOWN => "╭",
+            b if b == RIGHT | UP => "╰",
+            b if b == LEFT | RIGHT | DOWN => "┬",
+            b if b == LEFT | RIGHT | UP => "┴",
+            b if b == UP | DOWN | RIGHT => "├",
+            b if b == UP | DOWN | LEFT => "┤",
+            _ => "┼",
+        };
+        put(x, y, sym, style_at(x));
+    }
+    for y in heads {
+        put(x0 + 2, y, "▸", style_at(x0 + 2));
+    }
 }
 
 /// A column's box, resolved to text before anything decides how wide it may be.
@@ -7092,6 +7171,8 @@ fn graph_box(
     GraphBox {
         rows,
         feeds: g.feeds,
+        keys: g.keys.clone(),
+        needs: g.needs.clone(),
         status,
         hidden: 0,
         open: is_open,
@@ -10496,8 +10577,15 @@ jobs:
     /// Where [`a_chained_run`] puts the workflow file it needs on disk. The
     /// cache re-stats it, so it has to outlive every `rebuild_run_shape` the
     /// test makes — which is why the test clears it up rather than the helper.
+    /// One directory per test thread. Shared by the whole process, one test's
+    /// cleanup removed the file another was still writing — `NotFound` here,
+    /// `Access is denied` on Windows, where an open file pins its directory.
     fn chained_run_dir() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("jog-graph-{}", std::process::id()))
+        let thread: String = format!("{:?}", std::thread::current().id())
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect();
+        std::env::temp_dir().join(format!("jog-graph-{}-{thread}", std::process::id()))
     }
 
     #[test]
@@ -10764,6 +10852,8 @@ jobs:
                 GraphBox {
                     rows: (0..6).map(|i| test_row(&format!("quiet{i}"))).collect(),
                     feeds: true,
+                    keys: Vec::new(),
+                    needs: Vec::new(),
                     status: Status::Success,
                     hidden: 0,
                     open: false,
@@ -10771,6 +10861,8 @@ jobs:
                 GraphBox {
                     rows: (0..6).map(|i| test_row(&format!("asked{i}"))).collect(),
                     feeds: false,
+                    keys: Vec::new(),
+                    needs: Vec::new(),
                     status: Status::Success,
                     hidden: 0,
                     open: true,
@@ -10865,6 +10957,98 @@ jobs:
         let runs = draw_view(&st, 200, 30, render_runs);
         assert!(runs.contains("──▸"), "{runs}");
         std::fs::remove_dir_all(chained_run_dir()).ok();
+    }
+
+    /// `Vakanzo/kavosh`'s ci: `stage` waits on `backend`, `frontend` and the
+    /// `images` matrix, which sit one above the other. One stub per box left
+    /// `images` pointing at empty space and `backend` never reaching `stage`;
+    /// the run page draws a line per `needs:`, and so does the band now.
+    #[test]
+    fn every_needs_edge_is_drawn_and_none_points_at_nothing() {
+        let root = std::env::temp_dir().join(format!("jog-edges-{}", std::process::id()));
+        let dir = root.join(".github").join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ci.yml"),
+            concat!(
+                "jobs:\n",
+                "  secrets: { name: 1 secrets }\n",
+                "  backend: { name: 2 backend, needs: secrets }\n",
+                "  frontend: { name: 3 frontend, needs: secrets }\n",
+                "  benchmarks: { name: 4 benchmarks, needs: [secrets, backend] }\n",
+                "  images:\n    name: 5 images\n    needs: secrets\n",
+                "    strategy: { matrix: { svc: [app, web] } }\n",
+                "  stage: { name: 6 stage, needs: [secrets, backend, frontend, images] }\n",
+                "  main: { name: 7 main, needs: [stage, benchmarks] }\n",
+            ),
+        )
+        .unwrap();
+        let mut st = AppState::new(
+            "Vakanzo/kavosh".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        st.view = View::RunDetail;
+        st.repo_root = Some(root.clone());
+        st.workflow_for_runs = Some("ci.yml".into());
+        let step = &[("Set up job", Status::Success)];
+        let mut run = a_run(37611836520, "ci", Status::Success, 300);
+        run.workflow_file = Some("ci.yml".into());
+        st.run_detail = Some(crate::provider::RunDetail {
+            run,
+            jobs: ["1 secrets", "2 backend", "3 frontend", "4 benchmarks"]
+                .iter()
+                .chain(&["5 images (app)", "5 images (web)", "6 stage", "7 main"])
+                .map(|n| a_job_at(n, Status::Success, 30, step))
+                .collect(),
+        });
+        st.rebuild_run_shape();
+        let out = draw_detail(&st, 200, 34);
+        let band: Vec<Vec<char>> = out
+            .lines()
+            .skip_while(|l| !l.contains("1 secrets"))
+            .take(12)
+            .map(|l| l.chars().collect())
+            .collect();
+        let text: String = band
+            .iter()
+            .map(|l| l.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Every head lands on a box wall — nothing points at empty space.
+        let mut heads = 0;
+        for line in &band {
+            for (i, c) in line.iter().enumerate() {
+                if *c == '▸' {
+                    assert_eq!(line.get(i + 1), Some(&'│'), "loose head:\n{text}");
+                    heads += 1;
+                }
+            }
+        }
+        // secrets → backend, frontend, images; backend → benchmarks, stage;
+        // frontend, images → stage; benchmarks, stage → main. A box with two
+        // edges into it from one row gets one head, so count the boxes reached.
+        assert!(heads >= 6, "{heads} heads:\n{text}");
+        // `images` reaches `stage`: its row leaves its box on a rule.
+        let images = band
+            .iter()
+            .find(|l| l.iter().collect::<String>().contains("Matrix: 5 images"))
+            .expect("the matrix is drawn");
+        let wall = images
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c == '│')
+            .map(|(i, _)| i)
+            .find(|&i| i > 5 && images.get(i + 1).is_some_and(|c| "─━".contains(*c)));
+        assert!(
+            wall.is_some(),
+            "images feeds stage but no edge leaves it:\n{text}"
+        );
+        // And `backend` turns down toward `stage` as well as on to `benchmarks`.
+        assert!(text.contains('┬') || text.contains('╮'), "{text}");
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// Where this layout came from: a screenshot of `vakanzo/vakanzo` next to
