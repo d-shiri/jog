@@ -309,6 +309,29 @@ impl JobSpec {
     }
 }
 
+/// What a matrix box is titled: the job's `name:`, as the run page prints it.
+///
+/// GitHub names each leg of a matrix with no expression in its `name:` as
+/// `5 images (app)` — the name, then the leg's values in parentheses — and
+/// titles the box `Matrix: 5 images`. When the legs all read that way around
+/// one shared name, that name is the title. Anything else (a templated name,
+/// legs that disagree) falls back to the key, which is all the file promises.
+pub fn matrix_title(key: &str, legs: &[usize], jobs: &[Job]) -> String {
+    let base = |n: &str| {
+        n.strip_suffix(')')
+            .and_then(|n| n.rsplit_once(" ("))
+            .map(|(b, _)| b.to_string())
+    };
+    let mut names = legs
+        .iter()
+        .filter_map(|&i| jobs.get(i))
+        .map(|j| base(&j.name));
+    match names.next().flatten() {
+        Some(first) if names.all(|n| n.as_deref() == Some(first.as_str())) => first,
+        _ => key.to_string(),
+    }
+}
+
 /// How well `name` fits this spec — higher is more specific, `None` is no fit.
 fn score(spec: &JobSpec, name: &str) -> Option<usize> {
     let lit: usize = spec
@@ -424,6 +447,14 @@ fn relink(specs: &mut [JobSpec]) {
         up.sort_unstable();
         down.sort_unstable();
         spec.band = format!("{}\u{1}{}", up.join(","), down.join(","));
+        // A matrix is a box of its own even beside a job with the same edges:
+        // the run page draws `Matrix: images` apart from `frontend` when both
+        // wait on `secrets` and feed `stage`, and pooling them would put a
+        // plain job inside the matrix's border.
+        if spec.matrix {
+            spec.band.push('\u{1}');
+            spec.band.push_str(&spec.key);
+        }
     }
 }
 
@@ -752,6 +783,51 @@ jobs:
                 RunNode::Job(7),
             ]
         );
+    }
+
+    #[test]
+    fn a_matrix_never_shares_a_box_with_a_plain_job() {
+        // `frontend` and `images` wait on the same job and feed the same job,
+        // which pools two plain jobs — but the run page keeps a matrix apart.
+        let g = WorkflowGraph::parse(
+            r#"
+jobs:
+  secrets: { name: 1 secrets }
+  frontend: { name: 3 frontend, needs: secrets }
+  images:
+    name: 5 images
+    needs: secrets
+    strategy: { matrix: { svc: [app, web] } }
+  stage: { name: 6 stage, needs: [frontend, images] }
+"#,
+        )
+        .unwrap();
+        let jobs = vec![
+            job(1, "1 secrets"),
+            job(2, "3 frontend"),
+            job(3, "5 images (app)"),
+            job(4, "5 images (web)"),
+        ];
+        let st = stages(&jobs, Some(&g));
+        let boxes: Vec<Vec<RunNode>> = st[1].iter().map(|b| b.nodes.clone()).collect();
+        assert_eq!(boxes.len(), 2, "{boxes:?}");
+        assert!(boxes.contains(&vec![RunNode::Job(1)]), "{boxes:?}");
+        assert!(
+            boxes.contains(&vec![RunNode::Matrix {
+                key: "images".into(),
+                legs: vec![2, 3],
+            }]),
+            "{boxes:?}"
+        );
+    }
+
+    #[test]
+    fn matrix_title_is_the_name_the_legs_share() {
+        let jobs = vec![job(1, "5 images (app)"), job(2, "5 images (web)")];
+        assert_eq!(matrix_title("images", &[0, 1], &jobs), "5 images");
+        // A templated name leaves nothing shared to read: the key it is.
+        let jobs = vec![job(1, "build gojobi"), job(2, "build ollama")];
+        assert_eq!(matrix_title("build", &[0, 1], &jobs), "build");
     }
 
     #[test]

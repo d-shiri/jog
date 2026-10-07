@@ -19,7 +19,7 @@ use crate::app::state::{
 };
 use crate::history::HistoryEntry;
 use crate::provider::github::{ApiFault, CRITICAL_PERCENT};
-use crate::provider::graph::{NodeGroup, RunNode};
+use crate::provider::graph::{NodeGroup, RunNode, matrix_title};
 use crate::provider::{Job, Run, RunDetail, Status};
 
 pub fn render(f: &mut Frame, state: &AppState) {
@@ -7121,7 +7121,7 @@ fn graph_rows(
             .unwrap_or_default();
         let mut rows = vec![GraphRow {
             glyph: animated_glyph(status, tick).to_string(),
-            name: format!("− Matrix: {key}"),
+            name: format!("− Matrix: {}", matrix_title(key, legs, &detail.jobs)),
             meta: format!("{} legs{dur}", legs.len()),
             status,
             toggle: Some(key.clone()),
@@ -7176,7 +7176,7 @@ fn graph_row(node: &RunNode, detail: &RunDetail, tick: u64) -> GraphRow {
         // A stage the run has not reached: drawn, but drawn as nothing having
         // happened — no glyph that spins, no duration to report, and a grey
         // that keeps the eye on the stages that have.
-        RunNode::Pending { key, label, matrix } => {
+        RunNode::Pending { label, matrix, .. } => {
             // Once the run itself has landed, a stage with no job behind it is
             // not "still to come" — it was skipped, or the run stopped before
             // reaching it. Saying so with a terminal status is what keeps the
@@ -7194,7 +7194,7 @@ fn graph_row(node: &RunNode, detail: &RunDetail, tick: u64) -> GraphRow {
                     "·".to_string()
                 },
                 name: if *matrix {
-                    format!("Matrix: {key}")
+                    format!("Matrix: {label}")
                 } else {
                     label.clone()
                 },
@@ -7217,7 +7217,7 @@ fn graph_row(node: &RunNode, detail: &RunDetail, tick: u64) -> GraphRow {
                 // Not the list's own `▸`: inside a band that glyph is the
                 // arrow head between two stages, and one shape must not mean
                 // two things a few columns apart.
-                name: format!("+ Matrix: {key}"),
+                name: format!("+ Matrix: {}", matrix_title(key, legs, &detail.jobs)),
                 meta: format!("{} legs{dur}", legs.len()),
                 status,
                 toggle: Some(key.clone()),
@@ -7417,7 +7417,10 @@ fn render_run_detail(f: &mut Frame, area: Rect, state: &AppState) {
                             if open { " ▾ " } else { " ▸ " },
                             Style::default().fg(theme.text_muted),
                         ),
-                        Span::styled(format!("Matrix: {key}"), name_style),
+                        Span::styled(
+                            format!("Matrix: {}", matrix_title(key, legs, &detail.jobs)),
+                            name_style,
+                        ),
                     ]));
                     // The box's own clock is the wall time it took, not the sum of
                     // its legs — they ran side by side.
@@ -8327,7 +8330,10 @@ fn draw_watch_matrix(
     let chip = Line::from(vec![
         Span::styled("─┤ ", Style::default().fg(edge)),
         Span::styled("Matrix: ", Style::default().fg(theme.text_muted)),
-        Span::styled(key.to_string(), Style::default().fg(theme.primary).bold()),
+        Span::styled(
+            matrix_title(key, legs, &detail.jobs),
+            Style::default().fg(theme.primary).bold(),
+        ),
         Span::styled(" ├", Style::default().fg(edge)),
     ]);
     let mut blk = Block::default()

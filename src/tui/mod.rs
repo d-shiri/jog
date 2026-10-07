@@ -2582,7 +2582,10 @@ fn open_finder(state: &mut AppState) {
                 .map(|(i, item)| {
                     let label = match item {
                         DetailItem::Group(ni) => match &state.run_shape[*ni] {
-                            RunNode::Matrix { key, .. } => format!("Matrix: {key}"),
+                            RunNode::Matrix { key, legs } => format!(
+                                "Matrix: {}",
+                                crate::provider::graph::matrix_title(key, legs, &detail.jobs)
+                            ),
                             RunNode::Job(ji) => detail.jobs[*ji].name.clone(),
                             // `shape` emits no pending stages — only the
                             // graph's `stages` does.
