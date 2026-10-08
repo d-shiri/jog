@@ -29,10 +29,11 @@ pub enum Command {
         /// Workflow file name or fuzzy match on workflow name
         workflow: String,
     },
-    /// Open the repo's Actions page in a browser, or the latest run of a workflow
+    /// Open a repo tab in a browser, or the latest run of a workflow
     #[command(visible_alias = "o")]
     Open {
-        /// Workflow file name or fuzzy match on workflow name; omit for the Actions tab
+        /// Tab: c(ode), i(ssues), pr (pulls), a(ctions), p(rojects), s(ettings);
+        /// otherwise a workflow file name or fuzzy match. Omit for Actions.
         workflow: Option<String>,
     },
     /// Multi-repo dashboard for every repo in `[provider] repos`

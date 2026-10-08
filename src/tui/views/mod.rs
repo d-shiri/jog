@@ -669,6 +669,7 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
                 Some((_, BatchAction::NewBranch)) => "Batch new branch",
                 Some((_, BatchAction::BackToMain)) => "Batch back to main",
                 Some((_, BatchAction::OpenPr)) => "Batch PRs",
+                Some((_, BatchAction::MergePr)) => "Batch merge",
                 Some((_, BatchAction::Run)) => "Batch run",
                 Some((_, BatchAction::Deploy)) => "Batch deploy",
                 _ => "Batch commit",
@@ -4794,10 +4795,18 @@ fn render_batch_commit(f: &mut Frame, area: Rect, state: &AppState) {
             BatchAction::OpenPr => {
                 Some("pushes each branch, then `gh pr create` — repos on main are skipped")
             }
+            BatchAction::MergePr => Some(
+                "`gh pr merge --merge --delete-branch` — repos with no open PR for it are skipped",
+            ),
             BatchAction::Run => {
                 Some("`sh -c` in each repo, one at a time — a failure pauses the rest")
             }
             _ => None,
+        };
+        let note = if batch.checking {
+            Some("asking GitHub whether every PR merges cleanly…")
+        } else {
+            note
         };
         if let (Some(note), true) = (note, bi.height >= 4) {
             lines.push(Line::from(Span::styled(note, dim)));
@@ -7106,8 +7115,9 @@ fn draw_graph_edges(
     let still = Style::default().fg(theme.text_muted);
     let lit = Style::default().fg(theme.warning).bold();
     // One beat of rest at the end of each pass — enough that it reads as
-    // something travelling rather than a continuous crawl.
-    let head = Motion::new(tick).sweep(GRAPH_ARROW, 1) as u16;
+    // something travelling rather than a continuous crawl. Half the shared
+    // sweep speed, so the edges hum rather than flicker.
+    let head = Motion::new(tick / 2).sweep(GRAPH_ARROW, 1) as u16;
     let style_at = |x: u16| {
         if crossing && x == x0 + head {
             lit
@@ -7365,7 +7375,9 @@ fn draw_graph_box(
             Motion::new(tick).pulse(16),
         ),
         Status::Queued => theme.text_muted,
-        _ => theme.border,
+        // A dimmed info tint: a box with no verdict yet still reads as a box,
+        // and follows the configured theme (mono included).
+        _ => mix(theme.info, theme.border, 0.4),
     };
     let blk = Block::default()
         .borders(Borders::ALL)

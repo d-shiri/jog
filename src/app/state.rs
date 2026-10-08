@@ -1091,6 +1091,9 @@ pub enum BatchAction {
     BackToMain,
     /// Push the branch if needed, then `gh pr create` with one title.
     OpenPr,
+    /// `gh pr merge <branch> --merge --delete-branch`: merge the named
+    /// branch's open PR into main and delete the branch.
+    MergePr,
     /// Any shell command, `sh -c`, in each repo.
     Run,
     /// `workflow_dispatch` one workflow in each repo, on its current branch.
@@ -1105,6 +1108,8 @@ impl BatchAction {
             Self::Commit => Some("message for every repo"),
             Self::NewBranch => Some("branch name"),
             Self::OpenPr => Some("PR title"),
+            // Typing the branch is the confirmation: a merge can't be taken back.
+            Self::MergePr => Some("branch to merge into main"),
             Self::Run => Some("command"),
             Self::BackToMain | Self::Deploy => None,
         }
@@ -1123,6 +1128,7 @@ impl BatchAction {
             Self::NewBranch => "New branch in",
             Self::BackToMain => "Back to main in",
             Self::OpenPr => "Open PRs in",
+            Self::MergePr => "Merge PRs in",
             Self::Run => "Run in",
             Self::Deploy => "Deploy",
         }
@@ -1135,6 +1141,7 @@ impl BatchAction {
             Self::NewBranch => "branching",
             Self::BackToMain => "switching",
             Self::OpenPr => "opening PR",
+            Self::MergePr => "merging",
             Self::Run => "running",
             Self::Deploy => "dispatching",
         }
@@ -1147,6 +1154,7 @@ impl BatchAction {
             Self::NewBranch => "created",
             Self::BackToMain => "on",
             Self::OpenPr => "opened",
+            Self::MergePr => "merged",
             Self::Run => "done",
             Self::Deploy => "started on",
         }
@@ -1160,6 +1168,7 @@ impl BatchAction {
             Self::NewBranch => "branched",
             Self::BackToMain => "back on main",
             Self::OpenPr => "PRs opened",
+            Self::MergePr => "PRs merged",
             Self::Run => "done",
             Self::Deploy => "deploys started",
         }
@@ -1264,6 +1273,9 @@ pub struct BatchCommit {
     /// screen against. `None` while it is still working, and after an abort:
     /// see [`BatchCommit::returns_on_its_own`].
     pub done_tick: Option<u64>,
+    /// Merge: asking GitHub about every PR before any is merged. Input is
+    /// held while it does.
+    pub checking: bool,
 }
 
 /// What the batch has actually done, for the summary line.
@@ -1289,6 +1301,7 @@ impl BatchCommit {
             started_tick: tick,
             done_tick: None,
             deploy: None,
+            checking: false,
         }
     }
 

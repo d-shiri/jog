@@ -680,6 +680,134 @@ pub fn open_pr(
     Err(anyhow!("gh pr create: {}", last_line(&lines.join("\n"))))
 }
 
+/// What `gh pr merge` came back with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// gh's own line saying what it merged.
+    Merged(String),
+    /// No open PR has `branch` as its head.
+    NoPr,
+    AlreadyMerged,
+}
+
+/// Merge the open PR whose head is `branch` with a merge commit, then delete
+/// the branch on the remote and locally, via `gh`.
+pub fn merge_pr(
+    dir: &Path,
+    branch: &str,
+    on_line: &mut dyn FnMut(String, bool),
+) -> Result<MergeOutcome> {
+    let args = ["pr", "merge", branch, "--merge", "--delete-branch"];
+    let (ok, lines) = run_streaming("gh", dir, &args, on_line)?;
+    let said = |s: &str| lines.iter().any(|l| l.contains(s));
+    // gh exits non-zero when the merge went through but tidying the local
+    // branch failed (a dirty tree blocking the switch to main). The merge is
+    // what counts; reporting it as a failure would invite a retry.
+    let merged = said("Merged pull request");
+    if ok || merged {
+        let what = lines
+            .iter()
+            .find(|l| l.contains("Merged pull request"))
+            .or_else(|| lines.iter().rev().find(|l| !l.trim().is_empty()))
+            // The row already says "merged", so keep just `owner/repo#12 (title)`.
+            .map(|l| {
+                let l = l.trim().trim_start_matches('✓').trim();
+                l.strip_prefix("Merged pull request ")
+                    .unwrap_or(l)
+                    .to_string()
+            })
+            .unwrap_or_else(|| branch.to_string());
+        let what = if ok {
+            what
+        } else {
+            format!("{what} (local branch not cleaned up)")
+        };
+        return Ok(MergeOutcome::Merged(what));
+    }
+    if said("no pull requests found") || said("no open pull requests") {
+        return Ok(MergeOutcome::NoPr);
+    }
+    if said("already merged") {
+        return Ok(MergeOutcome::AlreadyMerged);
+    }
+    Err(anyhow!("gh pr merge: {}", last_line(&lines.join("\n"))))
+}
+
+/// Whether GitHub can merge a branch's PR, asked before a batch merges any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mergeable {
+    Clean,
+    Conflicting,
+    /// Mergeable in content, but GitHub would still refuse: a draft, or
+    /// branch protection (required reviews or checks) not yet satisfied.
+    Blocked(&'static str),
+    /// No open PR for the branch — the merge would skip this repo anyway.
+    NoPr,
+    /// GitHub computes mergeability lazily and hadn't finished.
+    Unknown,
+}
+
+/// Read `gh pr view --json state,mergeable,isDraft,mergeStateStatus`.
+pub fn parse_mergeable(json: &str) -> Mergeable {
+    // An answer that can't be read is not "no PR": before a merge, fail closed.
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Mergeable::Unknown;
+    };
+    if v["state"].as_str() != Some("OPEN") {
+        return Mergeable::NoPr;
+    }
+    match v["mergeable"].as_str() {
+        Some("CONFLICTING") => Mergeable::Conflicting,
+        Some("MERGEABLE") if v["isDraft"].as_bool() == Some(true) => {
+            Mergeable::Blocked("is a draft")
+        }
+        Some("MERGEABLE") => match v["mergeStateStatus"].as_str() {
+            Some("BLOCKED") => Mergeable::Blocked("is blocked by branch protection"),
+            Some("DRAFT") => Mergeable::Blocked("is a draft"),
+            _ => Mergeable::Clean,
+        },
+        _ => Mergeable::Unknown,
+    }
+}
+
+/// Ask GitHub whether `branch`'s PR merges cleanly. The first ask after a
+/// push often comes back UNKNOWN while GitHub works it out, so it asks again
+/// a few times before giving up.
+pub fn pr_mergeable(dir: &Path, branch: &str) -> Result<Mergeable> {
+    for attempt in 0..4 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        let out = Command::new("gh")
+            .args([
+                "pr",
+                "view",
+                branch,
+                "--json",
+                "state,mergeable,isDraft,mergeStateStatus",
+            ])
+            .current_dir(dir)
+            // Never let gh prompt on the terminal the TUI owns.
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .output()
+            .context("run gh pr view")?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            if err.contains("no pull requests found") {
+                return Ok(Mergeable::NoPr);
+            }
+            return Err(anyhow!("gh pr view: {}", first_line(err.trim())));
+        }
+        let m = parse_mergeable(&String::from_utf8_lossy(&out.stdout));
+        if m != Mergeable::Unknown {
+            return Ok(m);
+        }
+    }
+    Ok(Mergeable::Unknown)
+}
+
 /// Run `command` under `sh -c` in `dir`. Returns its last line of output.
 pub fn run_shell(
     dir: &Path,
@@ -804,6 +932,36 @@ pub fn head_sha(dir: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mergeable_reads_state_before_conflicts() {
+        let p = |s| parse_mergeable(s);
+        assert_eq!(
+            p(r#"{"state":"OPEN","mergeable":"MERGEABLE"}"#),
+            Mergeable::Clean
+        );
+        assert_eq!(
+            p(r#"{"state":"OPEN","mergeable":"CONFLICTING"}"#),
+            Mergeable::Conflicting
+        );
+        assert_eq!(
+            p(r#"{"state":"OPEN","mergeable":"UNKNOWN"}"#),
+            Mergeable::Unknown
+        );
+        assert_eq!(
+            p(r#"{"state":"MERGED","mergeable":"UNKNOWN"}"#),
+            Mergeable::NoPr
+        );
+        assert_eq!(
+            p(r#"{"state":"OPEN","mergeable":"MERGEABLE","isDraft":true}"#),
+            Mergeable::Blocked("is a draft")
+        );
+        assert_eq!(
+            p(r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED"}"#),
+            Mergeable::Blocked("is blocked by branch protection")
+        );
+        assert_eq!(p("not json"), Mergeable::Unknown);
+    }
 
     #[test]
     fn the_fingerprint_holds_still_until_git_state_moves() {

@@ -37,6 +37,9 @@ mod motion;
 mod views;
 
 pub enum AppEvent {
+    /// Batch merge pre-check: the branch asked about, and each repo's answer
+    /// in batch order.
+    BatchMergeChecked(String, Vec<(String, Result<crate::git::Mergeable, String>)>),
     RepoStatuses(Vec<Run>),
     WorkflowRunsPreviewLoaded(String, Vec<Run>),
     RunsLoaded(String, Vec<Run>),
@@ -977,6 +980,9 @@ async fn event_loop(
                                 op.push_line(line, partial);
                             }
                         }
+                    }
+                    AppEvent::BatchMergeChecked(branch, answers) => {
+                        batch_merge_checked(state, &branch, answers, &tx);
                     }
                     AppEvent::GitOpDone(spec, result) => {
                         let failed = result.is_err();
@@ -2968,7 +2974,7 @@ fn start_batch_menu(state: &mut AppState) {
 }
 
 /// The menu's letters, in the order the menu lists them.
-pub(crate) const BATCH_MENU: [(char, BatchAction, &str); 6] = [
+pub(crate) const BATCH_MENU: [(char, BatchAction, &str); 7] = [
     ('n', BatchAction::NewBranch, "new branch from main"),
     (
         'm',
@@ -2976,6 +2982,11 @@ pub(crate) const BATCH_MENU: [(char, BatchAction, &str); 6] = [
         "back to main and pull (skips dirty repos)",
     ),
     ('p', BatchAction::OpenPr, "open a PR from each branch (gh)"),
+    (
+        'g',
+        BatchAction::MergePr,
+        "merge a branch's PR into main and delete it (gh)",
+    ),
     ('c', BatchAction::Commit, "commit everything"),
     ('r', BatchAction::Run, "run a shell command in each"),
     (
@@ -3171,6 +3182,9 @@ fn handle_batch_input(state: &mut AppState, key: KeyEvent, tx: &mpsc::UnboundedS
             state.batch = None;
             state.switch_view(View::Repos);
         }
+        // The pre-merge check is out asking GitHub; the branch it is asking
+        // about stays as typed until it answers.
+        _ if batch.checking => {}
         KeyCode::Enter => {
             // Read rather than take: refusing an all-whitespace message must not
             // also wipe the draft, or Enter becomes a way to lose what you typed.
@@ -3183,6 +3197,11 @@ fn handle_batch_input(state: &mut AppState, key: KeyEvent, tx: &mpsc::UnboundedS
                 && let Err(e) = crate::git::check_branch_name(&msg)
             {
                 state.set_status_err(e.to_string());
+                return;
+            }
+            if batch.action == BatchAction::MergePr {
+                batch.message = msg;
+                start_merge_check(state, tx);
                 return;
             }
             batch.input = None;
@@ -3198,6 +3217,95 @@ fn handle_batch_input(state: &mut AppState, key: KeyEvent, tx: &mpsc::UnboundedS
         }
         _ => {}
     }
+}
+
+/// Ask GitHub whether every marked repo's PR merges cleanly, before merging
+/// any. Merging one at a time and stopping at the first conflict would leave
+/// the branch merged in some repos and not others.
+fn start_merge_check(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
+    let Some(batch) = state.batch.as_mut() else {
+        return;
+    };
+    batch.checking = true;
+    let branch = batch.message.clone();
+    let repos: Vec<_> = batch
+        .items
+        .iter()
+        .map(|i| (i.spec.clone(), i.path.clone()))
+        .collect();
+    let tx = tx.clone();
+    state.pending += 1;
+    tokio::task::spawn_blocking(move || {
+        // Side by side: each answer can take a few retries of its own.
+        let answers = std::thread::scope(|s| {
+            let handles: Vec<_> = repos
+                .iter()
+                .map(|(spec, path)| {
+                    let branch = &branch;
+                    s.spawn(move || {
+                        let r =
+                            crate::git::pr_mergeable(path, branch).map_err(|e| format!("{e:#}"));
+                        (spec.clone(), r)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .zip(&repos)
+                .map(|(h, (spec, _))| {
+                    h.join()
+                        .unwrap_or_else(|_| (spec.clone(), Err("check panicked".into())))
+                })
+                .collect()
+        });
+        let _ = tx.send(AppEvent::BatchMergeChecked(branch, answers));
+    });
+}
+
+/// Start the merge if every repo is clean (or has no PR to merge); otherwise
+/// say which repos are in the way and merge nothing.
+fn batch_merge_checked(
+    state: &mut AppState,
+    branch: &str,
+    answers: Vec<(String, Result<crate::git::Mergeable, String>)>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    use crate::git::Mergeable;
+    state.pending = state.pending.saturating_sub(1);
+    // A check from a batch that was abandoned (Esc) and replaced by another
+    // must not green-light this one: it asked about another branch or repos.
+    let Some(batch) = state.batch.as_mut().filter(|b| {
+        b.checking
+            && b.message == branch
+            && b.items.len() == answers.len()
+            && b.items
+                .iter()
+                .zip(&answers)
+                .all(|(i, (spec, _))| &i.spec == spec)
+    }) else {
+        return;
+    };
+    batch.checking = false;
+    let short = |spec: &str| spec.rsplit('/').next().unwrap_or(spec).to_string();
+    let mut blocked = Vec::new();
+    for (spec, answer) in &answers {
+        match answer {
+            Ok(Mergeable::Clean | Mergeable::NoPr) => {}
+            Ok(Mergeable::Conflicting) => blocked.push(format!("{} conflicts", short(spec))),
+            Ok(Mergeable::Blocked(why)) => blocked.push(format!("{} {why}", short(spec))),
+            Ok(Mergeable::Unknown) => {
+                blocked.push(format!("{} not checked by GitHub yet", short(spec)))
+            }
+            Err(e) => blocked.push(format!("{}: {e}", short(spec))),
+        }
+    }
+    if !blocked.is_empty() {
+        state.set_status_err(format!("nothing merged — {}", blocked.join(", ")));
+        return;
+    }
+    batch.input = None;
+    batch.phase = BatchPhase::Committing;
+    batch_step(state, tx);
 }
 
 /// How long a finished batch's summary stays on screen before it takes itself
@@ -3397,6 +3505,18 @@ fn batch_step(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
                 Ok(target.branch.clone())
             },
         );
+    } else if !pushing && action == BatchAction::MergePr {
+        spawn_streaming_op_for(state, tx, spec, path, "merge", "", move |dir, out| {
+            match crate::git::merge_pr(dir, msg.trim(), out)? {
+                crate::git::MergeOutcome::Merged(what) => Ok(what),
+                crate::git::MergeOutcome::NoPr => {
+                    Ok(format!("{BATCH_NOTHING}no open PR for {}", msg.trim()))
+                }
+                crate::git::MergeOutcome::AlreadyMerged => {
+                    Ok(format!("{BATCH_NOTHING}{} already merged", msg.trim()))
+                }
+            }
+        });
     } else if !pushing && action == BatchAction::Run {
         spawn_streaming_op_for(state, tx, spec, path, "run", "", move |dir, out| {
             crate::git::run_shell(dir, &msg, out)

@@ -171,20 +171,22 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Command::Open { workflow: None }) => {
-            if !has_remote {
-                return Err(anyhow!("no GitHub remote to open — pass --repo owner/name"));
+        Some(Command::Open { workflow }) => {
+            let tab = match workflow.as_deref() {
+                None => Some("/actions"),
+                Some(w) => repo_tab(w),
+            };
+            if let Some(tab) = tab {
+                if !has_remote {
+                    return Err(anyhow!("no GitHub remote to open — pass --repo owner/name"));
+                }
+                let spec = provider.repo();
+                let url = format!("https://github.com/{}/{}{}", spec.owner, spec.repo, tab);
+                open::that(&url).context("open browser")?;
+                println!("opened {url}");
+                return Ok(());
             }
-            let spec = provider.repo();
-            let url = format!("https://github.com/{}/{}/actions", spec.owner, spec.repo);
-            open::that(&url).context("open browser")?;
-            println!("opened {url}");
-            Ok(())
-        }
-        Some(Command::Open {
-            workflow: Some(workflow),
-        }) => {
-            let resolved = resolve_workflow(&workflows, &workflow)?;
+            let resolved = resolve_workflow(&workflows, workflow.as_deref().unwrap_or_default())?;
             let latest = provider
                 .get_latest_run(&resolved)
                 .await?
@@ -237,4 +239,18 @@ fn parse_kv(raw: &[String]) -> Result<std::collections::HashMap<String, String>>
         out.insert(k.to_string(), v.to_string());
     }
     Ok(out)
+}
+
+/// URL suffix for a repo tab named on `jog open`, by short key or full name.
+/// Anything else is taken as a workflow.
+fn repo_tab(arg: &str) -> Option<&'static str> {
+    Some(match arg {
+        "c" | "code" => "",
+        "i" | "issues" => "/issues",
+        "pr" | "pulls" => "/pulls",
+        "a" | "actions" => "/actions",
+        "p" | "projects" => "/projects",
+        "s" | "settings" => "/settings",
+        _ => return None,
+    })
 }
