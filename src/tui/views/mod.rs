@@ -57,9 +57,9 @@ pub fn render(f: &mut Frame, state: &AppState) {
         render_commit_overlay(f, area, state);
     }
     render_push_prompt(f, area, state);
+    render_pr_card(f, area, state);
     render_finder_overlay(f, area, state);
     render_services_overlay(f, area, state);
-    render_pr_card(f, area, state);
     // Drawn last so it sits above every other overlay.
     render_help_overlay(f, area, state);
 }
@@ -539,67 +539,162 @@ fn render_services_overlay(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 /// Whether the PR card still has rows arriving — the redraw loop's question.
+/// A card still waiting on its list animates its spinner, and a pending check
+/// spins too.
 pub fn pr_card_revealing(state: &AppState) -> bool {
-    state.pr_card.as_ref().is_some_and(|c| {
-        staggered_reveal(
-            c.opened_tick,
+    let Some(card) = state.pr_card.as_ref() else {
+        return false;
+    };
+    let rows = state.pr_visible();
+    // Waiting spins; an error sits still.
+    let waiting = state.pr_data().is_none()
+        && !state
+            .pr_list
+            .as_ref()
+            .is_some_and(|l| l.repo == state.repo_label && l.data.is_err());
+    waiting
+        || staggered_reveal(
+            card.opened_tick,
             state.tick_count,
-            c.list().len(),
+            rows.len(),
             REVEAL_STEP,
             REVEAL_TICKS,
         ) < 1.0
-            || c.prs.is_none()
-    })
+        || rows
+            .iter()
+            .any(|p| p.checks == Some(crate::provider::Checks::Pending))
+}
+
+/// An age in as few columns as it can be read in: `now`, `12m`, `3h`, `5d`,
+/// `6w`, `4mo`, `2y`.
+fn short_age(t: chrono::DateTime<Utc>) -> String {
+    let secs = (Utc::now() - t).num_seconds().max(0);
+    match secs {
+        s if s < 60 => "now".into(),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s if s < 14 * 86_400 => format!("{}d", s / 86_400),
+        s if s < 63 * 86_400 => format!("{}w", s / (7 * 86_400)),
+        s if s < 365 * 86_400 => format!("{}mo", s / (30 * 86_400)),
+        s => format!("{}y", s / (365 * 86_400)),
+    }
+}
+
+/// A line count for the diff-size column: `297`, `7.5k`, `38k`.
+fn short_count(n: u64) -> String {
+    match n {
+        n if n < 1000 => n.to_string(),
+        n if n < 10_000 => format!("{:.1}k", n as f64 / 1000.0),
+        n => format!("{}k", n / 1000),
+    }
+}
+
+/// Which optional columns a PR card of `inner_w` columns has room for, and
+/// how wide the title gets. The title is what the eye scans for, so the
+/// others give way to it — branch first, then diff size, then author.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrColumns {
+    num: usize,
+    title: usize,
+    diff: usize,
+    branch: usize,
+    author: usize,
+    age: usize,
+}
+
+impl PrColumns {
+    /// The width a row laid out on these columns takes.
+    fn row_width(&self) -> usize {
+        let extras: usize = [self.diff, self.branch, self.author]
+            .iter()
+            .filter(|w| **w > 0)
+            .map(|w| w + 2)
+            .sum();
+        3 + 2 + self.num + 2 + self.title + 2 + 8 + extras + 2 + self.age
+    }
+}
+
+/// Columns every row has: gutter (3), state (2), the number, the status
+/// cluster (checks, review, conflict, preview: 8), and the gaps between.
+const PR_TITLE_MIN: usize = 24;
+const PR_TITLE_MAX: usize = 60;
+
+fn pr_columns(prs: &[&crate::provider::PullRequest], inner_w: usize) -> PrColumns {
+    let col = |f: &dyn Fn(&crate::provider::PullRequest) -> usize| {
+        prs.iter().map(|p| f(p)).max().unwrap_or(0)
+    };
+    let num = col(&|p| p.number.to_string().len() + 1);
+    let age = 4;
+    let diff_want = col(&|p| short_count(p.additions).len() + short_count(p.deletions).len() + 3);
+    let branch_want = col(&|p| disp_width(&p.head)).min(24);
+    let author_want = col(&|p| disp_width(&p.author) + 1).min(16);
+    let title_want = col(&|p| disp_width(&p.title) + if p.draft { 6 } else { 0 })
+        .clamp(PR_TITLE_MIN, PR_TITLE_MAX);
+    // gutter + state + number + gap + [title] + gap + cluster + gap + age
+    let fixed = 3 + 2 + num + 2 + 2 + 8 + 2 + age;
+    let mut c = PrColumns {
+        num,
+        title: 0,
+        diff: diff_want,
+        branch: branch_want,
+        author: author_want,
+        age,
+    };
+    // Everything but the title, at the columns `c` currently keeps.
+    let extras = |c: &PrColumns| c.row_width() - fixed;
+    // Shed optional columns, least useful first, until the title has its
+    // minimum; then hand the title whatever is left, up to what it wants.
+    for shed in [
+        |c: &mut PrColumns| c.branch = 0,
+        |c: &mut PrColumns| c.diff = 0,
+        |c: &mut PrColumns| c.author = 0,
+    ] {
+        if fixed + extras(&c) + PR_TITLE_MIN <= inner_w {
+            break;
+        }
+        shed(&mut c);
+    }
+    c.title = inner_w
+        .saturating_sub(fixed + extras(&c))
+        .clamp(10, title_want.max(10));
+    c
 }
 
 /// The open pull requests of the repo in hand, floated over the Workflows view
-/// like the services card: one row per PR — state, number, title, branch,
-/// author, age — with a cursor to move and `o` to open it.
+/// like the services card: one row per PR — state, number, title, how its
+/// checks/review/merge/preview stand, size, branch, author, age — and a detail
+/// block for the selected one underneath.
 fn render_pr_card(f: &mut Frame, area: Rect, state: &AppState) {
     let Some(card) = state.pr_card.as_ref() else {
         return;
     };
     let theme = &state.theme;
     let km = &state.keymap;
-    let prs = card.list();
+    let data = state.pr_data();
+    let prs = state.pr_visible();
+    let viewer = data.map(|d| d.viewer.as_str()).unwrap_or("");
+    let error = state
+        .pr_list
+        .as_ref()
+        .filter(|l| l.repo == state.repo_label)
+        .and_then(|l| l.data.as_ref().err());
 
-    // The fixed columns, measured once: they size the card and lay out its rows.
-    let col =
-        |f: &dyn Fn(&crate::provider::PullRequest) -> usize| prs.iter().map(f).max().unwrap_or(0);
-    let num_w = col(&|p| p.number.to_string().len() + 1);
-    let draft_w = if prs.iter().any(|p| p.draft) { 7 } else { 0 };
-    let branch_w = col(&|p| disp_width(&p.head)).min(26);
-    let author_w = col(&|p| disp_width(&p.author) + 1).min(18);
-    let ages: Vec<(String, Style)> = prs
-        .iter()
-        .map(|p| match p.updated_at {
-            Some(t) => relative_styled(t, theme),
-            None => ("—".into(), Style::default().fg(theme.text_faint)),
-        })
-        .collect();
-    // "1000d ago" outgrows the usual seven columns on a long-lived backlog.
-    let age_w = ages
-        .iter()
-        .map(|(a, _)| disp_width(a))
-        .max()
-        .unwrap_or(0)
-        .max(7);
-    // "▌ " cursor bar, "● " state, number, then a two-column gap per field.
-    let fixed = 2 + 2 + num_w + 2 + draft_w + 2 + branch_w + 2 + author_w + 2 + age_w;
-
-    // As wide as the longest row wants, capped so a long title is cut rather
-    // than stretching the card edge to edge, and never wider than the screen.
-    let natural = if prs.is_empty() {
-        60
+    let w = area.width.saturating_sub(4).min(150);
+    let inner_w = w.saturating_sub(4) as usize;
+    let cols = pr_columns(&prs, inner_w);
+    // Shrink to the rows' own width when they don't need all of it.
+    let row_w = cols.row_width();
+    let w = if prs.is_empty() {
+        w.min(76)
     } else {
-        fixed + col(&|p| disp_width(&p.title)) + 4
+        w.min((row_w + 4).max(64) as u16)
     };
-    let w = (natural as u16)
-        .clamp(60, 112)
-        .min(area.width.saturating_sub(4));
-    // Borders, a padding line above and below, and the rows.
+    let inner_w = w.saturating_sub(4) as usize;
+    let selected = prs.get(card.cursor).copied();
+    // The detail block: a rule, then the selected PR's title, state, links.
+    let detail_h: u16 = if selected.is_some() { 4 } else { 0 };
     let body_rows = prs.len().max(1) as u16;
-    let h = (body_rows + 4)
+    let h = (body_rows + 4 + detail_h)
         .min(area.height.saturating_sub(2))
         .max(5.min(area.height));
     let slot = Rect {
@@ -608,146 +703,92 @@ fn render_pr_card(f: &mut Frame, area: Rect, state: &AppState) {
         width: w,
         height: h,
     };
-    // Inside the border and a column of padding either side.
-    let inner_w = w.saturating_sub(4) as usize;
-    let viewport = h.saturating_sub(4) as usize;
+    let list_h = h.saturating_sub(4 + detail_h) as usize;
+    let viewport = list_h.max(1);
 
-    let rows: Vec<Line> = match &card.prs {
-        None => {
-            let spin = Motion::new(state.tick_count).spinner();
-            vec![Line::from(vec![
-                Span::styled(format!("{spin} "), Style::default().fg(theme.accent)),
-                Span::styled(
-                    "asking GitHub for open pull requests…",
-                    Style::default().fg(theme.text_muted).italic(),
-                ),
-            ])]
-        }
-        Some(Err(e)) => vec![Line::from(Span::styled(
+    let muted = Style::default().fg(theme.text_muted);
+    let mut rows: Vec<Line> = match (data, error) {
+        (None, Some(e)) => vec![Line::from(Span::styled(
             format!(
                 "✗ can't list pull requests — {}",
                 truncate(e, inner_w.saturating_sub(32))
             ),
             Style::default().fg(theme.failure),
         ))],
-        Some(Ok(v)) if v.is_empty() => vec![Line::from(vec![
+        (None, None) => {
+            let spin = Motion::new(state.tick_count).spinner();
+            vec![Line::from(vec![
+                Span::styled(format!("{spin} "), Style::default().fg(theme.accent)),
+                Span::styled("asking GitHub for open pull requests…", muted),
+            ])]
+        }
+        (Some(d), _) if d.prs.is_empty() => vec![Line::from(vec![
             Span::styled("✓ ", Style::default().fg(theme.success)),
-            Span::styled(
-                "no open pull requests — nothing waiting on review",
-                Style::default().fg(theme.text_muted).italic(),
-            ),
+            Span::styled("no open pull requests — nothing waiting on review", muted),
         ])],
-        Some(Ok(v)) => {
-            // The title takes what the fixed columns leave.
-            let title_w = inner_w.saturating_sub(fixed).max(10);
-
-            v.iter()
-                .enumerate()
-                .map(|(i, pr)| {
-                    let p = staggered_reveal(
+        (Some(_), _) if prs.is_empty() => vec![Line::from(Span::styled(
+            format!(
+                "nothing matches — {} shows bots, {} shows everyone's",
+                display_key(&km.pr_hide_bots),
+                display_key(&km.pr_mine)
+            ),
+            muted,
+        ))],
+        (Some(_), _) => prs
+            .iter()
+            .enumerate()
+            .map(|(i, pr)| {
+                pr_row(
+                    pr,
+                    i == card.cursor,
+                    pr.head == state.current_branch,
+                    pr.author == viewer,
+                    cols,
+                    inner_w,
+                    staggered_reveal(
                         card.opened_tick,
                         state.tick_count,
                         i,
                         REVEAL_STEP,
                         REVEAL_TICKS,
-                    );
-                    let selected = i == card.cursor;
-                    let bg = if selected {
-                        theme.select_bg
-                    } else {
-                        theme.surface_alt
-                    };
-                    let fade = |c: Color| Style::default().fg(mix(bg, c, p)).bg(bg);
-                    let (glyph, gcolor) = if pr.draft {
-                        ("◌", theme.text_muted)
-                    } else {
-                        ("●", theme.success)
-                    };
-                    let title_color = if pr.draft {
-                        theme.text_muted
-                    } else {
-                        theme.text_bright
-                    };
-                    let mut title = fade(title_color);
-                    if selected {
-                        title = title.bold();
-                    }
-                    let (age, age_style) = &ages[i];
-                    let age_fg = age_style.fg.unwrap_or(theme.text_faint);
-                    let draft = if draft_w == 0 {
-                        String::new()
-                    } else if pr.draft {
-                        format!("{:<draft_w$}", "draft")
-                    } else {
-                        " ".repeat(draft_w)
-                    };
-                    let author = if pr.author.is_empty() {
-                        String::new()
-                    } else {
-                        format!("@{}", pr.author)
-                    };
-                    let mut spans = vec![
-                        Span::styled(
-                            if selected { "▌ " } else { "  " },
-                            Style::default().fg(theme.accent).bg(bg),
-                        ),
-                        Span::styled(format!("{glyph} "), fade(gcolor)),
-                        Span::styled(
-                            format!("{:>num_w$}", format!("#{}", pr.number)),
-                            fade(theme.primary),
-                        ),
-                        Span::styled("  ", fade(theme.text)),
-                    ];
-                    if draft_w > 0 {
-                        spans.push(Span::styled(draft, fade(theme.text_faint).italic()));
-                    }
-                    spans.extend([
-                        Span::styled(pad_to(&truncate(&pr.title, title_w), title_w), title),
-                        Span::styled("  ", fade(theme.text)),
-                        Span::styled(
-                            pad_to(&truncate(&pr.head, branch_w), branch_w),
-                            fade(theme.accent),
-                        ),
-                        Span::styled("  ", fade(theme.text)),
-                        Span::styled(
-                            pad_to(&truncate(&author, author_w), author_w),
-                            fade(theme.text_muted),
-                        ),
-                        Span::styled("  ", fade(theme.text)),
-                        Span::styled(format!("{age:>age_w$}"), fade(age_fg)),
-                    ]);
-                    // Fill the rest of the row so the highlight is one bar.
-                    let used: usize = spans.iter().map(|s| s.width()).sum();
-                    if used < inner_w {
-                        spans.push(Span::styled(" ".repeat(inner_w - used), fade(theme.text)));
-                    }
-                    Line::from(spans)
-                })
-                .collect()
-        }
+                    ),
+                    state.tick_count,
+                    theme,
+                )
+            })
+            .collect(),
     };
 
     // Keep the cursor on screen: scroll only as far as it takes.
     let mut scroll = card.scroll.get();
     if card.cursor < scroll {
         scroll = card.cursor;
-    } else if viewport > 0 && card.cursor >= scroll + viewport {
+    } else if card.cursor >= scroll + viewport {
         scroll = card.cursor + 1 - viewport;
     }
-    scroll = scroll.min(rows.len().saturating_sub(viewport.max(1)));
+    scroll = scroll.min(rows.len().saturating_sub(viewport));
     card.scroll.set(scroll);
     card.viewport.set(viewport);
+    // The list is cut to its window here rather than scrolled by the
+    // paragraph, so the detail block underneath stays put.
+    rows = rows.into_iter().skip(scroll).take(viewport).collect();
+    while rows.len() < list_h {
+        rows.push(Line::from(""));
+    }
+
+    if let Some(pr) = selected {
+        rows.extend(pr_detail(pr, &state.current_branch, inner_w, theme));
+    }
 
     // The click map: each visible row, then the card as a whole. Rows sit
     // inside the border and the padding line under it.
     {
         let mut hits = state.hits.borrow_mut();
-        let first_row_y = slot.y + 2;
         for r in 0..viewport.min(prs.len().saturating_sub(scroll)) {
             hits.push((
                 Rect {
                     x: slot.x + 1,
-                    y: first_row_y + r as u16,
+                    y: slot.y + 2 + r as u16,
                     width: slot.width.saturating_sub(2),
                     height: 1,
                 },
@@ -759,15 +800,27 @@ fn render_pr_card(f: &mut Frame, area: Rect, state: &AppState) {
 
     f.render_widget(Clear, slot);
     let accent = Style::default().fg(theme.accent);
+    let faint = Style::default().fg(theme.text_faint);
     let mut title = vec![
         Span::styled("─┤ ", accent),
         Span::styled("\u{f407} Pull requests", accent.bold()),
     ];
-    if let Some(Ok(v)) = &card.prs {
+    if let Some(d) = data {
+        let n = if prs.len() == d.prs.len() {
+            prs.len().to_string()
+        } else {
+            format!("{} of {}", prs.len(), d.prs.len())
+        };
         title.push(Span::styled(
-            format!("  {}", v.len()),
+            format!("  {n}"),
             Style::default().fg(theme.text_bright),
         ));
+    }
+    if card.only_mine {
+        title.push(Span::styled("  mine", Style::default().fg(theme.info)));
+    }
+    if card.hide_bots {
+        title.push(Span::styled("  no bots", Style::default().fg(theme.info)));
     }
     title.push(Span::styled(" ├", accent));
     let mut block = Block::default()
@@ -776,41 +829,313 @@ fn render_pr_card(f: &mut Frame, area: Rect, state: &AppState) {
         .border_style(accent)
         .padding(Padding::new(1, 1, 1, 1))
         .title(Line::from(title))
-        .title(
-            Line::from(Span::styled(
-                format!(" {} ", card.repo),
-                Style::default().fg(theme.text_faint),
-            ))
-            .right_aligned(),
-        );
-    let hint = format!(
-        " {}/{} move · {} open · {} refresh · esc close ",
-        display_key(&km.down),
-        display_key(&km.up),
-        display_key(&km.open_browser),
-        display_key(&km.refresh),
-    );
-    block = block.title_bottom(
-        Line::from(Span::styled(hint, Style::default().fg(theme.text_faint))).right_aligned(),
-    );
-    if card.refreshing {
-        block = block.title_bottom(Line::from(Span::styled(
-            " updating… ",
-            Style::default().fg(theme.text_faint),
-        )));
-    } else if prs.len() > viewport && viewport > 0 {
+        .title(Line::from(Span::styled(format!(" {} ", state.repo_label), faint)).right_aligned());
+    // As many key hints as fit, most used first.
+    let k = |s: &str| display_key(s).to_string();
+    let hints = [
+        ("↵".to_string(), "runs"),
+        (k(&km.open_browser), "open"),
+        (k(&km.pr_preview), "preview"),
+        (k(&km.pr_checkout), "checkout"),
+        (k(&km.yank), "copy"),
+        (k(&km.pr_mine), "mine"),
+        (k(&km.pr_hide_bots), "bots"),
+        (k(&km.finder), "find"),
+        (k(&km.refresh), "refresh"),
+    ];
+    let mut hint = String::from(" ");
+    let room = (w as usize).saturating_sub(16);
+    for (key, what) in hints {
+        let piece = format!("{key} {what} · ");
+        if disp_width(&hint) + disp_width(&piece) + 4 > room {
+            break;
+        }
+        hint.push_str(&piece);
+    }
+    hint.push_str("esc ");
+    block = block.title_bottom(Line::from(Span::styled(hint, faint)).right_aligned());
+    if state.pr_fetching && data.is_some() {
+        block = block.title_bottom(Line::from(Span::styled(" updating… ", faint)));
+    } else if prs.len() > viewport {
         block = block.title_bottom(Line::from(Span::styled(
             format!(" {}/{} ", card.cursor + 1, prs.len()),
-            Style::default().fg(theme.text_faint),
+            faint,
         )));
     }
     f.render_widget(
         Paragraph::new(rows)
             .block(block)
-            .scroll((scroll as u16, 0))
             .style(Style::default().bg(theme.surface_alt)),
         slot,
     );
+}
+
+/// One PR's row on the card.
+#[allow(clippy::too_many_arguments)]
+fn pr_row<'a>(
+    pr: &crate::provider::PullRequest,
+    selected: bool,
+    on_branch: bool,
+    mine: bool,
+    cols: PrColumns,
+    inner_w: usize,
+    p: f64,
+    tick: u64,
+    theme: &Theme,
+) -> Line<'a> {
+    use crate::provider::{Checks, PreviewState, Review};
+    let bg = if selected {
+        theme.select_bg
+    } else {
+        theme.surface_alt
+    };
+    // Each row fades up out of the card's ground; nothing here is italic —
+    // tmux under `screen` draws italics as reverse video.
+    let fade = |c: Color| Style::default().fg(mix(bg, c, p)).bg(bg);
+    let gap = || Span::styled("  ", Style::default().bg(bg));
+
+    let (glyph, gcolor) = if pr.draft {
+        ("◌", theme.text_muted)
+    } else {
+        ("●", theme.success)
+    };
+    let mut spans = vec![
+        Span::styled(
+            if selected { "▌" } else { " " },
+            Style::default().fg(theme.accent).bg(bg),
+        ),
+        // The branch checked out here wears the branch mark in the gutter.
+        Span::styled(if on_branch { "⎇ " } else { "  " }, fade(theme.accent)),
+        Span::styled(format!("{glyph} "), fade(gcolor)),
+        Span::styled(
+            format!("{:>w$}", format!("#{}", pr.number), w = cols.num),
+            fade(theme.primary),
+        ),
+        gap(),
+    ];
+
+    // Title, with drafts saying so in front and dimmed.
+    let mut title_style = fade(if pr.draft {
+        theme.text_muted
+    } else {
+        theme.text_bright
+    });
+    if selected {
+        title_style = title_style.bold();
+    }
+    if pr.draft {
+        spans.push(Span::styled("draft ", fade(theme.text_faint)));
+        spans.push(Span::styled(
+            pad_to(
+                &truncate(&pr.title, cols.title.saturating_sub(6)),
+                cols.title.saturating_sub(6),
+            ),
+            title_style,
+        ));
+    } else {
+        spans.push(Span::styled(
+            pad_to(&truncate(&pr.title, cols.title), cols.title),
+            title_style,
+        ));
+    }
+    spans.push(gap());
+
+    // The status cluster — four glyphs, one question each: do checks pass, is
+    // it reviewed, does it merge, is there a preview to look at.
+    let (c, cc) = match pr.checks {
+        Some(Checks::Passing) => ("✓", theme.success),
+        Some(Checks::Failing) => ("✗", theme.failure),
+        Some(Checks::Pending) => (Motion::new(tick).spinner(), theme.warning),
+        None => ("·", theme.text_ghost),
+    };
+    let (r, rc) = match pr.review {
+        Some(Review::Approved) => ("✔", theme.success),
+        Some(Review::ChangesRequested) => ("✎", theme.failure),
+        Some(Review::Required) | None => ("·", theme.text_ghost),
+    };
+    let (m, mc) = if pr.conflicting {
+        ("≠", theme.warning)
+    } else {
+        (" ", theme.text_ghost)
+    };
+    let (v, vc) = match pr.preview.as_ref().map(|p| p.state) {
+        Some(PreviewState::Ready) => ("◆", theme.info),
+        Some(PreviewState::Deploying) => ("◇", theme.warning),
+        Some(PreviewState::Failed) => ("◆", theme.failure),
+        Some(PreviewState::Gone) => ("◇", theme.text_faint),
+        None => (" ", theme.text_ghost),
+    };
+    for (g, color) in [(c, cc), (r, rc), (m, mc), (v, vc)] {
+        spans.push(Span::styled(format!("{g} "), fade(color)));
+    }
+
+    if cols.diff > 0 {
+        let add = format!("+{}", short_count(pr.additions));
+        let del = format!("−{}", short_count(pr.deletions));
+        let pad = cols
+            .diff
+            .saturating_sub(add.chars().count() + 1 + del.chars().count());
+        spans.push(gap());
+        spans.push(Span::styled(" ".repeat(pad), fade(theme.text)));
+        spans.push(Span::styled(add, fade(theme.success_dim)));
+        spans.push(Span::styled(" ", fade(theme.text)));
+        spans.push(Span::styled(del, fade(theme.failure_dim)));
+    }
+    if cols.branch > 0 {
+        let mut st = fade(theme.accent);
+        if on_branch {
+            st = st.bold();
+        }
+        spans.push(gap());
+        spans.push(Span::styled(
+            pad_to(&truncate(&pr.head, cols.branch), cols.branch),
+            st,
+        ));
+    }
+    if cols.author > 0 {
+        let author = format!("@{}", pr.author);
+        let color = if mine {
+            theme.text
+        } else if pr.author_is_bot {
+            theme.text_faint
+        } else {
+            theme.text_muted
+        };
+        spans.push(gap());
+        spans.push(Span::styled(
+            pad_to(&truncate(&author, cols.author), cols.author),
+            fade(color),
+        ));
+    }
+    let (age, age_color) = match pr.updated_at {
+        Some(t) => {
+            let (_, st) = relative_styled(t, theme);
+            (short_age(t), st.fg.unwrap_or(theme.text_faint))
+        }
+        None => ("—".into(), theme.text_faint),
+    };
+    spans.push(gap());
+    spans.push(Span::styled(
+        format!("{age:>w$}", w = cols.age),
+        fade(age_color),
+    ));
+
+    // Fill the rest of the row so the highlight is one bar.
+    let used: usize = spans.iter().map(|s| s.width()).sum();
+    if used < inner_w {
+        spans.push(Span::styled(" ".repeat(inner_w - used), fade(theme.text)));
+    }
+    Line::from(spans)
+}
+
+/// The block under the list: the selected PR in full — its whole title,
+/// where it merges, and the state the row's glyphs only hint at.
+fn pr_detail<'a>(
+    pr: &crate::provider::PullRequest,
+    current_branch: &str,
+    inner_w: usize,
+    theme: &Theme,
+) -> Vec<Line<'a>> {
+    use crate::provider::{Checks, PreviewState, Review};
+    let faint = Style::default().fg(theme.text_faint);
+    let sep = || Span::styled(" · ", Style::default().fg(theme.border_dim));
+    let rule = Line::from(Span::styled(
+        "─".repeat(inner_w),
+        Style::default().fg(theme.border_dim),
+    ));
+
+    let mut head = vec![Span::styled(
+        format!("#{} ", pr.number),
+        Style::default().fg(theme.primary),
+    )];
+    if pr.draft {
+        head.push(Span::styled("draft ", faint));
+    }
+    let used = disp_width(&format!("#{} ", pr.number)) + if pr.draft { 6 } else { 0 };
+    head.push(Span::styled(
+        truncate(&pr.title, inner_w.saturating_sub(used)),
+        Style::default().fg(theme.text_bright).bold(),
+    ));
+
+    let mut state_line = vec![
+        Span::styled(pr.base.clone(), Style::default().fg(theme.text_muted)),
+        Span::styled(" ← ", faint),
+        Span::styled(pr.head.clone(), Style::default().fg(theme.accent)),
+    ];
+    if pr.head == current_branch {
+        state_line.push(Span::styled(" (checked out)", faint));
+    }
+    let (checks, cc) = match pr.checks {
+        Some(Checks::Passing) => ("checks pass", theme.success),
+        Some(Checks::Failing) => ("checks fail", theme.failure),
+        Some(Checks::Pending) => ("checks running", theme.warning),
+        None => ("no checks", theme.text_faint),
+    };
+    let (review, rc) = match pr.review {
+        Some(Review::Approved) => ("approved", theme.success),
+        Some(Review::ChangesRequested) => ("changes requested", theme.failure),
+        Some(Review::Required) => ("needs review", theme.text_muted),
+        None => ("no review required", theme.text_faint),
+    };
+    state_line.extend([
+        sep(),
+        Span::styled(checks, Style::default().fg(cc)),
+        sep(),
+        Span::styled(review, Style::default().fg(rc)),
+    ]);
+    if pr.conflicting {
+        state_line.extend([
+            sep(),
+            Span::styled("conflicts", Style::default().fg(theme.warning)),
+        ]);
+    }
+    if pr.comments > 0 {
+        state_line.extend([
+            sep(),
+            Span::styled(
+                format!(
+                    "{} comment{}",
+                    pr.comments,
+                    if pr.comments == 1 { "" } else { "s" }
+                ),
+                Style::default().fg(theme.text_muted),
+            ),
+        ]);
+    }
+
+    let mut links = Vec::new();
+    match &pr.preview {
+        Some(p) => {
+            let (word, color) = match p.state {
+                PreviewState::Ready => ("preview", theme.info),
+                PreviewState::Deploying => ("preview deploying", theme.warning),
+                PreviewState::Failed => ("preview failed", theme.failure),
+                PreviewState::Gone => ("preview inactive", theme.text_faint),
+            };
+            links.push(Span::styled(
+                format!("◆ {word} "),
+                Style::default().fg(color),
+            ));
+            links.push(Span::styled(
+                p.url.clone(),
+                Style::default().fg(theme.text).underlined(),
+            ));
+        }
+        None => links.push(Span::styled("no preview", faint)),
+    }
+    if !pr.labels.is_empty() {
+        links.push(sep());
+        links.push(Span::styled(
+            pr.labels.join(", "),
+            Style::default().fg(theme.text_muted),
+        ));
+    }
+    vec![
+        rule,
+        Line::from(head),
+        Line::from(state_line),
+        Line::from(links),
+    ]
 }
 
 /// `s` padded with spaces to `w` display columns.
@@ -5946,6 +6271,7 @@ fn render_finder_overlay(f: &mut Frame, area: Rect, state: &AppState) {
         crate::app::state::FinderKind::Runs => "Find run",
         crate::app::state::FinderKind::DetailItems => "Find job / step",
         crate::app::state::FinderKind::GitEntries => "Find changed file",
+        crate::app::state::FinderKind::PullRequests => "Find pull request",
     };
     let block = Block::default()
         .title(Span::styled(
@@ -6085,6 +6411,25 @@ fn render_workflows_list(f: &mut Frame, area: Rect, state: &AppState) {
             format!("  ⏵{wf_run}"),
             Style::default().fg(theme.warning).bold(),
         ));
+    }
+    // Open PRs, kept current in the background — a new one shows up here
+    // without the card having to be opened to find out.
+    if let Some(data) = state.pr_data() {
+        tallies.push(Span::styled(
+            format!("  PRs {}", data.prs.len()),
+            Style::default().fg(theme.accent),
+        ));
+        let red = data
+            .prs
+            .iter()
+            .filter(|p| p.checks == Some(crate::provider::Checks::Failing))
+            .count();
+        if red > 0 {
+            tallies.push(Span::styled(
+                format!(" ✗{red}"),
+                Style::default().fg(theme.failure),
+            ));
+        }
     }
     let blk = panel(
         &format!("Workflows  {count}"),
@@ -13840,28 +14185,58 @@ jobs:
     }
 
     fn pr_card_state(n: usize, cursor: usize) -> AppState {
+        use crate::provider::{Checks, Preview, PreviewState, PullRequest, PullRequests, Review};
         let mut st = AppState::new(
             "acme/api".into(),
-            "main".into(),
+            "feature-2".into(),
             Vec::new(),
             crate::config::KeymapConfig::default(),
             crate::history::History::default(),
         );
         let prs = (0..n)
-            .map(|i| crate::provider::PullRequest {
+            .map(|i| PullRequest {
                 number: 200 - i as u64,
                 title: format!("Improve the CV section, take {i}"),
-                url: format!("https://github.com/o/r/pull/{}", 200 - i),
+                url: format!("https://github.com/acme/api/pull/{}", 200 - i),
                 draft: i == 1,
-                author: "octocat".into(),
+                author: if i == 3 {
+                    "dependabot".into()
+                } else {
+                    "octocat".into()
+                },
+                author_is_bot: i == 3,
                 head: format!("feature-{i}"),
+                cross_repo: false,
+                base: "main".into(),
                 updated_at: Some(Utc::now() - chrono::Duration::hours(i as i64 * 7)),
+                additions: 7503,
+                deletions: 297,
+                checks: Some(if i == 0 {
+                    Checks::Failing
+                } else {
+                    Checks::Passing
+                }),
+                review: Some(Review::Required),
+                conflicting: i == 2,
+                labels: vec!["matcher".into()],
+                comments: 2,
+                preview: (i == 2).then(|| Preview {
+                    url: "https://198.preview.example.com".into(),
+                    state: PreviewState::Ready,
+                }),
             })
             .collect();
-        st.pr_card = Some(crate::app::state::PrCard {
+        st.pr_list = Some(crate::app::state::PrList {
             repo: "acme/api".into(),
-            prs: Some(Ok(prs)),
+            data: Ok(PullRequests {
+                viewer: "octocat".into(),
+                prs,
+            }),
+            fetched_tick: 0,
+        });
+        st.pr_card = Some(crate::app::state::PrCard {
             cursor,
+            placed: true,
             ..Default::default()
         });
         st
@@ -13883,26 +14258,94 @@ jobs:
 
     #[test]
     fn pr_card_lists_each_pr_with_its_branch_and_marks_the_cursor() {
-        let st = pr_card_state(3, 2);
-        let out = draw_pr_card(&st, 110, 20);
+        let st = pr_card_state(4, 2);
+        let out = draw_pr_card(&st, 130, 24);
         if std::env::var("JOG_SHOW").is_ok() {
             println!("{out}");
         }
-        assert!(out.contains("Pull requests  3"), "{out}");
-        assert!(out.contains("#200") && out.contains("#198"), "{out}");
+        assert!(out.contains("Pull requests  4"), "{out}");
+        assert!(out.contains("#200") && out.contains("#197"), "{out}");
         assert!(
             out.contains("feature-1") && out.contains("@octocat"),
             "{out}"
         );
         assert!(out.contains("draft"), "{out}");
+        assert!(out.contains("+7.5k −297"), "{out}");
         let cursor_line = out.lines().find(|l| l.contains('▌')).unwrap();
         assert!(cursor_line.contains("#198"), "{out}");
+        // The branch checked out here is marked in the gutter.
+        assert!(cursor_line.contains('⎇'), "{out}");
+    }
+
+    #[test]
+    fn pr_card_details_the_selected_pr_with_its_preview() {
+        let st = pr_card_state(4, 2);
+        let out = draw_pr_card(&st, 130, 24);
+        assert!(out.contains("main ← feature-2 (checked out)"), "{out}");
+        assert!(
+            out.contains("needs review") && out.contains("conflicts"),
+            "{out}"
+        );
+        assert!(out.contains("https://198.preview.example.com"), "{out}");
+        assert!(
+            out.contains("2 comments") && out.contains("matcher"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_pr_card_keeps_the_title_and_the_age_and_drops_the_branch() {
+        // The width the first version starved: titles cut to ten columns and
+        // the age pushed off the card's edge.
+        let st = pr_card_state(4, 0);
+        let out = draw_pr_card(&st, 84, 24);
+        if std::env::var("JOG_SHOW").is_ok() {
+            println!("{out}");
+        }
+        let row = out.lines().find(|l| l.contains("#198")).unwrap();
+        assert!(row.contains("Improve the CV section"), "{out}");
+        assert!(
+            row.trim_end()
+                .trim_end_matches('│')
+                .trim_end()
+                .ends_with("14h"),
+            "age shown: {out}"
+        );
+        assert!(!row.contains("feature-2"), "branch gives way first: {out}");
+    }
+
+    #[test]
+    fn nothing_on_the_pr_card_is_italic() {
+        // tmux under `screen` draws italics as reverse video: grey blocks.
+        let st = pr_card_state(4, 1);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| render_pr_card(f, f.area(), &st)).unwrap();
+        let buf = term.backend().buffer();
+        assert!(
+            buf.content()
+                .iter()
+                .all(|c| !c.modifier.contains(Modifier::ITALIC))
+        );
+    }
+
+    #[test]
+    fn pr_card_filters_hide_bots_and_show_only_mine() {
+        let mut st = pr_card_state(4, 0);
+        assert_eq!(st.pr_visible().len(), 4);
+        st.pr_card.as_mut().unwrap().hide_bots = true;
+        assert!(st.pr_visible().iter().all(|p| !p.author_is_bot));
+        assert_eq!(st.pr_visible().len(), 3);
+        let out = draw_pr_card(&st, 130, 24);
+        assert!(out.contains("3 of 4") && out.contains("no bots"), "{out}");
+        st.pr_card.as_mut().unwrap().hide_bots = false;
+        st.pr_card.as_mut().unwrap().only_mine = true;
+        assert!(st.pr_visible().iter().all(|p| p.author == "octocat"));
     }
 
     #[test]
     fn pr_card_maps_each_visible_row_for_clicks() {
         let st = pr_card_state(40, 39);
-        draw_pr_card(&st, 100, 14);
+        draw_pr_card(&st, 100, 18);
         let hits = st.hits.borrow();
         let rows: Vec<usize> = hits
             .iter()
@@ -13920,7 +14363,7 @@ jobs:
     #[test]
     fn pr_card_scrolls_to_keep_the_cursor_on_screen() {
         let st = pr_card_state(40, 39);
-        let out = draw_pr_card(&st, 100, 14);
+        let out = draw_pr_card(&st, 100, 18);
         assert!(out.contains("#161"), "{out}");
         assert!(!out.contains("#200"), "{out}");
     }
@@ -13930,8 +14373,17 @@ jobs:
         let mut st = pr_card_state(0, 0);
         let out = draw_pr_card(&st, 100, 14);
         assert!(out.contains("no open pull requests"), "{out}");
-        st.pr_card.as_mut().unwrap().prs = None;
+        st.pr_list = None;
         let out = draw_pr_card(&st, 100, 14);
         assert!(out.contains("asking GitHub"), "{out}");
+    }
+
+    #[test]
+    fn short_ages_and_counts_fit_their_columns() {
+        assert_eq!(short_count(297), "297");
+        assert_eq!(short_count(7503), "7.5k");
+        assert_eq!(short_count(38711), "38k");
+        assert_eq!(short_age(Utc::now() - chrono::Duration::days(3)), "3d");
+        assert_eq!(short_age(Utc::now() - chrono::Duration::days(1000)), "2y");
     }
 }

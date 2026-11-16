@@ -458,29 +458,40 @@ impl GitHubProvider {
             author: pr.user.map(|u| u.login).unwrap_or_default(),
             head: pr.head.ref_field,
             updated_at: pr.updated_at,
+            ..Default::default()
         }
     }
 
+    /// Recent runs of every workflow on `branch` — what a PR's CI looks like
+    /// from the runs list.
+    pub async fn list_branch_runs(&self, branch: &str, limit: u8) -> Result<Vec<Run>> {
+        let page = gated(
+            self.crab
+                .workflows(&self.repo.owner, &self.repo.repo)
+                .list_all_runs()
+                .branch(branch)
+                .per_page(limit)
+                .send(),
+        )
+        .await
+        .context("list branch runs")?;
+        Ok(page.items.into_iter().map(map_run).collect())
+    }
+
     /// The repo's open pull requests, most recently touched first — the PR
-    /// card's list. One page of fifty: a card is for the PRs in play, and a
-    /// repo with more open than that has a backlog, not a review queue.
-    pub async fn open_pull_requests(&self) -> Result<Vec<crate::provider::PullRequest>> {
-        let page = self
-            .crab
-            .pulls(&self.repo.owner, &self.repo.repo)
-            .list()
-            .state(octocrab::params::State::Open)
-            .sort(octocrab::params::pulls::Sort::Updated)
-            .direction(octocrab::params::Direction::Descending)
-            .per_page(50)
-            .send()
+    /// card's list. One GraphQL request carries what the REST list would need
+    /// a call per PR for: check state, review decision, mergeability, and the
+    /// preview deployment's URL. One page of fifty: a card is for the PRs in
+    /// play, and a repo with more open than that has a backlog, not a queue.
+    pub async fn open_pull_requests(&self) -> Result<crate::provider::PullRequests> {
+        let body = serde_json::json!({
+            "query": PULL_REQUESTS_QUERY,
+            "variables": { "owner": self.repo.owner, "name": self.repo.repo },
+        });
+        let resp: serde_json::Value = gated(self.crab.graphql(&body))
             .await
             .context("list pull requests")?;
-        Ok(page
-            .items
-            .into_iter()
-            .map(|pr| self.pull_request_from(pr))
-            .collect())
+        parse_pull_requests(&resp)
     }
 
     /// Bank the budget an answer arrived with, when it carried one.
@@ -1106,8 +1117,152 @@ fn runs_per_workflow(limit: u8, files: usize) -> u8 {
         .min(limit.max(1) as usize) as u8
 }
 
+const PULL_REQUESTS_QUERY: &str = r#"
+query($owner: String!, $name: String!) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes {
+        number title url isDraft updatedAt headRefName baseRefName isCrossRepository
+        additions deletions mergeable reviewDecision
+        author { login __typename }
+        labels(first: 6) { nodes { name } }
+        comments { totalCount }
+        commits(last: 1) { nodes { commit {
+          statusCheckRollup { state }
+          deployments(last: 1) { nodes { latestStatus { environmentUrl state } } }
+        } } }
+      }
+    }
+  }
+}
+"#;
+
+/// Read the answer to [`PULL_REQUESTS_QUERY`]. GraphQL reports failure inside
+/// a 200, so an `errors` array is the error, not something to skip past.
+fn parse_pull_requests(v: &serde_json::Value) -> Result<crate::provider::PullRequests> {
+    use crate::provider::{Checks, Preview, PreviewState, PullRequest, PullRequests, Review};
+    if let Some(msg) = v["errors"][0]["message"].as_str() {
+        return Err(anyhow!("{msg}"));
+    }
+    let s = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    let nodes = v["data"]["repository"]["pullRequests"]["nodes"]
+        .as_array()
+        .ok_or_else(|| anyhow!("no pull requests in the answer"))?;
+    let prs = nodes
+        .iter()
+        .map(|n| {
+            let commit = &n["commits"]["nodes"][0]["commit"];
+            let checks = match commit["statusCheckRollup"]["state"].as_str() {
+                Some("SUCCESS") => Some(Checks::Passing),
+                Some("FAILURE" | "ERROR") => Some(Checks::Failing),
+                Some("PENDING" | "EXPECTED") => Some(Checks::Pending),
+                _ => None,
+            };
+            let review = match n["reviewDecision"].as_str() {
+                Some("APPROVED") => Some(Review::Approved),
+                Some("CHANGES_REQUESTED") => Some(Review::ChangesRequested),
+                Some("REVIEW_REQUIRED") => Some(Review::Required),
+                _ => None,
+            };
+            let status = &commit["deployments"]["nodes"][0]["latestStatus"];
+            let preview = status["environmentUrl"]
+                .as_str()
+                .filter(|u| !u.is_empty())
+                .map(|url| Preview {
+                    url: url.to_string(),
+                    state: match status["state"].as_str() {
+                        Some("SUCCESS") => PreviewState::Ready,
+                        Some("FAILURE" | "ERROR") => PreviewState::Failed,
+                        Some("INACTIVE" | "DESTROYED") => PreviewState::Gone,
+                        _ => PreviewState::Deploying,
+                    },
+                });
+            PullRequest {
+                number: n["number"].as_u64().unwrap_or_default(),
+                title: crate::provider::emoji_width_safe(&s(&n["title"])),
+                url: s(&n["url"]),
+                draft: n["isDraft"].as_bool().unwrap_or(false),
+                author: s(&n["author"]["login"]),
+                author_is_bot: n["author"]["__typename"].as_str() == Some("Bot"),
+                head: s(&n["headRefName"]),
+                cross_repo: n["isCrossRepository"].as_bool().unwrap_or(false),
+                base: s(&n["baseRefName"]),
+                updated_at: n["updatedAt"].as_str().and_then(|t| t.parse().ok()),
+                additions: n["additions"].as_u64().unwrap_or_default(),
+                deletions: n["deletions"].as_u64().unwrap_or_default(),
+                checks,
+                review,
+                conflicting: n["mergeable"].as_str() == Some("CONFLICTING"),
+                labels: n["labels"]["nodes"]
+                    .as_array()
+                    .map(|l| l.iter().map(|l| s(&l["name"])).collect())
+                    .unwrap_or_default(),
+                comments: n["comments"]["totalCount"].as_u64().unwrap_or_default(),
+                preview,
+            }
+        })
+        .collect();
+    Ok(PullRequests {
+        viewer: s(&v["data"]["viewer"]["login"]),
+        prs,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_graphql_pr_answer_reads_into_checks_review_and_preview() {
+        use crate::provider::{Checks, PreviewState, Review};
+        let v = serde_json::json!({"data": {
+            "viewer": {"login": "octocat"},
+            "repository": {"pullRequests": {"nodes": [{
+                "number": 7, "title": "Add login", "url": "https://github.com/acme/api/pull/7",
+                "isDraft": false, "updatedAt": "2026-11-01T10:00:00Z",
+                "headRefName": "login", "baseRefName": "main",
+                "additions": 12, "deletions": 3, "mergeable": "CONFLICTING",
+                "reviewDecision": "APPROVED",
+                "author": {"login": "dependabot", "__typename": "Bot"},
+                "labels": {"nodes": [{"name": "deps"}]},
+                "comments": {"totalCount": 4},
+                "commits": {"nodes": [{"commit": {
+                    "statusCheckRollup": {"state": "FAILURE"},
+                    "deployments": {"nodes": [{"latestStatus": {
+                        "environmentUrl": "https://7.preview.example.com", "state": "SUCCESS"}}]}
+                }}]}
+            }, {
+                "number": 8, "title": "Quiet", "url": "u", "isDraft": true,
+                "headRefName": "q", "baseRefName": "main", "mergeable": "UNKNOWN",
+                "reviewDecision": null, "author": null,
+                "labels": {"nodes": []}, "comments": {"totalCount": 0},
+                "commits": {"nodes": [{"commit": {"statusCheckRollup": null,
+                    "deployments": {"nodes": []}}}]}
+            }]}}
+        }});
+        let got = parse_pull_requests(&v).unwrap();
+        assert_eq!(got.viewer, "octocat");
+        let a = &got.prs[0];
+        assert_eq!(a.checks, Some(Checks::Failing));
+        assert_eq!(a.review, Some(Review::Approved));
+        assert!(a.conflicting && a.author_is_bot);
+        assert_eq!(a.preview.as_ref().unwrap().state, PreviewState::Ready);
+        assert_eq!(
+            a.preview.as_ref().unwrap().url,
+            "https://7.preview.example.com"
+        );
+        assert_eq!((a.additions, a.deletions, a.comments), (12, 3, 4));
+        let b = &got.prs[1];
+        assert!(b.draft && b.checks.is_none() && b.review.is_none() && b.preview.is_none());
+
+        let err = serde_json::json!({"errors": [{"message": "Field 'x' doesn't exist"}]});
+        assert!(
+            parse_pull_requests(&err)
+                .unwrap_err()
+                .to_string()
+                .contains("doesn't exist")
+        );
+    }
+
     use super::*;
 
     /// `clamp(3, limit)` panics the moment its floor passes its ceiling, so a

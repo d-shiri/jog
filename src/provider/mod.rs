@@ -128,16 +128,71 @@ pub struct PrInfo {
 }
 
 /// One open pull request, as the PR card lists it: enough to recognise it at a
-/// glance (who, which branch, how fresh) and to open it.
-#[derive(Debug, Clone)]
+/// glance (who, which branch, how fresh), to judge whether it can land (checks,
+/// review, conflicts), and to open it or its preview.
+#[derive(Debug, Clone, Default)]
 pub struct PullRequest {
     pub number: u64,
     pub title: String,
     pub url: String,
     pub draft: bool,
     pub author: String,
+    /// The author is an app (dependabot, renovate) rather than a person.
+    pub author_is_bot: bool,
     pub head: String,
+    /// The head branch lives in a fork, not in this repo.
+    pub cross_repo: bool,
+    pub base: String,
     pub updated_at: Option<DateTime<Utc>>,
+    pub additions: u64,
+    pub deletions: u64,
+    /// The head commit's combined check state; `None` when nothing reports.
+    pub checks: Option<Checks>,
+    pub review: Option<Review>,
+    /// GitHub says the branch no longer merges cleanly into its base.
+    pub conflicting: bool,
+    pub labels: Vec<String>,
+    pub comments: u64,
+    /// The head commit's latest deployment, when one was made — the preview
+    /// environment a PR workflow stands up.
+    pub preview: Option<Preview>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checks {
+    Passing,
+    Failing,
+    Pending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Review {
+    Approved,
+    ChangesRequested,
+    Required,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preview {
+    pub url: String,
+    pub state: PreviewState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewState {
+    Ready,
+    Deploying,
+    Failed,
+    /// Superseded or torn down: the URL may no longer answer.
+    Gone,
+}
+
+/// The open PRs of a repo and who is asking — the card's "mine" filter needs
+/// the second as much as the first.
+#[derive(Debug, Clone, Default)]
+pub struct PullRequests {
+    pub viewer: String,
+    pub prs: Vec<PullRequest>,
 }
 
 #[derive(Debug, Clone)]

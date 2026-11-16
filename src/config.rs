@@ -262,6 +262,11 @@ pub struct KeymapConfig {
     pub services: String,
     // open pull requests of the repo in hand (Workflows view)
     pub pull_requests: String,
+    // inside the PR card
+    pub pr_preview: String,
+    pub pr_checkout: String,
+    pub pr_hide_bots: String,
+    pub pr_mine: String,
     // snooze notifications: 30m, press again for 60m, again for off
     pub snooze: String,
     // batch commit: mark repos on the dashboard, commit them with one message
@@ -322,6 +327,10 @@ impl Default for KeymapConfig {
             repos_view: "H".into(),
             services: "S".into(),
             pull_requests: "p".into(),
+            pr_preview: "v".into(),
+            pr_checkout: "c".into(),
+            pr_hide_bots: "b".into(),
+            pr_mine: "m".into(),
             snooze: "Z".into(),
             repo_mark: "Space".into(),
             batch_commit: "C".into(),

@@ -632,6 +632,16 @@ pub fn checkout(dir: &Path, name: &str, on_line: &mut dyn FnMut(String, bool)) -
     Ok(())
 }
 
+/// `git fetch origin <branch>`, so a branch that only exists on the remote —
+/// someone else's PR — can be checked out by name afterwards.
+pub fn fetch_branch(dir: &Path, branch: &str) -> Result<()> {
+    let (ok, lines) = git_streaming(dir, &["fetch", "origin", branch], &mut |_, _| {})?;
+    if !ok {
+        return Err(anyhow!("git fetch: {}", last_line(&lines.join("\n"))));
+    }
+    Ok(())
+}
+
 /// `git pull --ff-only`: a batch never makes merge commits. A branch that has
 /// diverged fails here and waits for a person.
 pub fn pull_ff(dir: &Path, on_line: &mut dyn FnMut(String, bool)) -> Result<()> {

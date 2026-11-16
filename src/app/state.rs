@@ -214,36 +214,51 @@ pub enum View {
     BatchCommit,
 }
 
-/// The pull-request card: the active repo's open PRs, one cursor over them.
+/// The active repo's open PRs as last fetched — shared by the PR card and the
+/// count on the Workflows title, so opening the card shows something at once.
+#[derive(Debug, Clone)]
+pub struct PrList {
+    /// Which repo the list was asked of — an answer for a repo since switched
+    /// away from is never drawn under the wrong name.
+    pub repo: String,
+    pub data: Result<crate::provider::PullRequests, String>,
+    /// The tick it landed on, for the background refresh's cadence.
+    pub fetched_tick: u64,
+}
+
+/// The pull-request card's own state: where the cursor is and what is hidden.
+/// The PRs themselves live in [`AppState::pr_list`].
 #[derive(Debug, Clone, Default)]
 pub struct PrCard {
-    /// Which repo the list was asked of — an answer for a repo since switched
-    /// away from is dropped rather than drawn under the wrong name.
-    pub repo: String,
-    /// `None` while the first answer is on its way.
-    pub prs: Option<Result<Vec<crate::provider::PullRequest>, String>>,
+    /// Index into [`AppState::pr_visible`], not into the full list.
     pub cursor: usize,
     /// First row on screen; kept by the renderer so the cursor stays in view.
     pub scroll: std::cell::Cell<usize>,
     /// How many rows the last frame had room for — what a page key moves by.
     pub viewport: std::cell::Cell<usize>,
-    /// The tick the card went up on, for its row-by-row entrance.
+    /// The tick the rows started arriving, for their entrance.
     pub opened_tick: Option<u64>,
-    /// A re-fetch is in flight over a list already on screen.
-    pub refreshing: bool,
+    /// Hide PRs opened by apps — dependabot and friends.
+    pub hide_bots: bool,
+    /// Show only the viewer's own PRs.
+    pub only_mine: bool,
+    /// The cursor has been put on the current branch's PR once; after that
+    /// it stays where the user leaves it.
+    pub placed: bool,
 }
 
-impl PrCard {
-    pub fn list(&self) -> &[crate::provider::PullRequest] {
-        match &self.prs {
-            Some(Ok(v)) => v,
-            _ => &[],
-        }
-    }
+/// The runs list's key for "every run on this branch", standing where a
+/// workflow file name otherwise would. The glyph cannot start a file name, so
+/// the two never collide, and the crumb that prints the key reads naturally.
+pub const BRANCH_RUNS_PREFIX: &str = "\u{2387} ";
 
-    pub fn selected(&self) -> Option<&crate::provider::PullRequest> {
-        self.list().get(self.cursor)
-    }
+pub fn branch_runs_key(branch: &str) -> String {
+    format!("{BRANCH_RUNS_PREFIX}{branch}")
+}
+
+/// The branch a runs key stands for, when it stands for one.
+pub fn runs_key_branch(key: &str) -> Option<&str> {
+    key.strip_prefix(BRANCH_RUNS_PREFIX)
 }
 
 /// GitHub's mark, as a Nerd Font glyph. Overridable, because a terminal without
@@ -1650,6 +1665,7 @@ pub enum FinderKind {
     DetailItems,
     Repos,
     GitEntries,
+    PullRequests,
 }
 
 #[derive(Debug, Clone)]
@@ -2572,6 +2588,13 @@ pub struct AppState {
     pub show_services: bool,
     /// The pull-request card over the Workflows view, while it is open.
     pub pr_card: Option<PrCard>,
+    /// The card as it was when Enter left it for a branch's runs — put back
+    /// up when `back` returns to the Workflows view.
+    pub pr_card_parked: Option<PrCard>,
+    /// The active repo's open PRs as last fetched.
+    pub pr_list: Option<PrList>,
+    /// A PR fetch is in flight — one at a time, so answers land in order.
+    pub pr_fetching: bool,
     /// The tick the services card went up on — the clock its rows reveal
     /// themselves against. `None` while it is closed, and while it is on
     /// screen without an entrance to play (a redraw, a test).
@@ -2631,6 +2654,57 @@ pub struct WatchTail {
 }
 
 impl AppState {
+    /// The open PRs of the active repo, when the last fetch was for it and
+    /// worked.
+    pub fn pr_data(&self) -> Option<&crate::provider::PullRequests> {
+        self.pr_list
+            .as_ref()
+            .filter(|l| l.repo == self.repo_label)
+            .and_then(|l| l.data.as_ref().ok())
+    }
+
+    /// The PRs the card shows, after its filters, in list order.
+    pub fn pr_visible(&self) -> Vec<&crate::provider::PullRequest> {
+        let Some(data) = self.pr_data() else {
+            return Vec::new();
+        };
+        let card = self.pr_card.as_ref();
+        let hide_bots = card.is_some_and(|c| c.hide_bots);
+        let only_mine = card.is_some_and(|c| c.only_mine);
+        data.prs
+            .iter()
+            .filter(|p| !(hide_bots && p.author_is_bot))
+            .filter(|p| !only_mine || p.author == data.viewer)
+            .collect()
+    }
+
+    /// The PR under the card's cursor.
+    pub fn pr_selected(&self) -> Option<&crate::provider::PullRequest> {
+        let cursor = self.pr_card.as_ref()?.cursor;
+        self.pr_visible().get(cursor).copied()
+    }
+
+    /// The open PR whose head is the branch checked out here, if any.
+    pub fn pr_for_current_branch(&self) -> Option<u64> {
+        self.pr_data()?
+            .prs
+            .iter()
+            .find(|p| p.head == self.current_branch)
+            .map(|p| p.number)
+    }
+
+    /// Put the card's cursor on PR `number` if it is visible; otherwise keep
+    /// the row it was on, inside the list's new length.
+    pub fn pr_cursor_to(&mut self, number: Option<u64>) {
+        let visible: Vec<u64> = self.pr_visible().iter().map(|p| p.number).collect();
+        let Some(card) = self.pr_card.as_mut() else {
+            return;
+        };
+        card.cursor = number
+            .and_then(|n| visible.iter().position(|v| *v == n))
+            .unwrap_or(card.cursor.min(visible.len().saturating_sub(1)));
+    }
+
     pub fn new(
         repo_label: String,
         current_branch: String,
@@ -2767,6 +2841,9 @@ impl AppState {
             kuma_error: None,
             show_services: false,
             pr_card: None,
+            pr_card_parked: None,
+            pr_list: None,
+            pr_fetching: false,
             services_opened_tick: None,
             kuma_fetched_at: None,
             kuma_last_poll_tick: 0,
@@ -3013,7 +3090,12 @@ impl AppState {
     pub fn workflow_file_of(&self, run: &Run) -> Option<String> {
         run.workflow_file
             .clone()
-            .or_else(|| self.workflow_for_runs.clone())
+            // A branch's runs list spans every workflow: its key names no file.
+            .or_else(|| {
+                self.workflow_for_runs
+                    .clone()
+                    .filter(|k| runs_key_branch(k).is_none())
+            })
             .or_else(|| {
                 self.workflows
                     .iter()

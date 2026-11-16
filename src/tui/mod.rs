@@ -80,7 +80,10 @@ pub enum AppEvent {
     PrLoaded(String, String, Option<PrInfo>),
     /// The open PRs of a repo, for the PR card: the repo label it was asked
     /// of, and the list or why it could not be read.
-    PullRequestsLoaded(String, Result<Vec<crate::provider::PullRequest>, String>),
+    PullRequestsLoaded(String, Result<crate::provider::PullRequests, String>),
+    /// A PR's branch was checked out from the card: the branch, or why not.
+    /// Carries the repo label it ran in, so a repo switched since is left alone.
+    PrCheckedOut(String, Result<String, String>),
     /// Recent runs of a repo whose push is being followed into CI.
     PushWatchRuns(String, Vec<Run>),
     /// The log-so-far of the running job the Watch view is following: job id,
@@ -640,7 +643,9 @@ async fn event_loop(
                         state.pending = state.pending.saturating_sub(1);
                     }
                     AppEvent::RunDetailLoaded(detail) => {
-                        if let Some(file) = state.workflow_for_runs.as_deref() {
+                        if let Some(file) = state.workflow_for_runs.as_deref()
+                            && crate::app::state::runs_key_branch(file).is_none()
+                        {
                             state.history.record(file, &detail);
                         }
                         // Sound + desktop notification when a run we saw as Running finishes.
@@ -664,7 +669,9 @@ async fn event_loop(
                         maybe_spawn_digest(&provider, state, &tx);
                     }
                     AppEvent::RunPreviewLoaded(run_id, detail) => {
-                        if let Some(file) = state.workflow_for_runs.as_deref() {
+                        if let Some(file) = state.workflow_for_runs.as_deref()
+                            && crate::app::state::runs_key_branch(file).is_none()
+                        {
                             state.history.record(file, &detail);
                         }
                         if state.runs_preview_id == Some(run_id) {
@@ -909,39 +916,18 @@ async fn event_loop(
                         }
                     }
                     AppEvent::PullRequestsLoaded(repo, result) => {
-                        if let Some(card) = state.pr_card.as_mut()
-                            && card.repo == repo
-                        {
-                            card.refreshing = false;
-                            // A refresh that fails keeps the list it had: an
-                            // error line over PRs still worth opening helps
-                            // no one. The status line says what went wrong.
-                            match (&card.prs, result) {
-                                (Some(Ok(_)), Err(e)) => {
-                                    state.set_status(format!("pull requests: {e}"));
-                                }
-                                (_, result) => {
-                                    // The first list is what the entrance
-                                    // plays on: timed from the open, it would
-                                    // be over before the answer landed.
-                                    if card.prs.is_none() {
-                                        card.opened_tick = Some(state.tick_count);
-                                    }
-                                    // Keep the cursor on the PR it was on: a
-                                    // refresh re-sorts by last update, and `o`
-                                    // must not open a neighbour.
-                                    let held = card.selected().map(|p| p.number);
-                                    let len = result.as_ref().map_or(0, |v| v.len());
-                                    card.cursor = held
-                                        .and_then(|n| {
-                                            result.as_ref().ok()?.iter().position(|p| p.number == n)
-                                        })
-                                        .unwrap_or(card.cursor.min(len.saturating_sub(1)));
-                                    card.prs = Some(result);
-                                }
+                        state.pr_fetching = false;
+                        on_pull_requests(state, repo, result);
+                    }
+                    AppEvent::PrCheckedOut(repo, result) => match result {
+                        Ok(branch) => {
+                            state.set_status(format!("checked out {branch}"));
+                            if repo == state.repo_label {
+                                state.current_branch = branch;
                             }
                         }
-                    }
+                        Err(e) => state.set_status_err(format!("checkout: {e}")),
+                    },
                     AppEvent::PushWatchRuns(spec, runs) => {
                         state.pending = state.pending.saturating_sub(1);
                         settle_push_watch(state, &spec, &runs, &config);
@@ -1123,6 +1109,7 @@ async fn event_loop(
                     AppEvent::RepoSwitched { label, branch, workflows } => {
                         state.repo_label = label;
                         state.repo_label_implicit = false;
+                        state.pr_card_parked = None;
                         state.current_branch = branch;
                         state.workflows = sort_with_favorites(workflows, &config);
                         state.workflow_cursor = 0;
@@ -1225,6 +1212,7 @@ async fn event_loop(
                     state.status_msg = None;
                     redraw = true;
                 }
+                maybe_refresh_pull_requests(state, &provider, &tx);
                 let now = tokio::time::Instant::now();
                 if now.duration_since(last_poll) >= poll_interval {
                     last_poll = now;
@@ -1629,11 +1617,23 @@ async fn handle_key(
             }
             View::Workflows => return Some(AppEvent::Quit),
             View::Runs => {
+                let from_pr = state
+                    .workflow_for_runs
+                    .as_deref()
+                    .and_then(crate::app::state::runs_key_branch)
+                    .is_some();
                 state.switch_view(View::Workflows);
                 state.runs.clear();
                 state.workflow_for_runs = None;
                 state.runs_preview = None;
                 state.runs_preview_id = None;
+                // Came here from the PR card: go back to it, not past it. A
+                // card parked on some earlier trip is not this one's to raise.
+                if let Some(card) = state.pr_card_parked.take()
+                    && from_pr
+                {
+                    state.pr_card = Some(card);
+                }
             }
             View::RunDetail | View::Watch => {
                 state.switch_view(View::Runs);
@@ -2778,6 +2778,12 @@ fn commit_finder_choice(
             let max = state.detail_items().len();
             state.detail_cursor = target.min(max.saturating_sub(1));
         }
+        FinderKind::PullRequests => {
+            let max = state.pr_visible().len();
+            if let Some(card) = state.pr_card.as_mut() {
+                card.cursor = target.min(max.saturating_sub(1));
+            }
+        }
     }
 }
 
@@ -3876,26 +3882,85 @@ fn spawn_fetch_pr(
 }
 
 /// `p` on the Workflows view: put up the PR card and ask GitHub what is open.
+/// A list fetched in the background shows at once; the fresh one replaces it.
 fn open_pr_card(
     state: &mut AppState,
     provider: &Arc<GitHubProvider>,
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
-    state.pr_card = Some(crate::app::state::PrCard {
-        repo: state.repo_label.clone(),
-        opened_tick: Some(state.tick_count),
-        ..Default::default()
-    });
+    state.pr_card_parked = None;
+    state.pr_card = Some(crate::app::state::PrCard::default());
+    if state.pr_data().is_some() {
+        place_pr_cursor(state);
+    }
     spawn_fetch_pull_requests(state, provider, tx);
 }
 
-/// Ask for the active repo's open PRs. Outside the `pending` counter for the
-/// same reason as the branch PR: the card says "loading" itself.
+/// The first time the card has rows: start their entrance, and put the cursor
+/// on the PR of the branch checked out here — the one you most likely came for.
+fn place_pr_cursor(state: &mut AppState) {
+    let mine = state.pr_for_current_branch();
+    let tick = state.tick_count;
+    let Some(card) = state.pr_card.as_mut() else {
+        return;
+    };
+    if card.placed {
+        return;
+    }
+    card.placed = true;
+    card.opened_tick = Some(tick);
+    state.pr_cursor_to(mine);
+}
+
+/// A PR list landed: keep it, and keep the card's cursor on the PR it was on —
+/// a refresh re-sorts by last update, and `o` must not open a neighbour.
+fn on_pull_requests(
+    state: &mut AppState,
+    repo: String,
+    result: Result<crate::provider::PullRequests, String>,
+) {
+    // An answer for a repo since switched away from would only push the
+    // active repo's list out; the background refresh asks again.
+    if repo != state.repo_label {
+        return;
+    }
+    let held = state.pr_selected().map(|p| p.number);
+    let had_list = state.pr_data().is_some();
+    // A refresh that fails keeps the list it had: an error line over PRs
+    // still worth opening helps no one. The status line says what went wrong.
+    if let (true, Err(e)) = (had_list, &result) {
+        if state.pr_card.is_some() {
+            state.set_status_err(format!("pull requests: {e}"));
+        }
+        if let Some(l) = state.pr_list.as_mut() {
+            l.fetched_tick = state.tick_count;
+        }
+        return;
+    }
+    state.pr_list = Some(crate::app::state::PrList {
+        repo,
+        data: result,
+        fetched_tick: state.tick_count,
+    });
+    if state.pr_card.as_ref().is_some_and(|c| c.placed) {
+        state.pr_cursor_to(held);
+    } else if state.pr_data().is_some() {
+        place_pr_cursor(state);
+    }
+}
+
+/// Ask for the active repo's open PRs — one request at a time, so answers land
+/// in the order they were asked. Outside the `pending` counter: the card says
+/// "loading" itself, and a background refresh is nothing to wait on.
 fn spawn_fetch_pull_requests(
-    state: &AppState,
+    state: &mut AppState,
     provider: &Arc<GitHubProvider>,
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
+    if state.pr_fetching {
+        return;
+    }
+    state.pr_fetching = true;
     let (p, tx, repo) = (provider.clone(), tx.clone(), state.repo_label.clone());
     tokio::spawn(async move {
         let result = p.open_pull_requests().await.map_err(|e| format!("{e:#}"));
@@ -3903,7 +3968,35 @@ fn spawn_fetch_pull_requests(
     });
 }
 
-/// Keys while the PR card is up: move, open, refresh, close.
+/// How often the PR list refreshes on its own while the Workflows view (or
+/// the card) is on screen, in ticks: a minute. PRs move on the scale of
+/// reviews and pushes, and the one GraphQL request is cheap.
+const PR_REFRESH_TICKS: u64 = 600;
+
+/// Keep the PR count on the Workflows title current without being asked.
+fn maybe_refresh_pull_requests(
+    state: &mut AppState,
+    provider: &Arc<GitHubProvider>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    if state.view != View::Workflows && state.pr_card.is_none() {
+        return;
+    }
+    if state.repo_label_implicit || state.pr_fetching {
+        return;
+    }
+    let stale = match &state.pr_list {
+        Some(l) if l.repo == state.repo_label => {
+            state.tick_count.saturating_sub(l.fetched_tick) >= PR_REFRESH_TICKS
+        }
+        _ => true,
+    };
+    if stale {
+        spawn_fetch_pull_requests(state, provider, tx);
+    }
+}
+
+/// Keys while the PR card is up.
 fn handle_pr_card_key(
     state: &mut AppState,
     key: KeyEvent,
@@ -3911,10 +4004,10 @@ fn handle_pr_card_key(
     provider: &Arc<GitHubProvider>,
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
+    let len = state.pr_visible().len();
     let Some(card) = state.pr_card.as_mut() else {
         return;
     };
-    let len = card.list().len();
     if key_is(&key, km.down) || key.code == KeyCode::Down {
         move_cursor(&mut card.cursor, len, 1);
     } else if key_is(&key, km.up) || key.code == KeyCode::Up {
@@ -3929,18 +4022,48 @@ fn handle_pr_card_key(
         card.cursor = 0;
     } else if key_is(&key, km.scroll_bottom) || key.code == KeyCode::End {
         card.cursor = len.saturating_sub(1);
-    } else if key_is(&key, km.open_browser)
-        || key_is(&key, km.confirm)
-        || key.code == KeyCode::Enter
-    {
+    } else if key_is(&key, km.open_browser) {
         open_selected_pr(state);
-    } else if key_is(&key, km.refresh) {
-        // One fetch at a time: two in flight could land out of order and leave
-        // the older list on screen.
-        if card.prs.is_some() && !card.refreshing {
-            card.refreshing = true;
-            spawn_fetch_pull_requests(state, provider, tx);
+    } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter {
+        open_pr_runs(state, provider, tx);
+    } else if key_is(&key, km.pr_preview) {
+        open_selected_preview(state);
+    } else if key_is(&key, km.yank) {
+        if let Some(pr) = state.pr_selected() {
+            let (url, number) = (pr.url.clone(), pr.number);
+            match yank_to_clipboard(&url) {
+                Ok(()) => state.set_status(format!("copied PR #{number}'s link")),
+                Err(e) => state.set_status_err(e),
+            }
         }
+    } else if key_is(&key, km.pr_checkout) {
+        checkout_selected_pr(state, tx);
+    } else if key_is(&key, km.pr_hide_bots) || key_is(&key, km.pr_mine) {
+        let held = state.pr_selected().map(|p| p.number);
+        let card = state.pr_card.as_mut().expect("checked above");
+        if key_is(&key, km.pr_hide_bots) {
+            card.hide_bots = !card.hide_bots;
+        } else {
+            card.only_mine = !card.only_mine;
+        }
+        state.pr_cursor_to(held);
+    } else if key_is(&key, km.finder) {
+        let items: Vec<(usize, String)> = state
+            .pr_visible()
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                (
+                    i,
+                    format!("#{}  {}  {}  @{}", p.number, p.title, p.head, p.author),
+                )
+            })
+            .collect();
+        if !items.is_empty() {
+            state.finder = Some(Finder::new(FinderKind::PullRequests, items));
+        }
+    } else if key_is(&key, km.refresh) {
+        spawn_fetch_pull_requests(state, provider, tx);
     } else if key_is(&key, km.back)
         || key_is(&key, km.quit)
         || key_is(&key, km.pull_requests)
@@ -3954,12 +4077,95 @@ fn handle_pr_card_key(
 
 /// Open the PR under the card's cursor in the browser.
 fn open_selected_pr(state: &mut AppState) {
-    let Some(pr) = state.pr_card.as_ref().and_then(|c| c.selected()) else {
+    let Some(pr) = state.pr_selected() else {
         return;
     };
     let (url, number) = (pr.url.clone(), pr.number);
     let _ = open::that(&url);
     state.set_status(format!("opened PR #{number}"));
+}
+
+/// Open the selected PR's preview deployment — the environment its workflow
+/// stood up, as GitHub recorded it.
+fn open_selected_preview(state: &mut AppState) {
+    let Some(pr) = state.pr_selected() else {
+        return;
+    };
+    let number = pr.number;
+    match pr.preview.clone() {
+        Some(p) => {
+            let _ = open::that(&p.url);
+            let note = match p.state {
+                crate::provider::PreviewState::Ready => "",
+                crate::provider::PreviewState::Deploying => " (still deploying)",
+                crate::provider::PreviewState::Failed => " (its last deploy failed)",
+                crate::provider::PreviewState::Gone => " (marked inactive)",
+            };
+            state.set_status(format!("opened #{number}'s preview{note}"));
+        }
+        None => state.set_status(format!("#{number} has no preview deployment")),
+    }
+}
+
+/// Enter on a PR: the runs of its branch, every workflow — the PR's CI from
+/// jog's own side. The card is parked and comes back with `back`.
+fn open_pr_runs(
+    state: &mut AppState,
+    provider: &Arc<GitHubProvider>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(branch) = state.pr_selected().map(|p| p.head.clone()) else {
+        return;
+    };
+    state.pr_card_parked = state.pr_card.take();
+    state.needs_clear = true;
+    let key = crate::app::state::branch_runs_key(&branch);
+    state.switch_view(View::Runs);
+    state.workflow_for_runs = Some(key.clone());
+    state.runs.clear();
+    spawn_fetch_runs(provider.clone(), key, tx.clone(), state);
+}
+
+/// `c` on a PR: fetch its branch and check it out in the local checkout. Git
+/// refuses if local changes would be overwritten, and that refusal is the
+/// answer shown — nothing is stashed or forced.
+fn checkout_selected_pr(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
+    let Some((branch, number, cross_repo)) = state
+        .pr_selected()
+        .map(|p| (p.head.clone(), p.number, p.cross_repo))
+    else {
+        return;
+    };
+    // A fork's head branch is not on origin; fetching it by name would find
+    // nothing, or worse, origin's own branch of the same name.
+    if cross_repo {
+        state.set_status_err(format!(
+            "#{number} comes from a fork — check it out with `gh pr checkout {number}`"
+        ));
+        return;
+    }
+    let Some(dir) = state
+        .repos
+        .iter()
+        .find(|c| c.spec == state.repo_label)
+        .and_then(|c| c.path.clone())
+    else {
+        state.set_status_err("no local checkout of this repo to switch".into());
+        return;
+    };
+    if branch == state.current_branch {
+        state.set_status(format!("already on {branch}"));
+        return;
+    }
+    state.set_status(format!("checking out {branch}…"));
+    let (tx, repo) = (tx.clone(), state.repo_label.clone());
+    tokio::task::spawn_blocking(move || {
+        let result = crate::git::fetch_branch(&dir, &branch)
+            .and_then(|()| crate::git::checkout(&dir, &branch, &mut |_, _| {}))
+            .map(|()| branch)
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::PrCheckedOut(repo, result));
+    });
 }
 
 /// `o` in the working tree: the branch's PR if it has one, otherwise the page
@@ -4255,7 +4461,7 @@ async fn handle_click(
     }
     // The PR card is a list, so it takes clicks like one: a row selects, the
     // selected row opens, and only a click off the card puts it away.
-    if state.pr_card.is_some() {
+    if state.pr_card.is_some() && state.finder.is_none() {
         let hits = state.hits.borrow();
         let at = |h: &Hit| {
             hits.iter().any(|(r, hit)| {
@@ -4277,7 +4483,7 @@ async fn handle_click(
             let open = card.cursor == i;
             card.cursor = i;
             if open {
-                open_selected_pr(state);
+                open_pr_runs(state, provider, tx);
             }
         } else if !on_card {
             state.pr_card = None;
@@ -4369,6 +4575,10 @@ struct Keymap {
     repos_view: (KeyCode, KeyModifiers),
     services: (KeyCode, KeyModifiers),
     pull_requests: (KeyCode, KeyModifiers),
+    pr_preview: (KeyCode, KeyModifiers),
+    pr_checkout: (KeyCode, KeyModifiers),
+    pr_hide_bots: (KeyCode, KeyModifiers),
+    pr_mine: (KeyCode, KeyModifiers),
     snooze: (KeyCode, KeyModifiers),
     repo_mark: (KeyCode, KeyModifiers),
     batch_commit: (KeyCode, KeyModifiers),
@@ -4483,6 +4693,10 @@ fn resolve_keymap(cfg: &KeymapConfig) -> Result<Keymap> {
         repos_view: parse_key(&cfg.repos_view)?,
         services: parse_key(&cfg.services)?,
         pull_requests: parse_key(&cfg.pull_requests)?,
+        pr_preview: parse_key(&cfg.pr_preview)?,
+        pr_checkout: parse_key(&cfg.pr_checkout)?,
+        pr_hide_bots: parse_key(&cfg.pr_hide_bots)?,
+        pr_mine: parse_key(&cfg.pr_mine)?,
         snooze: parse_key(&cfg.snooze)?,
         repo_mark: parse_key(&cfg.repo_mark)?,
         batch_commit: parse_key(&cfg.batch_commit)?,
@@ -6016,7 +6230,11 @@ fn spawn_fetch_runs(
 ) {
     state.pending += 1;
     tokio::spawn(async move {
-        let runs = provider.list_runs(&file, 20).await.unwrap_or_default();
+        let runs = match crate::app::state::runs_key_branch(&file) {
+            Some(branch) => provider.list_branch_runs(branch, 20).await,
+            None => provider.list_runs(&file, 20).await,
+        }
+        .unwrap_or_default();
         let _ = tx.send(AppEvent::RunsLoaded(file, runs));
     });
 }
@@ -6654,6 +6872,104 @@ pub fn animated_glyph(s: Status, tick: u64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn p_on_the_workflows_view_opens_the_pr_card() {
+        let mut st = AppState::new(
+            "acme/api".into(),
+            "main".into(),
+            Vec::new(),
+            KeymapConfig::default(),
+            History::default(),
+        );
+        st.view = View::Workflows;
+        let km = resolve_keymap(&KeymapConfig::default()).unwrap();
+        let mut provider = Arc::new(
+            GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "test-token".into()).unwrap(),
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let key = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
+        handle_key(&mut st, key, &mut provider, &tx, &km).await;
+        assert!(st.pr_card.is_some(), "p should open the PR card");
+    }
+
+    /// A PR list of `(number, head)` pairs landing for the active repo.
+    fn pr_list_for(st: &mut AppState, prs: &[(u64, &str)]) {
+        let prs = prs
+            .iter()
+            .map(|(n, h)| crate::provider::PullRequest {
+                number: *n,
+                head: (*h).into(),
+                url: format!("https://github.com/acme/api/pull/{n}"),
+                ..Default::default()
+            })
+            .collect();
+        on_pull_requests(
+            st,
+            st.repo_label.clone(),
+            Ok(crate::provider::PullRequests {
+                viewer: "octocat".into(),
+                prs,
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pr_card_opens_on_the_checked_out_branchs_pr_and_enter_shows_its_runs() {
+        let mut st = AppState::new(
+            "acme/api".into(),
+            "fix-login".into(),
+            Vec::new(),
+            KeymapConfig::default(),
+            History::default(),
+        );
+        st.view = View::Workflows;
+        st.current_branch = "fix-login".into();
+        let km = resolve_keymap(&KeymapConfig::default()).unwrap();
+        let mut provider = Arc::new(
+            GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "test-token".into()).unwrap(),
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let press = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        handle_key(&mut st, press('p'), &mut provider, &tx, &km).await;
+        pr_list_for(
+            &mut st,
+            &[(10, "other"), (11, "dependabot/x"), (12, "fix-login")],
+        );
+        assert_eq!(st.pr_selected().map(|p| p.number), Some(12));
+
+        // A refresh that re-sorts keeps the cursor on the same PR.
+        pr_list_for(&mut st, &[(12, "fix-login"), (10, "other")]);
+        assert_eq!(st.pr_selected().map(|p| p.head.as_str()), Some("fix-login"));
+
+        handle_key(
+            &mut st,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut provider,
+            &tx,
+            &km,
+        )
+        .await;
+        assert_eq!(st.view, View::Runs);
+        assert_eq!(
+            st.workflow_for_runs
+                .as_deref()
+                .and_then(crate::app::state::runs_key_branch),
+            Some("fix-login")
+        );
+        assert!(st.pr_card.is_none());
+
+        handle_key(
+            &mut st,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut provider,
+            &tx,
+            &km,
+        )
+        .await;
+        assert_eq!(st.view, View::Workflows);
+        assert!(st.pr_card.is_some(), "back returns to the card");
+    }
 
     /// A dashboard with two checkouts and one remote-only row.
     fn dashboard() -> AppState {
