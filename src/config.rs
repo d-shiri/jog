@@ -260,6 +260,8 @@ pub struct KeymapConfig {
     pub repos_view: String,
     // service-health overlay (Uptime Kuma monitors by name)
     pub services: String,
+    // open pull requests of the repo in hand (Workflows view)
+    pub pull_requests: String,
     // snooze notifications: 30m, press again for 60m, again for off
     pub snooze: String,
     // batch commit: mark repos on the dashboard, commit them with one message
@@ -319,6 +321,7 @@ impl Default for KeymapConfig {
             finder: "ctrl+p".into(),
             repos_view: "H".into(),
             services: "S".into(),
+            pull_requests: "p".into(),
             snooze: "Z".into(),
             repo_mark: "Space".into(),
             batch_commit: "C".into(),

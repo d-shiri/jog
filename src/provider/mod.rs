@@ -127,6 +127,19 @@ pub struct PrInfo {
     pub draft: bool,
 }
 
+/// One open pull request, as the PR card lists it: enough to recognise it at a
+/// glance (who, which branch, how fresh) and to open it.
+#[derive(Debug, Clone)]
+pub struct PullRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub draft: bool,
+    pub author: String,
+    pub head: String,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Run {
     pub id: u64,

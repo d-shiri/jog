@@ -429,21 +429,58 @@ impl GitHubProvider {
             .send()
             .await
             .context("list pull requests")?;
+        Ok(page.items.into_iter().next().map(|pr| {
+            let pr = self.pull_request_from(pr);
+            crate::provider::PrInfo {
+                number: pr.number,
+                title: pr.title,
+                url: pr.url,
+                draft: pr.draft,
+            }
+        }))
+    }
+
+    /// Octocrab's pull request, cut down to what jog shows of one.
+    fn pull_request_from(
+        &self,
+        pr: octocrab::models::pulls::PullRequest,
+    ) -> crate::provider::PullRequest {
+        crate::provider::PullRequest {
+            number: pr.number,
+            title: crate::provider::emoji_width_safe(&pr.title.unwrap_or_default()),
+            url: pr.html_url.map(|u| u.to_string()).unwrap_or_else(|| {
+                format!(
+                    "https://github.com/{}/{}/pull/{}",
+                    self.repo.owner, self.repo.repo, pr.number
+                )
+            }),
+            draft: pr.draft.unwrap_or(false),
+            author: pr.user.map(|u| u.login).unwrap_or_default(),
+            head: pr.head.ref_field,
+            updated_at: pr.updated_at,
+        }
+    }
+
+    /// The repo's open pull requests, most recently touched first — the PR
+    /// card's list. One page of fifty: a card is for the PRs in play, and a
+    /// repo with more open than that has a backlog, not a review queue.
+    pub async fn open_pull_requests(&self) -> Result<Vec<crate::provider::PullRequest>> {
+        let page = self
+            .crab
+            .pulls(&self.repo.owner, &self.repo.repo)
+            .list()
+            .state(octocrab::params::State::Open)
+            .sort(octocrab::params::pulls::Sort::Updated)
+            .direction(octocrab::params::Direction::Descending)
+            .per_page(50)
+            .send()
+            .await
+            .context("list pull requests")?;
         Ok(page
             .items
             .into_iter()
-            .next()
-            .map(|pr| crate::provider::PrInfo {
-                number: pr.number,
-                title: crate::provider::emoji_width_safe(&pr.title.unwrap_or_default()),
-                url: pr.html_url.map(|u| u.to_string()).unwrap_or_else(|| {
-                    format!(
-                        "https://github.com/{}/{}/pull/{}",
-                        self.repo.owner, self.repo.repo, pr.number
-                    )
-                }),
-                draft: pr.draft.unwrap_or(false),
-            }))
+            .map(|pr| self.pull_request_from(pr))
+            .collect())
     }
 
     /// Bank the budget an answer arrived with, when it carried one.

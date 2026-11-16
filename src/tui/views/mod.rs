@@ -59,6 +59,7 @@ pub fn render(f: &mut Frame, state: &AppState) {
     render_push_prompt(f, area, state);
     render_finder_overlay(f, area, state);
     render_services_overlay(f, area, state);
+    render_pr_card(f, area, state);
     // Drawn last so it sits above every other overlay.
     render_help_overlay(f, area, state);
 }
@@ -535,6 +536,291 @@ fn render_services_overlay(f: &mut Frame, area: Rect, state: &AppState) {
             .style(Style::default().bg(theme.surface_alt)),
         slot,
     );
+}
+
+/// Whether the PR card still has rows arriving — the redraw loop's question.
+pub fn pr_card_revealing(state: &AppState) -> bool {
+    state.pr_card.as_ref().is_some_and(|c| {
+        staggered_reveal(
+            c.opened_tick,
+            state.tick_count,
+            c.list().len(),
+            REVEAL_STEP,
+            REVEAL_TICKS,
+        ) < 1.0
+            || c.prs.is_none()
+    })
+}
+
+/// The open pull requests of the repo in hand, floated over the Workflows view
+/// like the services card: one row per PR — state, number, title, branch,
+/// author, age — with a cursor to move and `o` to open it.
+fn render_pr_card(f: &mut Frame, area: Rect, state: &AppState) {
+    let Some(card) = state.pr_card.as_ref() else {
+        return;
+    };
+    let theme = &state.theme;
+    let km = &state.keymap;
+    let prs = card.list();
+
+    // The fixed columns, measured once: they size the card and lay out its rows.
+    let col =
+        |f: &dyn Fn(&crate::provider::PullRequest) -> usize| prs.iter().map(f).max().unwrap_or(0);
+    let num_w = col(&|p| p.number.to_string().len() + 1);
+    let draft_w = if prs.iter().any(|p| p.draft) { 7 } else { 0 };
+    let branch_w = col(&|p| disp_width(&p.head)).min(26);
+    let author_w = col(&|p| disp_width(&p.author) + 1).min(18);
+    let ages: Vec<(String, Style)> = prs
+        .iter()
+        .map(|p| match p.updated_at {
+            Some(t) => relative_styled(t, theme),
+            None => ("—".into(), Style::default().fg(theme.text_faint)),
+        })
+        .collect();
+    // "1000d ago" outgrows the usual seven columns on a long-lived backlog.
+    let age_w = ages
+        .iter()
+        .map(|(a, _)| disp_width(a))
+        .max()
+        .unwrap_or(0)
+        .max(7);
+    // "▌ " cursor bar, "● " state, number, then a two-column gap per field.
+    let fixed = 2 + 2 + num_w + 2 + draft_w + 2 + branch_w + 2 + author_w + 2 + age_w;
+
+    // As wide as the longest row wants, capped so a long title is cut rather
+    // than stretching the card edge to edge, and never wider than the screen.
+    let natural = if prs.is_empty() {
+        60
+    } else {
+        fixed + col(&|p| disp_width(&p.title)) + 4
+    };
+    let w = (natural as u16)
+        .clamp(60, 112)
+        .min(area.width.saturating_sub(4));
+    // Borders, a padding line above and below, and the rows.
+    let body_rows = prs.len().max(1) as u16;
+    let h = (body_rows + 4)
+        .min(area.height.saturating_sub(2))
+        .max(5.min(area.height));
+    let slot = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    // Inside the border and a column of padding either side.
+    let inner_w = w.saturating_sub(4) as usize;
+    let viewport = h.saturating_sub(4) as usize;
+
+    let rows: Vec<Line> = match &card.prs {
+        None => {
+            let spin = Motion::new(state.tick_count).spinner();
+            vec![Line::from(vec![
+                Span::styled(format!("{spin} "), Style::default().fg(theme.accent)),
+                Span::styled(
+                    "asking GitHub for open pull requests…",
+                    Style::default().fg(theme.text_muted).italic(),
+                ),
+            ])]
+        }
+        Some(Err(e)) => vec![Line::from(Span::styled(
+            format!(
+                "✗ can't list pull requests — {}",
+                truncate(e, inner_w.saturating_sub(32))
+            ),
+            Style::default().fg(theme.failure),
+        ))],
+        Some(Ok(v)) if v.is_empty() => vec![Line::from(vec![
+            Span::styled("✓ ", Style::default().fg(theme.success)),
+            Span::styled(
+                "no open pull requests — nothing waiting on review",
+                Style::default().fg(theme.text_muted).italic(),
+            ),
+        ])],
+        Some(Ok(v)) => {
+            // The title takes what the fixed columns leave.
+            let title_w = inner_w.saturating_sub(fixed).max(10);
+
+            v.iter()
+                .enumerate()
+                .map(|(i, pr)| {
+                    let p = staggered_reveal(
+                        card.opened_tick,
+                        state.tick_count,
+                        i,
+                        REVEAL_STEP,
+                        REVEAL_TICKS,
+                    );
+                    let selected = i == card.cursor;
+                    let bg = if selected {
+                        theme.select_bg
+                    } else {
+                        theme.surface_alt
+                    };
+                    let fade = |c: Color| Style::default().fg(mix(bg, c, p)).bg(bg);
+                    let (glyph, gcolor) = if pr.draft {
+                        ("◌", theme.text_muted)
+                    } else {
+                        ("●", theme.success)
+                    };
+                    let title_color = if pr.draft {
+                        theme.text_muted
+                    } else {
+                        theme.text_bright
+                    };
+                    let mut title = fade(title_color);
+                    if selected {
+                        title = title.bold();
+                    }
+                    let (age, age_style) = &ages[i];
+                    let age_fg = age_style.fg.unwrap_or(theme.text_faint);
+                    let draft = if draft_w == 0 {
+                        String::new()
+                    } else if pr.draft {
+                        format!("{:<draft_w$}", "draft")
+                    } else {
+                        " ".repeat(draft_w)
+                    };
+                    let author = if pr.author.is_empty() {
+                        String::new()
+                    } else {
+                        format!("@{}", pr.author)
+                    };
+                    let mut spans = vec![
+                        Span::styled(
+                            if selected { "▌ " } else { "  " },
+                            Style::default().fg(theme.accent).bg(bg),
+                        ),
+                        Span::styled(format!("{glyph} "), fade(gcolor)),
+                        Span::styled(
+                            format!("{:>num_w$}", format!("#{}", pr.number)),
+                            fade(theme.primary),
+                        ),
+                        Span::styled("  ", fade(theme.text)),
+                    ];
+                    if draft_w > 0 {
+                        spans.push(Span::styled(draft, fade(theme.text_faint).italic()));
+                    }
+                    spans.extend([
+                        Span::styled(pad_to(&truncate(&pr.title, title_w), title_w), title),
+                        Span::styled("  ", fade(theme.text)),
+                        Span::styled(
+                            pad_to(&truncate(&pr.head, branch_w), branch_w),
+                            fade(theme.accent),
+                        ),
+                        Span::styled("  ", fade(theme.text)),
+                        Span::styled(
+                            pad_to(&truncate(&author, author_w), author_w),
+                            fade(theme.text_muted),
+                        ),
+                        Span::styled("  ", fade(theme.text)),
+                        Span::styled(format!("{age:>age_w$}"), fade(age_fg)),
+                    ]);
+                    // Fill the rest of the row so the highlight is one bar.
+                    let used: usize = spans.iter().map(|s| s.width()).sum();
+                    if used < inner_w {
+                        spans.push(Span::styled(" ".repeat(inner_w - used), fade(theme.text)));
+                    }
+                    Line::from(spans)
+                })
+                .collect()
+        }
+    };
+
+    // Keep the cursor on screen: scroll only as far as it takes.
+    let mut scroll = card.scroll.get();
+    if card.cursor < scroll {
+        scroll = card.cursor;
+    } else if viewport > 0 && card.cursor >= scroll + viewport {
+        scroll = card.cursor + 1 - viewport;
+    }
+    scroll = scroll.min(rows.len().saturating_sub(viewport.max(1)));
+    card.scroll.set(scroll);
+    card.viewport.set(viewport);
+
+    // The click map: each visible row, then the card as a whole. Rows sit
+    // inside the border and the padding line under it.
+    {
+        let mut hits = state.hits.borrow_mut();
+        let first_row_y = slot.y + 2;
+        for r in 0..viewport.min(prs.len().saturating_sub(scroll)) {
+            hits.push((
+                Rect {
+                    x: slot.x + 1,
+                    y: first_row_y + r as u16,
+                    width: slot.width.saturating_sub(2),
+                    height: 1,
+                },
+                Hit::PullRequest(scroll + r),
+            ));
+        }
+        hits.push((slot, Hit::PrCard));
+    }
+
+    f.render_widget(Clear, slot);
+    let accent = Style::default().fg(theme.accent);
+    let mut title = vec![
+        Span::styled("─┤ ", accent),
+        Span::styled("\u{f407} Pull requests", accent.bold()),
+    ];
+    if let Some(Ok(v)) = &card.prs {
+        title.push(Span::styled(
+            format!("  {}", v.len()),
+            Style::default().fg(theme.text_bright),
+        ));
+    }
+    title.push(Span::styled(" ├", accent));
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(accent)
+        .padding(Padding::new(1, 1, 1, 1))
+        .title(Line::from(title))
+        .title(
+            Line::from(Span::styled(
+                format!(" {} ", card.repo),
+                Style::default().fg(theme.text_faint),
+            ))
+            .right_aligned(),
+        );
+    let hint = format!(
+        " {}/{} move · {} open · {} refresh · esc close ",
+        display_key(&km.down),
+        display_key(&km.up),
+        display_key(&km.open_browser),
+        display_key(&km.refresh),
+    );
+    block = block.title_bottom(
+        Line::from(Span::styled(hint, Style::default().fg(theme.text_faint))).right_aligned(),
+    );
+    if card.refreshing {
+        block = block.title_bottom(Line::from(Span::styled(
+            " updating… ",
+            Style::default().fg(theme.text_faint),
+        )));
+    } else if prs.len() > viewport && viewport > 0 {
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(" {}/{} ", card.cursor + 1, prs.len()),
+            Style::default().fg(theme.text_faint),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(rows)
+            .block(block)
+            .scroll((scroll as u16, 0))
+            .style(Style::default().bg(theme.surface_alt)),
+        slot,
+    );
+}
+
+/// `s` padded with spaces to `w` display columns.
+fn pad_to(s: &str, w: usize) -> String {
+    let have = disp_width(s);
+    if have >= w {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(w - have))
+    }
 }
 
 /// Where the working-tree views were entered from, as the first crumb.
@@ -1542,6 +1828,7 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             if state.active_has_checkout() {
                 hints.push((display_key(&km.git_view).into(), changes_label(state)));
             }
+            hints.push((display_key(&km.pull_requests).into(), "PRs"));
             hints.push((display_key(&km.finder).into(), "find"));
             // A one-row dashboard is nothing to advertise a key for.
             if state.repos.len() > 1 {
@@ -3527,7 +3814,10 @@ fn help_sections(
             vec![
                 ("↵".into(), "list runs"),
                 (k(&km.trigger), "trigger"),
-                (k(&km.watch), "watch the latest run"),
+                (
+                    pair(&km.watch, &km.pull_requests),
+                    "watch the latest run / open PRs",
+                ),
             ],
         ),
         (
@@ -13547,5 +13837,101 @@ jobs:
         };
         // Skipped 5s after creation; should stay 5s no matter when we look.
         assert_eq!(elapsed_seconds(&run), 5);
+    }
+
+    fn pr_card_state(n: usize, cursor: usize) -> AppState {
+        let mut st = AppState::new(
+            "acme/api".into(),
+            "main".into(),
+            Vec::new(),
+            crate::config::KeymapConfig::default(),
+            crate::history::History::default(),
+        );
+        let prs = (0..n)
+            .map(|i| crate::provider::PullRequest {
+                number: 200 - i as u64,
+                title: format!("Improve the CV section, take {i}"),
+                url: format!("https://github.com/o/r/pull/{}", 200 - i),
+                draft: i == 1,
+                author: "octocat".into(),
+                head: format!("feature-{i}"),
+                updated_at: Some(Utc::now() - chrono::Duration::hours(i as i64 * 7)),
+            })
+            .collect();
+        st.pr_card = Some(crate::app::state::PrCard {
+            repo: "acme/api".into(),
+            prs: Some(Ok(prs)),
+            cursor,
+            ..Default::default()
+        });
+        st
+    }
+
+    fn draw_pr_card(state: &AppState, w: u16, h: u16) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_pr_card(f, f.area(), state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn pr_card_lists_each_pr_with_its_branch_and_marks_the_cursor() {
+        let st = pr_card_state(3, 2);
+        let out = draw_pr_card(&st, 110, 20);
+        if std::env::var("JOG_SHOW").is_ok() {
+            println!("{out}");
+        }
+        assert!(out.contains("Pull requests  3"), "{out}");
+        assert!(out.contains("#200") && out.contains("#198"), "{out}");
+        assert!(
+            out.contains("feature-1") && out.contains("@octocat"),
+            "{out}"
+        );
+        assert!(out.contains("draft"), "{out}");
+        let cursor_line = out.lines().find(|l| l.contains('▌')).unwrap();
+        assert!(cursor_line.contains("#198"), "{out}");
+    }
+
+    #[test]
+    fn pr_card_maps_each_visible_row_for_clicks() {
+        let st = pr_card_state(40, 39);
+        draw_pr_card(&st, 100, 14);
+        let hits = st.hits.borrow();
+        let rows: Vec<usize> = hits
+            .iter()
+            .filter_map(|(_, h)| match h {
+                Hit::PullRequest(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        // Scrolled to the bottom: the last rows are the clickable ones.
+        assert_eq!(rows.last(), Some(&39), "{rows:?}");
+        assert_eq!(rows.len(), st.pr_card.as_ref().unwrap().viewport.get());
+        assert!(hits.iter().any(|(_, h)| *h == Hit::PrCard));
+    }
+
+    #[test]
+    fn pr_card_scrolls_to_keep_the_cursor_on_screen() {
+        let st = pr_card_state(40, 39);
+        let out = draw_pr_card(&st, 100, 14);
+        assert!(out.contains("#161"), "{out}");
+        assert!(!out.contains("#200"), "{out}");
+    }
+
+    #[test]
+    fn pr_card_says_so_when_nothing_is_open() {
+        let mut st = pr_card_state(0, 0);
+        let out = draw_pr_card(&st, 100, 14);
+        assert!(out.contains("no open pull requests"), "{out}");
+        st.pr_card.as_mut().unwrap().prs = None;
+        let out = draw_pr_card(&st, 100, 14);
+        assert!(out.contains("asking GitHub"), "{out}");
     }
 }

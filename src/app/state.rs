@@ -87,6 +87,11 @@ pub enum Hit {
     /// scratch every frame and a position in it means nothing between two of
     /// them — the key is the one thing about a matrix that holds still.
     GraphNode(String),
+    /// A row of the PR card, by index into its list.
+    PullRequest(usize),
+    /// Anywhere on the PR card — a click there that hits no row keeps the
+    /// card up rather than reading as a click outside it.
+    PrCard,
 }
 
 /// The part of a failed run's log worth reading before opening the log at all:
@@ -207,6 +212,38 @@ pub enum View {
     Diff,
     /// One message committed across several repos, one repo at a time.
     BatchCommit,
+}
+
+/// The pull-request card: the active repo's open PRs, one cursor over them.
+#[derive(Debug, Clone, Default)]
+pub struct PrCard {
+    /// Which repo the list was asked of — an answer for a repo since switched
+    /// away from is dropped rather than drawn under the wrong name.
+    pub repo: String,
+    /// `None` while the first answer is on its way.
+    pub prs: Option<Result<Vec<crate::provider::PullRequest>, String>>,
+    pub cursor: usize,
+    /// First row on screen; kept by the renderer so the cursor stays in view.
+    pub scroll: std::cell::Cell<usize>,
+    /// How many rows the last frame had room for — what a page key moves by.
+    pub viewport: std::cell::Cell<usize>,
+    /// The tick the card went up on, for its row-by-row entrance.
+    pub opened_tick: Option<u64>,
+    /// A re-fetch is in flight over a list already on screen.
+    pub refreshing: bool,
+}
+
+impl PrCard {
+    pub fn list(&self) -> &[crate::provider::PullRequest] {
+        match &self.prs {
+            Some(Ok(v)) => v,
+            _ => &[],
+        }
+    }
+
+    pub fn selected(&self) -> Option<&crate::provider::PullRequest> {
+        self.list().get(self.cursor)
+    }
 }
 
 /// GitHub's mark, as a Nerd Font glyph. Overridable, because a terminal without
@@ -2533,6 +2570,8 @@ pub struct AppState {
     /// The service-health overlay: every monitor by name, with its ping and
     /// day's uptime — including the ones no dashboard row claims.
     pub show_services: bool,
+    /// The pull-request card over the Workflows view, while it is open.
+    pub pr_card: Option<PrCard>,
     /// The tick the services card went up on — the clock its rows reveal
     /// themselves against. `None` while it is closed, and while it is on
     /// screen without an entrance to play (a redraw, a test).
@@ -2727,6 +2766,7 @@ impl AppState {
             kuma_error_shown: false,
             kuma_error: None,
             show_services: false,
+            pr_card: None,
             services_opened_tick: None,
             kuma_fetched_at: None,
             kuma_last_poll_tick: 0,
