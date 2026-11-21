@@ -777,7 +777,15 @@ fn render_pr_card(f: &mut Frame, area: Rect, state: &AppState) {
     }
 
     if let Some(pr) = selected {
-        rows.extend(pr_detail(pr, &state.current_branch, inner_w, theme));
+        rows.extend(pr_detail(
+            pr,
+            &state.current_branch,
+            display_key(&km.pr_deploy_preview),
+            cols.num,
+            inner_w,
+            state.tick_count,
+            theme,
+        ));
     }
 
     // The click map: each visible row, then the card as a whole. Rows sit
@@ -833,9 +841,10 @@ fn render_pr_card(f: &mut Frame, area: Rect, state: &AppState) {
     // As many key hints as fit, most used first.
     let k = |s: &str| display_key(s).to_string();
     let hints = [
-        ("↵".to_string(), "runs"),
-        (k(&km.open_browser), "open"),
+        ("↵".to_string(), "open"),
+        (k(&km.pr_runs), "runs"),
         (k(&km.pr_preview), "preview"),
+        (k(&km.pr_deploy_preview), "deploy"),
         (k(&km.pr_checkout), "checkout"),
         (k(&km.yank), "copy"),
         (k(&km.pr_mine), "mine"),
@@ -843,17 +852,70 @@ fn render_pr_card(f: &mut Frame, area: Rect, state: &AppState) {
         (k(&km.finder), "find"),
         (k(&km.refresh), "refresh"),
     ];
-    let mut hint = String::from(" ");
+    // Keys a step brighter than what they do, so the eye finds the letter;
+    // spacing rather than dots between them, which read as noise.
+    let key_st = Style::default().fg(theme.text_muted);
+    let mut hint = vec![Span::raw(" ")];
+    let mut hint_w = 1;
     let room = (w as usize).saturating_sub(16);
     for (key, what) in hints {
-        let piece = format!("{key} {what} · ");
-        if disp_width(&hint) + disp_width(&piece) + 4 > room {
+        let piece_w = disp_width(&key) + 1 + disp_width(what) + 3;
+        if hint_w + piece_w + 4 > room {
             break;
         }
-        hint.push_str(&piece);
+        hint_w += piece_w;
+        hint.push(Span::styled(key, key_st));
+        hint.push(Span::styled(format!(" {what}   "), faint));
     }
-    hint.push_str("esc ");
-    block = block.title_bottom(Line::from(Span::styled(hint, faint)).right_aligned());
+    hint.push(Span::styled("esc", key_st));
+    hint.push(Span::styled(" close ", faint));
+    // A question waiting on its yes replaces the hints: it is the only
+    // question on the card, and it must not be missed.
+    // Kept to the hints' room, so a long branch name neither runs into the
+    // left-hand title nor pushes the question's start off the card: the
+    // branch gives way first, then the "any other key" half of the answer.
+    let yes = format!("{} yes · any other key no ", display_key(&km.tp_yes));
+    let yes_short = format!("{} yes ", display_key(&km.tp_yes));
+    let question = card.confirm.as_ref().map(|ask| {
+        let shape = |branch: &str| match ask {
+            crate::app::state::PrAsk::Checkout { number, .. } => {
+                format!(" check out #{number} ({branch})? ")
+            }
+            crate::app::state::PrAsk::DeployPreview { number, .. } => format!(
+                " deploy #{number}'s preview — {} on {branch}? ",
+                state.preview_workflow
+            ),
+        };
+        let branch = match ask {
+            crate::app::state::PrAsk::Checkout { branch, .. }
+            | crate::app::state::PrAsk::DeployPreview { branch, .. } => branch.as_str(),
+        };
+        let full = shape(branch);
+        if disp_width(&full) + disp_width(&yes) <= room {
+            return (full, yes.clone());
+        }
+        let fixed = disp_width(&shape("")) + disp_width(&yes_short);
+        if fixed < room {
+            return (shape(&truncate(branch, room - fixed)), yes_short.clone());
+        }
+        // Too narrow even without the branch: just the act and the number.
+        let minimal = match ask {
+            crate::app::state::PrAsk::Checkout { number, .. } => format!(" check out #{number}? "),
+            crate::app::state::PrAsk::DeployPreview { number, .. } => {
+                format!(" deploy #{number}? ")
+            }
+        };
+        let left = room.saturating_sub(disp_width(&yes_short));
+        (truncate(&minimal, left), yes_short.clone())
+    });
+    let bottom = match question {
+        Some((question, answer)) => Line::from(vec![
+            Span::styled(question, Style::default().fg(theme.warning).bold()),
+            Span::styled(answer, Style::default().fg(theme.text_bright)),
+        ]),
+        None => Line::from(hint),
+    };
+    block = block.title_bottom(bottom.right_aligned());
     if state.pr_fetching && data.is_some() {
         block = block.title_bottom(Line::from(Span::styled(" updating… ", faint)));
     } else if prs.len() > viewport {
@@ -1028,114 +1090,190 @@ fn pr_row<'a>(
     Line::from(spans)
 }
 
-/// The block under the list: the selected PR in full — its whole title,
-/// where it merges, and the state the row's glyphs only hint at.
+/// The block under the list: the selected PR in full. Three lines, each one
+/// kind of thing — what it is (the whole title), where it goes (branches,
+/// labels), and how it stands (a strip of glyph-led facts). A fact with
+/// nothing to say ("no conflicts", "no review required") is left out rather
+/// than printed grey, so what is there is worth reading.
 fn pr_detail<'a>(
     pr: &crate::provider::PullRequest,
     current_branch: &str,
+    deploy_key: &str,
+    num_w: usize,
     inner_w: usize,
+    tick: u64,
     theme: &Theme,
 ) -> Vec<Line<'a>> {
     use crate::provider::{Checks, PreviewState, Review};
-    let faint = Style::default().fg(theme.text_faint);
-    let sep = || Span::styled(" · ", Style::default().fg(theme.border_dim));
-    let rule = Line::from(Span::styled(
-        "─".repeat(inner_w),
-        Style::default().fg(theme.border_dim),
-    ));
-
-    let mut head = vec![Span::styled(
-        format!("#{} ", pr.number),
-        Style::default().fg(theme.primary),
-    )];
-    if pr.draft {
-        head.push(Span::styled("draft ", faint));
-    }
-    let used = disp_width(&format!("#{} ", pr.number)) + if pr.draft { 6 } else { 0 };
-    head.push(Span::styled(
-        truncate(&pr.title, inner_w.saturating_sub(used)),
-        Style::default().fg(theme.text_bright).bold(),
-    ));
-
-    let mut state_line = vec![
-        Span::styled(pr.base.clone(), Style::default().fg(theme.text_muted)),
-        Span::styled(" ← ", faint),
-        Span::styled(pr.head.clone(), Style::default().fg(theme.accent)),
-    ];
-    if pr.head == current_branch {
-        state_line.push(Span::styled(" (checked out)", faint));
-    }
-    let (checks, cc) = match pr.checks {
-        Some(Checks::Passing) => ("checks pass", theme.success),
-        Some(Checks::Failing) => ("checks fail", theme.failure),
-        Some(Checks::Pending) => ("checks running", theme.warning),
-        None => ("no checks", theme.text_faint),
+    // A hanging indent that lines the block up with the list above it: the
+    // number in the rows' number column, everything else under their titles.
+    // The rows' gutter is the cursor bar, the branch mark and the state dot.
+    const GUTTER: usize = 5;
+    let (lead_w, indent) = if inner_w >= GUTTER + num_w + 2 + 40 {
+        (GUTTER + num_w, GUTTER + num_w + 2)
+    } else {
+        (0, 0)
     };
-    let (review, rc) = match pr.review {
-        Some(Review::Approved) => ("approved", theme.success),
-        Some(Review::ChangesRequested) => ("changes requested", theme.failure),
-        Some(Review::Required) => ("needs review", theme.text_muted),
-        None => ("no review required", theme.text_faint),
-    };
-    state_line.extend([
-        sep(),
-        Span::styled(checks, Style::default().fg(cc)),
-        sep(),
-        Span::styled(review, Style::default().fg(rc)),
-    ]);
-    if pr.conflicting {
-        state_line.extend([
-            sep(),
-            Span::styled("conflicts", Style::default().fg(theme.warning)),
-        ]);
-    }
-    if pr.comments > 0 {
-        state_line.extend([
-            sep(),
-            Span::styled(
-                format!(
-                    "{} comment{}",
-                    pr.comments,
-                    if pr.comments == 1 { "" } else { "s" }
-                ),
-                Style::default().fg(theme.text_muted),
-            ),
-        ]);
-    }
+    let pad = || Span::raw(" ".repeat(indent));
+    let fg = |c| Style::default().fg(c);
+    let faint = fg(theme.text_faint);
+    let muted = fg(theme.text_muted);
+    let rule = Line::from(Span::styled("─".repeat(inner_w), fg(theme.border)));
 
-    let mut links = Vec::new();
-    match &pr.preview {
-        Some(p) => {
-            let (word, color) = match p.state {
-                PreviewState::Ready => ("preview", theme.info),
-                PreviewState::Deploying => ("preview deploying", theme.warning),
-                PreviewState::Failed => ("preview failed", theme.failure),
-                PreviewState::Gone => ("preview inactive", theme.text_faint),
-            };
-            links.push(Span::styled(
-                format!("◆ {word} "),
-                Style::default().fg(color),
-            ));
-            links.push(Span::styled(
-                p.url.clone(),
-                Style::default().fg(theme.text).underlined(),
-            ));
+    // What it is, its labels on the right — the way GitHub shows them.
+    let mut labels = Vec::new();
+    for (i, l) in pr.labels.iter().enumerate() {
+        if i > 0 {
+            labels.push(Span::raw(" "));
         }
-        None => links.push(Span::styled("no preview", faint)),
-    }
-    if !pr.labels.is_empty() {
-        links.push(sep());
-        links.push(Span::styled(
-            pr.labels.join(", "),
-            Style::default().fg(theme.text_muted),
+        labels.push(Span::styled(
+            format!(" {l} "),
+            Style::default().fg(theme.text).bg(theme.border),
         ));
     }
+    let labels_w: usize = labels.iter().map(|s| s.width()).sum();
+    let num = format!("{:>lead_w$}  ", format!("#{}", pr.number));
+    let mut head = vec![Span::styled(num.clone(), fg(theme.primary).bold())];
+    let mut used = disp_width(&num);
+    if pr.draft {
+        head.push(Span::styled("draft  ", fg(theme.warning)));
+        used += 7;
+    }
+    // The title gives way to the labels only while a readable piece of it
+    // is left; past that the labels go instead.
+    let title_room = inner_w.saturating_sub(used);
+    let with_labels = title_room.saturating_sub(labels_w + 3);
+    let labels = if labels_w > 0 && (disp_width(&pr.title) <= with_labels || with_labels >= 24) {
+        labels
+    } else {
+        Vec::new()
+    };
+    let room = if labels.is_empty() {
+        title_room
+    } else {
+        with_labels
+    };
+    head.push(Span::styled(
+        truncate(&pr.title, room),
+        fg(theme.text_bright).bold(),
+    ));
+
+    // Where it goes, and its preview on the right.
+    let mut branch = vec![
+        pad(),
+        Span::styled(pr.head.clone(), fg(theme.accent)),
+        Span::styled(" → ", faint),
+        Span::styled(pr.base.clone(), muted),
+    ];
+    if pr.head == current_branch {
+        branch.push(Span::styled("  ⎇ checked out", faint));
+    } else if pr.cross_repo {
+        branch.push(Span::styled("  from a fork", faint));
+    }
+    let preview = match &pr.preview {
+        Some(p) => {
+            let (glyph, word, color) = match p.state {
+                PreviewState::Ready => ("◆", "preview", theme.info),
+                PreviewState::Deploying => ("◇", "preview deploying", theme.warning),
+                PreviewState::Failed => ("◆", "preview failed", theme.failure),
+                PreviewState::Gone => ("◇", "preview inactive", theme.text_faint),
+            };
+            let mut v = vec![Span::styled(format!("{glyph} {word}"), fg(color))];
+            if !p.url.is_empty() && p.state != PreviewState::Deploying {
+                v.push(Span::styled(" ", faint));
+                v.push(Span::styled(p.url.clone(), fg(theme.text).underlined()));
+            }
+            v
+        }
+        // Not for forks: their branch can't be dispatched here.
+        None if pr.cross_repo => vec![Span::styled("◇ no preview", faint)],
+        None => vec![
+            Span::styled("◇ no preview — ", faint),
+            Span::styled(deploy_key.to_string(), fg(theme.text_bright)),
+            Span::styled(" deploys one", faint),
+        ],
+    };
+
+    // How it stands.
+    let mut facts: Vec<Vec<Span<'a>>> = Vec::new();
+    facts.push(match pr.checks {
+        Some(Checks::Passing) => vec![Span::styled("✓ checks pass", fg(theme.success))],
+        Some(Checks::Failing) => vec![Span::styled("✗ checks fail", fg(theme.failure))],
+        Some(Checks::Pending) => vec![Span::styled(
+            format!("{} checks running", Motion::new(tick).spinner()),
+            fg(theme.warning),
+        )],
+        None => vec![Span::styled("· no checks", faint)],
+    });
+    match pr.review {
+        Some(Review::Approved) => facts.push(vec![Span::styled("✔ approved", fg(theme.success))]),
+        Some(Review::ChangesRequested) => {
+            facts.push(vec![Span::styled("✎ changes requested", fg(theme.failure))])
+        }
+        Some(Review::Required) => facts.push(vec![Span::styled("◌ review needed", fg(theme.text))]),
+        None => {}
+    }
+    if pr.conflicting {
+        facts.push(vec![Span::styled(
+            format!("≠ conflicts with {}", pr.base),
+            fg(theme.warning),
+        )]);
+    }
+    if pr.comments > 0 {
+        let s = if pr.comments == 1 { "" } else { "s" };
+        facts.push(vec![Span::styled(
+            format!("{} comment{s}", pr.comments),
+            muted,
+        )]);
+    }
+    let mut status = vec![pad()];
+    for (i, f) in facts.into_iter().enumerate() {
+        if i > 0 {
+            status.push(Span::raw("   "));
+        }
+        status.extend(f);
+    }
+
     vec![
         rule,
-        Line::from(head),
-        Line::from(state_line),
-        Line::from(links),
+        spread(head, labels, inner_w),
+        spread(branch, preview, inner_w),
+        Line::from(clip_spans(status, inner_w)),
     ]
+}
+
+/// `left` then `right` pushed to the far edge; `right` is dropped whole when
+/// the two don't fit, and `left` is clipped to the width.
+fn spread<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, w: usize) -> Line<'a> {
+    let lw: usize = left.iter().map(|s| s.width()).sum();
+    let rw: usize = right.iter().map(|s| s.width()).sum();
+    let mut spans = clip_spans(left, w);
+    if rw > 0 && lw + 3 + rw <= w {
+        spans.push(Span::raw(" ".repeat(w - lw - rw)));
+        spans.extend(right);
+    }
+    Line::from(spans)
+}
+
+/// `spans` cut to `w` display columns, the span that crosses the edge
+/// ending in "…".
+fn clip_spans(spans: Vec<Span<'_>>, w: usize) -> Vec<Span<'_>> {
+    let mut left = w;
+    let mut out = Vec::new();
+    for sp in spans {
+        if left == 0 {
+            break;
+        }
+        let sw = sp.width();
+        if sw <= left {
+            left -= sw;
+            out.push(sp);
+        } else {
+            out.push(Span::styled(truncate(&sp.content, left), sp.style));
+            break;
+        }
+    }
+    out
 }
 
 /// `s` padded with spaces to `w` display columns.
@@ -14281,9 +14419,12 @@ jobs:
     fn pr_card_details_the_selected_pr_with_its_preview() {
         let st = pr_card_state(4, 2);
         let out = draw_pr_card(&st, 130, 24);
-        assert!(out.contains("main ← feature-2 (checked out)"), "{out}");
+        if std::env::var("JOG_SHOW").is_ok() {
+            println!("{out}");
+        }
+        assert!(out.contains("feature-2 → main  ⎇ checked out"), "{out}");
         assert!(
-            out.contains("needs review") && out.contains("conflicts"),
+            out.contains("◌ review needed") && out.contains("≠ conflicts with main"),
             "{out}"
         );
         assert!(out.contains("https://198.preview.example.com"), "{out}");
@@ -14312,6 +14453,91 @@ jobs:
             "age shown: {out}"
         );
         assert!(!row.contains("feature-2"), "branch gives way first: {out}");
+    }
+
+    #[test]
+    fn the_pr_detail_leaves_out_facts_with_nothing_to_say() {
+        use crate::provider::{Preview, PreviewState};
+        let mut st = pr_card_state(4, 0);
+        let out = draw_pr_card(&st, 130, 24);
+        // #200: no preview yet, so the card says which key makes one; and
+        // no conflicts is not news, so it is not printed.
+        assert!(out.contains("◇ no preview — D deploys one"), "{out}");
+        assert!(!out.contains("no conflicts"), "{out}");
+        if let Some(Ok(d)) = st.pr_list.as_mut().map(|l| &mut l.data) {
+            d.prs[0].checks = None;
+            d.prs[0].preview = Some(Preview {
+                url: String::new(),
+                state: PreviewState::Deploying,
+            });
+        }
+        let out = draw_pr_card(&st, 130, 24);
+        assert!(out.contains("· no checks   ◌ review needed"), "{out}");
+        assert!(out.contains("◇ preview deploying"), "{out}");
+        let title = out.lines().rfind(|l| l.contains("#200  Improve")).unwrap();
+        assert!(
+            title.contains("matcher"),
+            "labels ride the title line: {out}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_pr_card_keeps_its_question_and_detail_inside_the_border() {
+        let mut st = pr_card_state(4, 2);
+        st.pr_card.as_mut().unwrap().confirm = Some(crate::app::state::PrAsk::DeployPreview {
+            number: 198,
+            branch: "a-very-long-branch-name-that-cannot-fit".into(),
+        });
+        for w in [24u16, 32, 48, 70] {
+            let out = draw_pr_card(&st, w, 24);
+            if std::env::var("JOG_SHOW").is_ok() {
+                println!("{out}");
+            }
+            for line in out.lines() {
+                // Nothing drawn right of the card's right border.
+                if let Some(i) = line.rfind(['│', '╯', '╮']) {
+                    let after: String = line.chars().skip(line[..i].chars().count() + 1).collect();
+                    assert!(after.trim().is_empty(), "w={w}: spill past border:\n{out}");
+                }
+            }
+            // Once there is room for it, the question names the PR even
+            // when the branch has had to go.
+            let bottom = out.lines().find(|l| l.contains('╯')).unwrap();
+            if w >= 48 {
+                assert!(
+                    bottom.contains("deploy #198") && bottom.contains("y yes"),
+                    "w={w}:\n{out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pending_checkout_puts_its_question_on_the_card() {
+        let mut st = pr_card_state(4, 2);
+        let out = draw_pr_card(&st, 130, 24);
+        assert!(out.contains("↵ open") && out.contains("R runs"), "{out}");
+        st.pr_card.as_mut().unwrap().confirm = Some(crate::app::state::PrAsk::Checkout {
+            number: 198,
+            branch: "feature-2".into(),
+        });
+        let out = draw_pr_card(&st, 130, 24);
+        if std::env::var("JOG_SHOW").is_ok() {
+            println!("{out}");
+        }
+        assert!(
+            out.contains("check out #198 (feature-2)? y yes · any other key no"),
+            "{out}"
+        );
+        st.pr_card.as_mut().unwrap().confirm = Some(crate::app::state::PrAsk::DeployPreview {
+            number: 198,
+            branch: "feature-2".into(),
+        });
+        let out = draw_pr_card(&st, 130, 24);
+        assert!(
+            out.contains("deploy #198's preview — preview.yml on feature-2? y yes"),
+            "{out}"
+        );
     }
 
     #[test]

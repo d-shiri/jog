@@ -22,7 +22,8 @@ use rayon::prelude::*;
 
 use crate::app::state::{
     AppState, BatchAction, BatchCommit, BatchPhase, DetailItem, FailureDigest, Finder, FinderKind,
-    GitOp, Hit, PushPrompt, PushWatch, RepoCard, Theme, TriggerPrompt, View, classify_log_severity,
+    GitOp, Hit, PrAsk, PushPrompt, PushWatch, RepoCard, Theme, TriggerPrompt, View,
+    classify_log_severity,
 };
 use crate::config::KeymapConfig;
 use crate::config::{Config, NotifyMode};
@@ -158,6 +159,7 @@ pub async fn run(
         state.bell_off_icon = icon;
     }
     state.file_icons = config.ui.file_icons;
+    state.preview_workflow = config.ui.preview_workflow.clone();
     state.notify_enabled = config.ui.notify_mode() != NotifyMode::Never
         && (config.ui.notify_sound || config.ui.notify_desktop);
     resolve_theme(&mut state, &config);
@@ -500,7 +502,11 @@ async fn event_loop(
                             MouseEventKind::ScrollUp => Some(KeyCode::Up),
                             _ => None,
                         };
-                        if let Some(code) = code {
+                        // A wheel nudge is not an answer: while the PR card
+                        // asks its question, it would call it off and then
+                        // move the cursor under it.
+                        let asking = state.pr_card.as_ref().is_some_and(|c| c.confirm.is_some());
+                        if let Some(code) = code.filter(|_| !asking) {
                             for _ in 0..3 {
                                 let key = KeyEvent::new(code, KeyModifiers::NONE);
                                 // ↑/↓ never map to Quit, so the action is moot.
@@ -1110,6 +1116,12 @@ async fn event_loop(
                         state.repo_label = label;
                         state.repo_label_implicit = false;
                         state.pr_card_parked = None;
+                        // A question asked in the old repo must not be
+                        // answered in the new one: its yes would land on the
+                        // wrong working tree or repo.
+                        if let Some(ask) = state.pr_card.as_mut().and_then(|c| c.confirm.take()) {
+                            state.set_status(format!("{} cancelled — repo switched", ask.what()));
+                        }
                         state.current_branch = branch;
                         state.workflows = sort_with_favorites(workflows, &config);
                         state.workflow_cursor = 0;
@@ -4004,6 +4016,21 @@ fn handle_pr_card_key(
     provider: &Arc<GitHubProvider>,
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
+    // A question waiting on its yes owns the next key: `y` goes ahead,
+    // anything else calls it off.
+    if let Some(ask) = state.pr_card.as_mut().and_then(|c| c.confirm.take()) {
+        if !key_is(&key, km.tp_yes) {
+            state.set_status(format!("{} cancelled", ask.what()));
+        } else {
+            match ask {
+                PrAsk::Checkout { number, branch } => run_pr_checkout(state, tx, number, branch),
+                PrAsk::DeployPreview { number, branch } => {
+                    run_preview_deploy(state, provider, tx, number, branch)
+                }
+            }
+        }
+        return;
+    }
     let len = state.pr_visible().len();
     let Some(card) = state.pr_card.as_mut() else {
         return;
@@ -4022,12 +4049,17 @@ fn handle_pr_card_key(
         card.cursor = 0;
     } else if key_is(&key, km.scroll_bottom) || key.code == KeyCode::End {
         card.cursor = len.saturating_sub(1);
-    } else if key_is(&key, km.open_browser) {
+    } else if key_is(&key, km.open_browser)
+        || key_is(&key, km.confirm)
+        || key.code == KeyCode::Enter
+    {
         open_selected_pr(state);
-    } else if key_is(&key, km.confirm) || key.code == KeyCode::Enter {
+    } else if key_is(&key, km.pr_runs) {
         open_pr_runs(state, provider, tx);
     } else if key_is(&key, km.pr_preview) {
         open_selected_preview(state);
+    } else if key_is(&key, km.pr_deploy_preview) {
+        ask_preview_deploy(state);
     } else if key_is(&key, km.yank) {
         if let Some(pr) = state.pr_selected() {
             let (url, number) = (pr.url.clone(), pr.number);
@@ -4037,7 +4069,7 @@ fn handle_pr_card_key(
             }
         }
     } else if key_is(&key, km.pr_checkout) {
-        checkout_selected_pr(state, tx);
+        ask_pr_checkout(state);
     } else if key_is(&key, km.pr_hide_bots) || key_is(&key, km.pr_mine) {
         let held = state.pr_selected().map(|p| p.number);
         let card = state.pr_card.as_mut().expect("checked above");
@@ -4107,7 +4139,7 @@ fn open_selected_preview(state: &mut AppState) {
     }
 }
 
-/// Enter on a PR: the runs of its branch, every workflow — the PR's CI from
+/// `R` on a PR: the runs of its branch, every workflow — the PR's CI from
 /// jog's own side. The card is parked and comes back with `back`.
 fn open_pr_runs(
     state: &mut AppState,
@@ -4126,10 +4158,9 @@ fn open_pr_runs(
     spawn_fetch_runs(provider.clone(), key, tx.clone(), state);
 }
 
-/// `c` on a PR: fetch its branch and check it out in the local checkout. Git
-/// refuses if local changes would be overwritten, and that refusal is the
-/// answer shown — nothing is stashed or forced.
-fn checkout_selected_pr(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEvent>) {
+/// `c` on a PR: ask before checking its branch out — the card's bottom line
+/// becomes the question, and only a yes goes on to [`run_pr_checkout`].
+fn ask_pr_checkout(state: &mut AppState) {
     let Some((branch, number, cross_repo)) = state
         .pr_selected()
         .map(|p| (p.head.clone(), p.number, p.cross_repo))
@@ -4144,6 +4175,106 @@ fn checkout_selected_pr(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEven
         ));
         return;
     }
+    // Asked before the question, not after the yes: a card that asks and
+    // then says it never could have is a wasted keypress.
+    if !state.active_has_checkout() {
+        state.set_status_err("no local checkout of this repo to switch".into());
+        return;
+    }
+    if branch == state.current_branch {
+        state.set_status(format!("already on {branch}"));
+        return;
+    }
+    if let Some(card) = state.pr_card.as_mut() {
+        card.confirm = Some(PrAsk::Checkout { number, branch });
+    }
+}
+
+/// `D` on a PR: ask before dispatching the preview workflow on its branch —
+/// what `gh workflow run preview.yml --ref <branch>` does by hand.
+fn ask_preview_deploy(state: &mut AppState) {
+    let Some((branch, number, cross_repo)) = state
+        .pr_selected()
+        .map(|p| (p.head.clone(), p.number, p.cross_repo))
+    else {
+        return;
+    };
+    // A fork's branch is not a ref of this repo, so a dispatch on it fails.
+    if cross_repo {
+        state.set_status_err(format!(
+            "#{number} comes from a fork — its branch can't be dispatched here"
+        ));
+        return;
+    }
+    // Checked against the repo's workflows when they are known, so a missing
+    // or misnamed file is said up front instead of as a 404 after the yes.
+    let file = state.preview_workflow.clone();
+    // A known workflow's `triggerable: false` is not checked: it is also the
+    // fallback when its YAML could not be fetched, so it proves nothing — the
+    // dispatch's own error says so if the trigger really is missing.
+    if !state.workflows.is_empty() && !state.workflows.iter().any(|w| w.file_name == file) {
+        state.set_status_err(format!(
+            "no {file} in {} — set ui.preview_workflow",
+            state.repo_label
+        ));
+        return;
+    }
+    if let Some(card) = state.pr_card.as_mut() {
+        card.confirm = Some(PrAsk::DeployPreview { number, branch });
+    }
+}
+
+/// The preview deploy itself, once `y` has answered: dispatch the preview
+/// workflow with the PR's branch as the ref. Inputs are left to their
+/// defaults — the branch is what picks the environment.
+fn run_preview_deploy(
+    state: &mut AppState,
+    provider: &Arc<GitHubProvider>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+    number: u64,
+    branch: String,
+) {
+    let file = state.preview_workflow.clone();
+    // Shown as deploying right away rather than after the next PR refresh:
+    // a card still saying "none · D deploys one" invites a second dispatch.
+    // The GitHub deployment only appears once the workflow's first job runs,
+    // so the next refresh is what confirms (or clears) it.
+    if let Some(pr) = state
+        .pr_list
+        .as_mut()
+        .filter(|l| l.repo == state.repo_label)
+        .and_then(|l| l.data.as_mut().ok())
+        .and_then(|d| d.prs.iter_mut().find(|p| p.number == number))
+    {
+        let url = pr.preview.take().map(|p| p.url).unwrap_or_default();
+        pr.preview = Some(crate::provider::Preview {
+            url,
+            state: crate::provider::PreviewState::Deploying,
+        });
+    }
+    let (p, tx) = (provider.clone(), tx.clone());
+    let msg_branch = branch.clone();
+    let msg_file = file.clone();
+    tokio::spawn(async move {
+        let msg = match p.trigger(&file, &branch, HashMap::new()).await {
+            Ok(()) => format!("deploying #{number}'s preview — {file} on {branch}"),
+            Err(e) => format!("preview deploy failed: {e:#}"),
+        };
+        let _ = tx.send(AppEvent::Status(msg));
+    });
+    state.set_status(format!("dispatching {msg_file} on {msg_branch}…"));
+}
+
+/// The checkout itself, once `y` has answered the card's question: fetch the
+/// branch and check it out. Git refuses if local changes would be
+/// overwritten, and that refusal is the answer shown — nothing is stashed or
+/// forced.
+fn run_pr_checkout(
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+    number: u64,
+    branch: String,
+) {
     let Some(dir) = state
         .repos
         .iter()
@@ -4153,11 +4284,12 @@ fn checkout_selected_pr(state: &mut AppState, tx: &mpsc::UnboundedSender<AppEven
         state.set_status_err("no local checkout of this repo to switch".into());
         return;
     };
+    // Asked again here: the branch may have changed while the question was up.
     if branch == state.current_branch {
         state.set_status(format!("already on {branch}"));
         return;
     }
-    state.set_status(format!("checking out {branch}…"));
+    state.set_status(format!("checking out #{number} ({branch})…"));
     let (tx, repo) = (tx.clone(), state.repo_label.clone());
     tokio::task::spawn_blocking(move || {
         let result = crate::git::fetch_branch(&dir, &branch)
@@ -4478,12 +4610,16 @@ async fn handle_click(
         });
         let on_card = at(&Hit::PrCard);
         drop(hits);
+        if let Some(ask) = state.pr_card.as_mut().and_then(|c| c.confirm.take()) {
+            state.set_status(format!("{} cancelled", ask.what()));
+            return;
+        }
         if let Some(i) = row {
             let card = state.pr_card.as_mut().expect("checked above");
             let open = card.cursor == i;
             card.cursor = i;
             if open {
-                open_pr_runs(state, provider, tx);
+                open_selected_pr(state);
             }
         } else if !on_card {
             state.pr_card = None;
@@ -4576,6 +4712,8 @@ struct Keymap {
     services: (KeyCode, KeyModifiers),
     pull_requests: (KeyCode, KeyModifiers),
     pr_preview: (KeyCode, KeyModifiers),
+    pr_deploy_preview: (KeyCode, KeyModifiers),
+    pr_runs: (KeyCode, KeyModifiers),
     pr_checkout: (KeyCode, KeyModifiers),
     pr_hide_bots: (KeyCode, KeyModifiers),
     pr_mine: (KeyCode, KeyModifiers),
@@ -4694,6 +4832,8 @@ fn resolve_keymap(cfg: &KeymapConfig) -> Result<Keymap> {
         services: parse_key(&cfg.services)?,
         pull_requests: parse_key(&cfg.pull_requests)?,
         pr_preview: parse_key(&cfg.pr_preview)?,
+        pr_deploy_preview: parse_key(&cfg.pr_deploy_preview)?,
+        pr_runs: parse_key(&cfg.pr_runs)?,
         pr_checkout: parse_key(&cfg.pr_checkout)?,
         pr_hide_bots: parse_key(&cfg.pr_hide_bots)?,
         pr_mine: parse_key(&cfg.pr_mine)?,
@@ -6002,6 +6142,12 @@ fn switch_to_selected_repo(
     };
 
     *provider = Arc::new(provider.for_repo(spec));
+    // The provider now points at the new repo while `repo_label` and the PR
+    // list still name the old one until `RepoSwitched` lands; a yes given in
+    // between would dispatch the old PR's branch on the new repo.
+    if let Some(ask) = state.pr_card.as_mut().and_then(|c| c.confirm.take()) {
+        state.set_status(format!("{} cancelled — repo switched", ask.what()));
+    }
     state.runs.clear();
     state.run_detail = None;
     state.run_shape.clear();
@@ -6504,7 +6650,7 @@ fn dispatch_trigger(
     tokio::spawn(async move {
         let msg = match p.trigger(&file, &r, inputs).await {
             Ok(_) => format!("triggered {} on {}", file, r),
-            Err(e) => format!("trigger failed: {}", e),
+            Err(e) => format!("trigger failed: {e:#}"),
         };
         let _ = tx2.send(AppEvent::Status(msg));
     });
@@ -6893,6 +7039,110 @@ mod tests {
         assert!(st.pr_card.is_some(), "p should open the PR card");
     }
 
+    #[tokio::test]
+    async fn checking_out_a_pr_asks_first_and_any_key_but_yes_calls_it_off() {
+        let mut st = AppState::new(
+            "acme/api".into(),
+            "main".into(),
+            Vec::new(),
+            KeymapConfig::default(),
+            History::default(),
+        );
+        st.view = View::Workflows;
+        st.current_branch = "main".into();
+        let mut card = RepoCard::new("acme/api".into());
+        card.path = Some(std::env::temp_dir());
+        st.repos = vec![card];
+        let km = resolve_keymap(&KeymapConfig::default()).unwrap();
+        let mut provider = Arc::new(
+            GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "test-token".into()).unwrap(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let press = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        handle_key(&mut st, press('p'), &mut provider, &tx, &km).await;
+        pr_list_for(&mut st, &[(12, "fix-login")]);
+
+        handle_key(&mut st, press('c'), &mut provider, &tx, &km).await;
+        let asked = st.pr_card.as_ref().unwrap().confirm.clone();
+        assert_eq!(
+            asked,
+            Some(PrAsk::Checkout {
+                number: 12,
+                branch: "fix-login".into()
+            }),
+            "c only asks"
+        );
+
+        // `j` is not a yes: nothing runs, the question goes away.
+        handle_key(&mut st, press('j'), &mut provider, &tx, &km).await;
+        assert!(st.pr_card.as_ref().unwrap().confirm.is_none());
+        // The checkout runs on a blocking thread one yield may not reach, so
+        // the status line — "checking out …" had it started — is the proof.
+        assert_eq!(st.status_msg.as_deref(), Some("checkout cancelled"));
+        tokio::task::yield_now().await;
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|e| matches!(e, AppEvent::PrCheckedOut(..))),
+            "no checkout without a yes"
+        );
+        assert_eq!(st.current_branch, "main");
+    }
+
+    #[tokio::test]
+    async fn deploying_a_preview_asks_first_and_refuses_a_missing_workflow() {
+        let mut st = AppState::new(
+            "acme/api".into(),
+            "main".into(),
+            Vec::new(),
+            KeymapConfig::default(),
+            History::default(),
+        );
+        st.view = View::Workflows;
+        let km = resolve_keymap(&KeymapConfig::default()).unwrap();
+        let mut provider = Arc::new(
+            GitHubProvider::new(RepoSpec::parse("acme/api").unwrap(), "test-token".into()).unwrap(),
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let press = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        handle_key(&mut st, press('p'), &mut provider, &tx, &km).await;
+        pr_list_for(&mut st, &[(12, "fix-login")]);
+
+        // Workflows not known yet: nothing to check against, so it asks.
+        handle_key(&mut st, press('D'), &mut provider, &tx, &km).await;
+        assert_eq!(
+            st.pr_card.as_ref().unwrap().confirm,
+            Some(PrAsk::DeployPreview {
+                number: 12,
+                branch: "fix-login".into()
+            }),
+            "D only asks"
+        );
+        handle_key(&mut st, press('n'), &mut provider, &tx, &km).await;
+        assert!(st.pr_card.as_ref().unwrap().confirm.is_none());
+
+        // A yes marks the PR deploying at once, so the card stops offering D.
+        handle_key(&mut st, press('D'), &mut provider, &tx, &km).await;
+        handle_key(&mut st, press('y'), &mut provider, &tx, &km).await;
+        assert_eq!(
+            st.pr_selected()
+                .and_then(|p| p.preview.as_ref())
+                .map(|p| p.state),
+            Some(crate::provider::PreviewState::Deploying)
+        );
+
+        // Workflows known and none is preview.yml: refused, nothing asked.
+        st.workflows = vec![crate::provider::Workflow {
+            name: "CI".into(),
+            file_name: "ci.yml".into(),
+            triggerable: true,
+            last_status: None,
+            last_run_at: None,
+            inputs: Vec::new(),
+        }];
+        handle_key(&mut st, press('D'), &mut provider, &tx, &km).await;
+        assert!(st.pr_card.as_ref().unwrap().confirm.is_none());
+    }
+
     /// A PR list of `(number, head)` pairs landing for the active repo.
     fn pr_list_for(st: &mut AppState, prs: &[(u64, &str)]) {
         let prs = prs
@@ -6915,7 +7165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_pr_card_opens_on_the_checked_out_branchs_pr_and_enter_shows_its_runs() {
+    async fn the_pr_card_opens_on_the_checked_out_branchs_pr_and_r_shows_its_runs() {
         let mut st = AppState::new(
             "acme/api".into(),
             "fix-login".into(),
@@ -6942,14 +7192,7 @@ mod tests {
         pr_list_for(&mut st, &[(12, "fix-login"), (10, "other")]);
         assert_eq!(st.pr_selected().map(|p| p.head.as_str()), Some("fix-login"));
 
-        handle_key(
-            &mut st,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut provider,
-            &tx,
-            &km,
-        )
-        .await;
+        handle_key(&mut st, press('R'), &mut provider, &tx, &km).await;
         assert_eq!(st.view, View::Runs);
         assert_eq!(
             st.workflow_for_runs

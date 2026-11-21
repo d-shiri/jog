@@ -156,6 +156,14 @@ pub struct UiConfig {
     /// ignored, since a silent typo looks exactly like the setting not working.
     #[serde(default)]
     pub colors: std::collections::HashMap<String, String>,
+    /// The workflow file `D` on the PR card dispatches on the PR's branch to
+    /// deploy its preview environment — `gh workflow run <this> --ref <branch>`.
+    #[serde(default = "default_preview_workflow")]
+    pub preview_workflow: String,
+}
+
+fn default_preview_workflow() -> String {
+    "preview.yml".into()
 }
 
 impl Default for UiConfig {
@@ -178,6 +186,7 @@ impl Default for UiConfig {
             file_icons: true,
             log_focus_context: default_focus_context(),
             colors: std::collections::HashMap::new(),
+            preview_workflow: default_preview_workflow(),
         }
     }
 }
@@ -264,6 +273,8 @@ pub struct KeymapConfig {
     pub pull_requests: String,
     // inside the PR card
     pub pr_preview: String,
+    pub pr_deploy_preview: String,
+    pub pr_runs: String,
     pub pr_checkout: String,
     pub pr_hide_bots: String,
     pub pr_mine: String,
@@ -328,6 +339,8 @@ impl Default for KeymapConfig {
             services: "S".into(),
             pull_requests: "p".into(),
             pr_preview: "v".into(),
+            pr_deploy_preview: "D".into(),
+            pr_runs: "R".into(),
             pr_checkout: "c".into(),
             pr_hide_bots: "b".into(),
             pr_mine: "m".into(),

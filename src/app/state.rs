@@ -245,6 +245,29 @@ pub struct PrCard {
     /// The cursor has been put on the current branch's PR once; after that
     /// it stays where the user leaves it.
     pub placed: bool,
+    /// A key that acts on the PR's branch was pressed and waits for a yes:
+    /// checking out moves the working tree and a preview deploy spends CI, so
+    /// neither is one keypress.
+    pub confirm: Option<PrAsk>,
+}
+
+/// What the PR card is asking about, for PR `number` on its head `branch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrAsk {
+    /// `c`: check the branch out locally.
+    Checkout { number: u64, branch: String },
+    /// `D`: dispatch the preview workflow on the branch.
+    DeployPreview { number: u64, branch: String },
+}
+
+impl PrAsk {
+    /// The verb for the status line when the question is called off.
+    pub fn what(&self) -> &'static str {
+        match self {
+            PrAsk::Checkout { .. } => "checkout",
+            PrAsk::DeployPreview { .. } => "preview deploy",
+        }
+    }
 }
 
 /// The runs list's key for "every run on this branch", standing where a
@@ -2406,6 +2429,9 @@ pub struct AppState {
     /// Whether the combined diff's file bands carry a language mark — Nerd
     /// Font glyphs, off for terminals whose font would draw boxes.
     pub file_icons: bool,
+    /// The workflow `D` on the PR card dispatches on a PR's branch to stand
+    /// up its preview environment (`ui.preview_workflow`).
+    pub preview_workflow: String,
     pub history: History,
     pub theme: Theme,
     /// Run IDs we have seen in a non-terminal state during this Watch session.
@@ -2588,7 +2614,7 @@ pub struct AppState {
     pub show_services: bool,
     /// The pull-request card over the Workflows view, while it is open.
     pub pr_card: Option<PrCard>,
-    /// The card as it was when Enter left it for a branch's runs — put back
+    /// The card as it was when `R` left it for a branch's runs — put back
     /// up when `back` returns to the Workflows view.
     pub pr_card_parked: Option<PrCard>,
     /// The active repo's open PRs as last fetched.
@@ -2790,6 +2816,7 @@ impl AppState {
             keymap,
             forge_icon: DEFAULT_FORGE_ICON.to_string(),
             file_icons: true,
+            preview_workflow: "preview.yml".into(),
             history,
             theme: Theme::default(),
             watch_seen_running: HashSet::new(),

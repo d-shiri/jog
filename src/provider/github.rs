@@ -54,6 +54,11 @@ pub fn parse_remote_url(url: &str) -> Result<RepoSpec> {
     RepoSpec::parse(path)
 }
 
+/// A dispatch's `inputs` as GitHub wants them: always a JSON object.
+fn dispatch_inputs(inputs: HashMap<String, String>) -> Result<serde_json::Value> {
+    serde_json::to_value(inputs).context("serialize inputs")
+}
+
 pub fn resolve_token() -> Result<String> {
     if let Ok(t) = std::env::var("GITHUB_TOKEN")
         && !t.is_empty()
@@ -1009,12 +1014,10 @@ impl Provider for GitHubProvider {
             workflow_file,
             reference,
         );
-        let dispatch = if inputs.is_empty() {
-            dispatch
-        } else {
-            let value = serde_json::to_value(inputs).context("serialize inputs")?;
-            dispatch.inputs(value)
-        };
+        // Always an object, even an empty one: octocrab's body defaults
+        // `inputs` to JSON null, which GitHub rejects with a 422 ("nil is not
+        // an object") — every dispatch of a workflow without inputs failed.
+        let dispatch = dispatch.inputs(dispatch_inputs(inputs)?);
         dispatch.send().await.context("dispatch workflow")?;
         Ok(())
     }
@@ -1211,6 +1214,13 @@ fn parse_pull_requests(v: &serde_json::Value) -> Result<crate::provider::PullReq
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_dispatch_without_inputs_sends_an_empty_object_not_null() {
+        // GitHub answers `"inputs": null` with a 422; octocrab's default is null.
+        let v = super::dispatch_inputs(Default::default()).unwrap();
+        assert_eq!(v, serde_json::json!({}));
+    }
+
     #[test]
     fn a_graphql_pr_answer_reads_into_checks_review_and_preview() {
         use crate::provider::{Checks, PreviewState, Review};
